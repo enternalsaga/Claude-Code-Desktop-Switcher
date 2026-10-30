@@ -306,6 +306,8 @@ public static extern uint PrivateExtractIcons(string file, int index, int cx, in
 [DllImport("user32.dll")]   public static extern IntPtr GetTopWindow(IntPtr hWnd);
 [DllImport("user32.dll")]   public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
 [DllImport("user32.dll")]   public static extern bool IsWindowVisible(IntPtr hWnd);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)]
+public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
 [DllImport("user32.dll")]   public static extern int GetWindowTextLength(IntPtr hWnd);
 [DllImport("user32.dll")]   public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 [DllImport("shlwapi.dll", CharSet = CharSet.Unicode)]
@@ -1239,11 +1241,103 @@ function Remove-ClaudeProfile {
     Set-ProfileLabel -Id $Target.Id -Label $null
 }
 
+# Local patch: -Install no longer overwrites a copy that was edited after it was installed.
+# ClaudeSwitcher.base.ps1 beside the installed script records what was last installed,
+# so local edits are told apart from a plain older version and merged three ways (git
+# merge-file) when git is available. Line endings are ignored when comparing.
+function Read-InstallChoice {
+    param([string]$Text)
+    Add-Type -AssemblyName System.Windows.Forms
+    return [string][System.Windows.Forms.MessageBox]::Show($Text, 'Claude Profile Switcher: update', 'YesNoCancel', 'Question')
+}
+
+function Get-ScriptText {
+    param([string]$Path)
+    return [IO.File]::ReadAllText($Path).Replace("`r`n", "`n")
+}
+
+function Update-InstalledScript {
+    param([Parameter(Mandatory)][string]$New, [Parameter(Mandatory)][string]$Installed)
+    $dir    = Split-Path $Installed -Parent
+    $base   = Join-Path $dir 'ClaudeSwitcher.base.ps1'
+    $backup = "$Installed.bak-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
+    $utf8   = New-Object System.Text.UTF8Encoding($false)
+    $put = {
+        param($Text)  # untyped: [string] would turn $null into ''
+        if (Test-Path -LiteralPath $Installed) { Copy-Item -LiteralPath $Installed -Destination $backup -Force }
+        if ($null -eq $Text) { Copy-Item -LiteralPath $New -Destination $Installed -Force }
+        else { [IO.File]::WriteAllText($Installed, $Text, $utf8) }
+        try { Unblock-File -LiteralPath $Installed } catch { }
+        Copy-Item -LiteralPath $New -Destination $base -Force
+    }
+
+    if (-not (Test-Path -LiteralPath $Installed)) {
+        Copy-Item -LiteralPath $New -Destination $Installed -Force
+        try { Unblock-File -LiteralPath $Installed } catch { }
+        Copy-Item -LiteralPath $New -Destination $base -Force
+        return $true
+    }
+    $newText  = Get-ScriptText $New
+    $instText = Get-ScriptText $Installed
+    if ($instText -ceq $newText) { Copy-Item -LiteralPath $New -Destination $base -Force; return $true }
+    $baseText = $(if (Test-Path -LiteralPath $base) { Get-ScriptText $base })
+    if ($null -ne $baseText -and $instText -ceq $baseText) { & $put $null; return $true }
+
+    # The installed copy was edited (or there is no record of what was installed).
+    $merged = $null; $conflicts = -1
+    if ($null -ne $baseText -and (Get-Command git -ErrorAction SilentlyContinue)) {
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('claude-switcher-merge-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $tmp | Out-Null
+        try {
+            foreach ($pair in @(@('installed', $instText), @('base', $baseText), @('new', $newText))) {
+                [IO.File]::WriteAllText((Join-Path $tmp $pair[0]), $pair[1], $utf8)
+            }
+            # Without -p the result goes into the first file, which keeps its bytes intact
+            # (captured stdout would be re-decoded with the console's code page).
+            & git merge-file -L installed -L 'last install' -L 'this version' (Join-Path $tmp 'installed') (Join-Path $tmp 'base') (Join-Path $tmp 'new')
+            $conflicts = $LASTEXITCODE
+            if ($conflicts -ge 0) { $merged = [IO.File]::ReadAllText((Join-Path $tmp 'installed')) }
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    if ($conflicts -eq 0) {
+        $choice = Read-InstallChoice ("The installed switcher has local changes. They merge cleanly with this version.`n`n" +
+            "Yes: install the merged version (keeps your changes)`nNo: install this version and drop your changes`nCancel: stop and change nothing`n`n" +
+            "The current copy is backed up first:`n$backup")
+        switch ($choice) {
+            'Yes'   { & $put $merged; return $true }
+            'No'    { & $put $null; return $true }
+            default { return $false }
+        }
+    }
+
+    $why = $(if ($null -eq $baseText) { "There is no record of the version installed last, so local changes cannot be merged automatically." }
+             elseif ($conflicts -gt 0) { "Your changes conflict with this version in $conflicts place(s)." }
+             else { "Your changes could not be merged automatically (git was not found)." })
+    $conflictFile = $null
+    if ($conflicts -gt 0) {
+        $conflictFile = Join-Path $dir 'ClaudeSwitcher.conflict.ps1'
+        [IO.File]::WriteAllText($conflictFile, $merged, $utf8)
+    }
+    $text = "The installed switcher has local changes. $why`n`n" +
+            "Yes: keep the installed copy as it is (shortcuts are still refreshed)`nNo: install this version and drop your changes (backed up first)`nCancel: stop and change nothing"
+    if ($conflictFile) {
+        $text += "`n`nA merge with conflict markers was written to:`n$conflictFile`nResolve the marked places, copy it over $Installed, then run -Install again."
+    }
+    switch (Read-InstallChoice $text) {
+        'Yes'   { return $true }
+        'No'    { & $put $null; return $true }
+        default { return $false }
+    }
+}
+
 function Install-Switcher {
     New-Item -ItemType Directory -Force -Path $script:SwitcherHome | Out-Null
     if ($script:ScriptPath -ne $script:InstalledScript) {
-        Copy-Item -LiteralPath $script:ScriptPath -Destination $script:InstalledScript -Force
-        try { Unblock-File -LiteralPath $script:InstalledScript } catch { }
+        if (-not (Update-InstalledScript -New $script:ScriptPath -Installed $script:InstalledScript)) {
+            $script:InstallCancelled = $true
+            return
+        }
     }
     New-SwitcherShortcut -Directory ([Environment]::GetFolderPath('Desktop'))
     New-SwitcherShortcut -Directory (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs')
@@ -1285,6 +1379,13 @@ function Get-FirstValue {
 function Get-CodeSessionRoot {
     param([Parameter(Mandatory)]$TargetProfile)
     $root = Join-Path $TargetProfile.Path 'claude-code-sessions'
+    # Local patch: newer Store builds (4.29) keep Default's data in %LOCALAPPDATA%\Claude-Data\claude_<id>.
+    if ($TargetProfile.IsDefault -and $script:ClaudeApp.Kind -eq 'Msix') {
+        $package = Split-Path (Split-Path (Split-Path $script:ClaudeApp.DefaultProfilePath -Parent) -Parent) -Parent
+        $dataDir = Join-Path (Join-Path $env:LOCALAPPDATA 'Claude-Data') (Split-Path $package -Leaf)
+        $modern = Join-Path $dataDir 'claude-code-sessions'
+        if (Test-Path -LiteralPath $modern -PathType Container) { return $modern }
+    }
     # Store apps redirect LocalAppData writes into their package's LocalCache.
     # Keep the launch path unchanged; only resolve where the session files live.
     $localPrefix = $env:LOCALAPPDATA.TrimEnd('\') + '\'
@@ -1307,7 +1408,8 @@ function Get-CodeSessions {
         $account = $_
         Get-ChildItem -LiteralPath $account.FullName -Directory | ForEach-Object {
             $org = $_
-            Get-ChildItem -LiteralPath $org.FullName -File -Filter 'local_*.json' | ForEach-Object {
+            # Local patch: skip broken junctions left by Claude's data move instead of aborting the list.
+            Get-ChildItem -LiteralPath $org.FullName -File -Filter 'local_*.json' -ErrorAction SilentlyContinue | ForEach-Object {
                 $data = $null
                 try { $data = Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
                 $folder = Get-FirstValue $data 'cwd', 'workingDirectory', 'projectPath', 'folder', 'path'
@@ -2023,6 +2125,7 @@ if ($RouteSignIns) {
 
 if ($Install) {
     Install-Switcher
+    if ($script:InstallCancelled) { 'Install cancelled. Nothing was changed.'; return }
     # Land on the switcher itself, which is where the next step (adding an account) is.
     Start-SwitcherWindow
     return
@@ -2393,6 +2496,23 @@ function Invoke-LaunchProfile {
     }
 }
 
+# Local patch: quit one profile's Claude (its whole process tree) and start it again.
+# Closing the window is not enough, since Claude keeps running in the tray.
+function Restart-ClaudeProfile {
+    param([Parameter(Mandatory)]$Target, [Parameter(Mandatory)][int]$ProcessId)
+    $statusLine.Text = "Restarting '$($Target.Name)'..."
+    & taskkill.exe /PID $ProcessId /T /F | Out-Null
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-RunningProfileMap)[$Target.Path.TrimEnd('\')] -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 300
+    }
+    if ((Get-RunningProfileMap)[$Target.Path.TrimEnd('\')]) {
+        Show-Message "'$($Target.Name)' did not quit. Quit it from its tray icon, then open it again." 'Could not restart' 'OK' 'Warning' | Out-Null
+        return
+    }
+    Invoke-LaunchProfile -Target $Target
+}
+
 $script:IdentityWatches = New-Object System.Collections.Generic.List[object]
 
 function Add-IdentityWatch {
@@ -2523,15 +2643,46 @@ function Show-TransferDialog {
     $dlg.Controls.Add($hdr)
 
     $all          = New-Object System.Windows.Forms.CheckBox
-    $all.Text     = 'Select all'
+    $all.Text     = 'Select all shown'
     $all.AutoSize = $true
-    $all.Location = New-Object System.Drawing.Point(560, 14)
+    $all.Location = New-Object System.Drawing.Point(540, 14)
     $all.Anchor   = 'Top,Right'
     $dlg.Controls.Add($all)
 
+    # Local patch: search box and folder/date filters. Ticks are kept per chat file, so a
+    # chat ticked and then filtered out is still copied.
+    $search             = New-Object System.Windows.Forms.TextBox
+    $search.Location    = New-Object System.Drawing.Point(16, 42)
+    $search.Size        = New-Object System.Drawing.Size(270, 26)
+    $search.Anchor      = 'Top,Left,Right'
+    $dlg.Controls.Add($search)
+    # EM_SETCUEBANNER: grey hint text, since .NET Framework's TextBox has no PlaceholderText.
+    $search.Add_HandleCreated({ [void][Native.WinApi]::SendMessage($this.Handle, 0x1501, [IntPtr]1, 'Search title or folder') })
+
+    $folderBox               = New-Object System.Windows.Forms.ComboBox
+    $folderBox.DropDownStyle = 'DropDownList'
+    $folderBox.Location      = New-Object System.Drawing.Point(294, 42)
+    $folderBox.Size          = New-Object System.Drawing.Size(220, 26)
+    $folderBox.Anchor        = 'Top,Right'
+    $folderBox.Items.Add('All folders') | Out-Null
+    $sessions | Group-Object Folder | Sort-Object Count -Descending | ForEach-Object {
+        $folderBox.Items.Add($(if ($_.Name) { $_.Name } else { '(no folder)' }) + " ($($_.Count))") | Out-Null
+    }
+    $folderBox.SelectedIndex = 0
+    $dlg.Controls.Add($folderBox)
+
+    $timeBox               = New-Object System.Windows.Forms.ComboBox
+    $timeBox.DropDownStyle = 'DropDownList'
+    $timeBox.Location      = New-Object System.Drawing.Point(522, 42)
+    $timeBox.Size          = New-Object System.Drawing.Size(146, 26)
+    $timeBox.Anchor        = 'Top,Right'
+    foreach ($t in 'Any time', 'Today', 'Last 7 days', 'Last 30 days', 'Older than 30 days') { $timeBox.Items.Add($t) | Out-Null }
+    $timeBox.SelectedIndex = 0
+    $dlg.Controls.Add($timeBox)
+
     $lv               = New-Object System.Windows.Forms.ListView
-    $lv.Location      = New-Object System.Drawing.Point(16, 40)
-    $lv.Size          = New-Object System.Drawing.Size(652, 300)
+    $lv.Location      = New-Object System.Drawing.Point(16, 76)
+    $lv.Size          = New-Object System.Drawing.Size(652, 264)
     $lv.View          = 'Details'
     $lv.CheckBoxes    = $true
     $lv.FullRowSelect = $true
@@ -2540,16 +2691,62 @@ function Show-TransferDialog {
     $lv.Columns.Add('Chat', 340)    | Out-Null
     $lv.Columns.Add('Folder', 150)  | Out-Null
     $lv.Columns.Add('Updated', 140) | Out-Null
-    foreach ($s in $sessions) {
-        $item = New-Object System.Windows.Forms.ListViewItem($s.Title)
-        $item.SubItems.Add($s.Folder) | Out-Null
-        $item.SubItems.Add($s.Updated.ToString('d MMM yyyy, HH:mm')) | Out-Null
-        $item.Tag = $s
-        $lv.Items.Add($item) | Out-Null
-    }
-    $all.Tag = $lv
-    $all.Add_CheckedChanged({ foreach ($i in $this.Tag.Items) { $i.Checked = $this.Checked } })
     $dlg.Controls.Add($lv)
+
+    # Handlers reach shared state through the form's Tag, as the rest of this file does with $this.Tag.
+    $state = @{
+        Sessions = $sessions; Checked = @{}; Filling = $false; SourceName = $Source.Name
+        List = $lv; Search = $search; Folder = $folderBox; Time = $timeBox; All = $all; Header = $hdr
+    }
+    $state.Refill = {
+        param($st)
+        $q = $st.Search.Text.Trim()
+        $folder = $null
+        if ($st.Folder.SelectedIndex -gt 0) { $folder = ($st.Folder.SelectedItem -replace ' \(\d+\)$', '') }
+        $now = Get-Date
+        $st.Filling = $true
+        $st.List.BeginUpdate()
+        $st.List.Items.Clear()
+        foreach ($s in $st.Sessions) {
+            $f = $(if ($s.Folder) { $s.Folder } else { '(no folder)' })
+            if ($folder -and $f -ne $folder) { continue }
+            if ($q -and $s.Title.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
+                $f.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+            # Not a switch: inside one, continue only leaves the switch.
+            $age = ($now - $s.Updated).TotalDays
+            $t = $st.Time.SelectedIndex
+            if (($t -eq 1 -and $s.Updated.Date -ne $now.Date) -or ($t -eq 2 -and $age -gt 7) -or
+                ($t -eq 3 -and $age -gt 30) -or ($t -eq 4 -and $age -le 30)) { continue }
+            $item = New-Object System.Windows.Forms.ListViewItem($s.Title)
+            $item.SubItems.Add($s.Folder) | Out-Null
+            $item.SubItems.Add($s.Updated.ToString('d MMM yyyy, HH:mm')) | Out-Null
+            $item.Tag = $s
+            $item.Checked = $st.Checked.ContainsKey($s.File.FullName)
+            $st.List.Items.Add($item) | Out-Null
+        }
+        $st.List.EndUpdate()
+        $shown = $st.List.Items.Count
+        $st.All.Checked = ($shown -gt 0 -and $st.List.CheckedItems.Count -eq $shown)
+        $st.Filling = $false
+        $st.Header.Text = "Chats in '$($st.SourceName)': $shown shown, $($st.Checked.Count) selected"
+    }
+    $dlg.Tag = $state
+
+    $lv.Add_ItemChecked({
+        $st = $this.FindForm().Tag
+        if ($st.Filling) { return }
+        $key = $_.Item.Tag.File.FullName
+        if ($_.Item.Checked) { $st.Checked[$key] = $true } else { $st.Checked.Remove($key) }
+        $st.Header.Text = "Chats in '$($st.SourceName)': $($st.List.Items.Count) shown, $($st.Checked.Count) selected"
+    })
+    $all.Add_Click({
+        $st = $this.FindForm().Tag
+        foreach ($i in $st.List.Items) { $i.Checked = $this.Checked }
+    })
+    $search.Add_TextChanged({ $st = $this.FindForm().Tag; & $st.Refill $st })
+    $folderBox.Add_SelectedIndexChanged({ $st = $this.FindForm().Tag; & $st.Refill $st })
+    $timeBox.Add_SelectedIndexChanged({ $st = $this.FindForm().Tag; & $st.Refill $st })
+    & $state.Refill $state
 
     $lblTo          = New-Object System.Windows.Forms.Label
     $lblTo.Text     = 'Copy to'
@@ -2604,11 +2801,8 @@ function Show-TransferDialog {
         Show-Message "'$($target.Name)' has not used Claude Code yet, so there is nowhere to put the chats.`n`nOpen it, sign in, visit the Code tab once, then try again." 'Not ready yet' | Out-Null
         return
     }
+    # Local patch: no prompt here any more; an open target is offered a restart after the copy.
     $live = (Get-RunningProfileMap)[$target.Path.TrimEnd('\')]
-    if ($live) {
-        $go = Show-Message "'$($target.Name)' is open. It may only show the copied chats after you quit and reopen it.`n`nCopy anyway?" 'Account is open' 'YesNo' 'Question'
-        if ($go -ne 'Yes') { return }
-    }
 
     $copied = 0; $skipped = 0
     try {
@@ -2625,6 +2819,10 @@ function Show-TransferDialog {
     $statusLine.Text = $msg
     if ($copied -and -not $live) {
         if ((Show-Message "$msg`n`nOpen '$($target.Name)' now?" 'Chats copied' 'YesNo') -eq 'Yes') { Invoke-LaunchProfile -Target $target }
+    } elseif ($copied) {
+        # Claude reads its chat list only at start-up, so an open target needs a restart.
+        $ask = "$msg`n`n'$($target.Name)' is open and only lists new chats after a restart. Restart it now?`n`nAny Code session still running in '$($target.Name)' will be stopped."
+        if ((Show-Message $ask 'Chats copied' 'YesNo' 'Question') -eq 'Yes') { Restart-ClaudeProfile -Target $target -ProcessId $live }
     } else {
         Show-Message $msg 'Chats copied' | Out-Null
     }
