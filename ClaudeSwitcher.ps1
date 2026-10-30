@@ -1420,6 +1420,9 @@ function Get-CodeSessions {
                     Title   = $(Get-FirstValue $data 'title', 'name', 'summary', 'customTitle', 'displayName')
                     Folder  = $(if (-not $folder) { '' } elseif ($folder -match '\\scratch-workspaces\\') { '(no folder)' } else { Split-Path $folder -Leaf })
                     Updated = $_.LastWriteTime
+                    # Local patch: the chat this one was forked from, for "Include fork family".
+                    Id      = $_.BaseName
+                    Parent  = $(Get-FirstValue $data 'forkedFromSessionId')
                 }
                 if (-not $entry.Title) { $entry.Title = "Chat $($_.BaseName.Substring(6, [math]::Min(8, $_.BaseName.Length - 6)))" }
                 # The same chat can sit under two accounts after an earlier copy. List it once.
@@ -2694,9 +2697,45 @@ function Show-TransferDialog {
     $dlg.Controls.Add($lv)
 
     # Handlers reach shared state through the form's Tag, as the rest of this file does with $this.Tag.
+    $family          = New-Object System.Windows.Forms.CheckBox
+    $family.Text     = 'Include fork family'
+    $family.AutoSize = $true
+    $family.Checked  = $true
+    $family.Location = New-Object System.Drawing.Point(316, 355)
+    $family.Anchor   = 'Left,Bottom'
+    $dlg.Controls.Add($family)
+
+    $byId = @{}; $children = @{}
+    foreach ($s in $sessions) { $byId[$s.Id] = $s }
+    foreach ($s in $sessions) {
+        if ($s.Parent -and $byId.ContainsKey($s.Parent)) {
+            if (-not $children.ContainsKey($s.Parent)) { $children[$s.Parent] = New-Object System.Collections.ArrayList }
+            [void]$children[$s.Parent].Add($s)
+        }
+    }
     $state = @{
         Sessions = $sessions; Checked = @{}; Filling = $false; SourceName = $Source.Name
         List = $lv; Search = $search; Folder = $folderBox; Time = $timeBox; All = $all; Header = $hdr
+        Family = $family; ById = $byId; Children = $children
+    }
+    # The whole fork tree a chat belongs to: up to its oldest listed ancestor, then every
+    # chat forked from there. Ancestors missing from this account end the walk up.
+    $state.GetFamily = {
+        param($st, $s)
+        $root = $s; $seen = @{ $s.Id = $true }
+        while ($root.Parent -and $st.ById.ContainsKey($root.Parent) -and -not $seen.ContainsKey($root.Parent)) {
+            $root = $st.ById[$root.Parent]; $seen[$root.Id] = $true
+        }
+        $out = New-Object System.Collections.ArrayList
+        $queue = New-Object System.Collections.Queue
+        $queue.Enqueue($root); $done = @{}
+        while ($queue.Count) {
+            $n = $queue.Dequeue()
+            if ($done.ContainsKey($n.Id)) { continue }
+            $done[$n.Id] = $true; [void]$out.Add($n)
+            if ($st.Children.ContainsKey($n.Id)) { foreach ($c in $st.Children[$n.Id]) { $queue.Enqueue($c) } }
+        }
+        return ,$out
     }
     $state.Refill = {
         param($st)
@@ -2734,9 +2773,20 @@ function Show-TransferDialog {
 
     $lv.Add_ItemChecked({
         $st = $this.FindForm().Tag
-        if ($st.Filling) { return }
-        $key = $_.Item.Tag.File.FullName
-        if ($_.Item.Checked) { $st.Checked[$key] = $true } else { $st.Checked.Remove($key) }
+        if ($st.Filling -or -not $_.Item.Tag) { return }
+        $on = $_.Item.Checked
+        # The list also raises this while it builds its window; only a real change counts.
+        if ($on -eq $st.Checked.ContainsKey($_.Item.Tag.File.FullName)) { return }
+        $group = $(if ($st.Family.Checked) { & $st.GetFamily $st $_.Item.Tag } else { @($_.Item.Tag) })
+        foreach ($s in $group) {
+            if ($on) { $st.Checked[$s.File.FullName] = $true } else { $st.Checked.Remove($s.File.FullName) }
+        }
+        if ($group.Count -gt 1) {
+            # Show the relatives that are on screen; Filling stops this from cascading again.
+            $st.Filling = $true
+            foreach ($i in $st.List.Items) { if ($i.Tag) { $i.Checked = $st.Checked.ContainsKey($i.Tag.File.FullName) } }
+            $st.Filling = $false
+        }
         $st.Header.Text = "Chats in '$($st.SourceName)': $($st.List.Items.Count) shown, $($st.Checked.Count) selected"
     })
     $all.Add_Click({
