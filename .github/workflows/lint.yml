@@ -73,6 +73,14 @@ jobs:
         shell: pwsh
         run: .\tests\ProfileLaunch.Tests.ps1
 
+      - name: Chat update tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\ChatUpdate.Tests.ps1
+
+      - name: Chat update tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\ChatUpdate.Tests.ps1
+
       - name: Install update tests (Windows PowerShell 5.1)
         shell: powershell
         run: .\tests\InstallUpdate.Tests.ps1

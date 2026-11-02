@@ -1423,6 +1423,7 @@ function Get-CodeSessions {
                     # Local patch: the chat this one was forked from, for "Include fork family".
                     Id      = $_.BaseName
                     Parent  = $(Get-FirstValue $data 'forkedFromSessionId')
+                    Activity = $(Get-SessionActivity $data $_)
                 }
                 if (-not $entry.Title) { $entry.Title = "Chat $($_.BaseName.Substring(6, [math]::Min(8, $_.BaseName.Length - 6)))" }
                 # The same chat can sit under two accounts after an earlier copy. List it once.
@@ -1443,11 +1444,31 @@ function Get-CodeSessionStore {
            Sort-Object LastWriteTime -Descending | Select-Object -First 1
 }
 
-# Returns 'copied' or 'exists'.
+# Local patch: when to treat a copy as newer. lastActivityAt (ms since 1970) is what Claude
+# updates on every turn; the file's own time is the fallback for files without it.
+function Get-SessionActivity {
+    param($Data, [Parameter(Mandatory)][IO.FileInfo]$File)
+    if ($Data -and $Data.PSObject.Properties['lastActivityAt'] -and $Data.lastActivityAt -is [ValueType]) { return [double]$Data.lastActivityAt }
+    return [double]([DateTimeOffset]$File.LastWriteTimeUtc).ToUnixTimeMilliseconds()
+}
+
+function Get-SessionActivityAt {
+    param([Parameter(Mandatory)][string]$Path)
+    $data = $null
+    try { $data = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    return Get-SessionActivity $data (Get-Item -LiteralPath $Path)
+}
+
+# Returns 'copied', 'updated' (the target had an older copy, now replaced) or 'exists'.
 function Copy-CodeSession {
     param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)]$Store)
     $dest = Join-Path $Store.FullName $Session.File.Name
-    if (Test-Path -LiteralPath $dest) { return 'exists' }
+    $result = 'copied'
+    if (Test-Path -LiteralPath $dest) {
+        $sourceAt = $(if ($null -ne $Session.Activity) { $Session.Activity } else { Get-SessionActivityAt $Session.File.FullName })
+        if ($sourceAt -le (Get-SessionActivityAt $dest)) { return 'exists' }
+        $result = 'updated'
+    }
     $targetAccount = Split-Path $Store.Parent.FullName -Leaf
     $targetOrg     = $Store.Name
     $text = [System.IO.File]::ReadAllText($Session.File.FullName)
@@ -1456,7 +1477,7 @@ function Copy-CodeSession {
     # the same ids (scratch folders are named after them) are left alone.
     $text = $text.Replace("`"$($Session.Account)`"", "`"$targetAccount`"").Replace("`"$($Session.Org)`"", "`"$targetOrg`"")
     [System.IO.File]::WriteAllText($dest, $text, (New-Object System.Text.UTF8Encoding($false)))
-    return 'copied'
+    return $result
 }
 
 # ------------------------------------------------------------------- layout --
@@ -2691,7 +2712,7 @@ function Show-TransferDialog {
     $lv.FullRowSelect = $true
     $lv.BackColor     = [System.Drawing.Color]::White
     $lv.Anchor        = 'Top,Left,Right,Bottom'
-    $lv.Columns.Add('Chat', 340)    | Out-Null
+    $lv.Columns.Add('Chat', 260)    | Out-Null
     $lv.Columns.Add('Folder', 150)  | Out-Null
     $lv.Columns.Add('Updated', 140) | Out-Null
     $dlg.Controls.Add($lv)
@@ -2716,7 +2737,7 @@ function Show-TransferDialog {
     $state = @{
         Sessions = $sessions; Checked = @{}; Filling = $false; SourceName = $Source.Name
         List = $lv; Search = $search; Folder = $folderBox; Time = $timeBox; All = $all; Header = $hdr
-        Family = $family; ById = $byId; Children = $children
+        Family = $family; ById = $byId; Children = $children; InTarget = @{}
     }
     # The whole fork tree a chat belongs to: up to its oldest listed ancestor, then every
     # chat forked from there. Ancestors missing from this account end the walk up.
@@ -2759,6 +2780,8 @@ function Show-TransferDialog {
             $item = New-Object System.Windows.Forms.ListViewItem($s.Title)
             $item.SubItems.Add($s.Folder) | Out-Null
             $item.SubItems.Add($s.Updated.ToString('d MMM yyyy, HH:mm')) | Out-Null
+            $there = $st.InTarget[$s.File.Name]
+            $item.SubItems.Add($(if ($null -eq $there) { '' } elseif ($there -lt $s.Activity) { 'older' } else { 'up to date' })) | Out-Null
             $item.Tag = $s
             $item.Checked = $st.Checked.ContainsKey($s.File.FullName)
             $st.List.Items.Add($item) | Out-Null
@@ -2814,6 +2837,24 @@ function Show-TransferDialog {
     $combo.SelectedIndex = 0
     $dlg.Controls.Add($combo)
 
+    # Local patch: an "In target" column says, per chat, whether the chosen account already
+    # has it and whether that copy is older (Copy chats then updates it) or up to date.
+    $lv.Columns.Add('In target', 90) | Out-Null
+    $state.Targets = $targets
+    $state.LoadTarget = {
+        param($st, $index)
+        $st.InTarget = @{}
+        $store = Get-CodeSessionStore -Target $st.Targets[$index]
+        if (-not $store) { return }
+        Get-ChildItem -LiteralPath $store.FullName -File -Filter 'local_*.json' -ErrorAction SilentlyContinue | ForEach-Object {
+            $st.InTarget[$_.Name] = Get-SessionActivityAt $_.FullName
+        }
+    }
+    $combo.Tag = $state
+    $combo.Add_SelectedIndexChanged({ & $this.Tag.LoadTarget $this.Tag $this.SelectedIndex; & $this.Tag.Refill $this.Tag })
+    & $state.LoadTarget $state $combo.SelectedIndex
+    & $state.Refill $state
+
     $note           = New-Object System.Windows.Forms.Label
     $note.Text      = 'The chat stays in this account too. Finish a chat in one account before continuing it in the other, since both continue the same history.'
     $note.Font      = $fontSmall
@@ -2854,10 +2895,10 @@ function Show-TransferDialog {
     # Local patch: no prompt here any more; an open target is offered a restart after the copy.
     $live = (Get-RunningProfileMap)[$target.Path.TrimEnd('\')]
 
-    $copied = 0; $skipped = 0
+    $copied = 0; $updated = 0; $skipped = 0
     try {
         foreach ($s in $picked) {
-            if ((Copy-CodeSession -Session $s -Store $store) -eq 'copied') { $copied++ } else { $skipped++ }
+            switch (Copy-CodeSession -Session $s -Store $store) { 'copied' { $copied++ } 'updated' { $updated++ } default { $skipped++ } }
         }
     } catch {
         Show-Message $_.Exception.Message 'Transfer failed' 'OK' 'Error' | Out-Null
@@ -2865,11 +2906,13 @@ function Show-TransferDialog {
     }
 
     $msg = "Copied $copied chat(s) to '$($target.Name)'."
-    if ($skipped) { $msg += " $skipped were already there." }
+    if ($updated) { $msg += " Updated $updated older copy(ies) there." }
+    if ($skipped) { $msg += " $skipped were already up to date." }
     $statusLine.Text = $msg
-    if ($copied -and -not $live) {
+    $changed = $copied + $updated
+    if ($changed -and -not $live) {
         if ((Show-Message "$msg`n`nOpen '$($target.Name)' now?" 'Chats copied' 'YesNo') -eq 'Yes') { Invoke-LaunchProfile -Target $target }
-    } elseif ($copied) {
+    } elseif ($changed) {
         # Claude reads its chat list only at start-up, so an open target needs a restart.
         $ask = "$msg`n`n'$($target.Name)' is open and only lists new chats after a restart. Restart it now?`n`nAny Code session still running in '$($target.Name)' will be stopped."
         if ((Show-Message $ask 'Chats copied' 'YesNo' 'Question') -eq 'Yes') { Restart-ClaudeProfile -Target $target -ProcessId $live }
