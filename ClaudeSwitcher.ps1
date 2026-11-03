@@ -1459,14 +1459,69 @@ function Get-SessionActivityAt {
     return Get-SessionActivity $data (Get-Item -LiteralPath $Path)
 }
 
-# Returns 'copied', 'updated' (the target had an older copy, now replaced) or 'exists'.
+function Read-ChatJson {
+    param([Parameter(Mandatory)][string]$Path)
+    try { return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+}
+
+# Local patch: a chat renamed in one account only. previousTitles tells which side renamed
+# last: when the target's old titles hold the source's title, the target was renamed after
+# it and keeps its name; otherwise the target takes the source's title.
+function Test-TitleNeedsSync {
+    param([string]$SourceTitle, [string]$TargetTitle, $TargetPrevious)
+    if (-not $SourceTitle -or $SourceTitle -ceq $TargetTitle) { return $false }
+    return -not (@($TargetPrevious) -ccontains $SourceTitle)
+}
+
+# Replaces one top-level string value in a JSON text and leaves every other byte alone
+# (a ConvertTo-Json round trip would reformat the file). Nested objects can use the same
+# key, spawnedFrom.title for one, so the depth is tracked. Returns $null when not found.
+function Set-JsonTopLevelString {
+    param([Parameter(Mandatory)][string]$Json, [Parameter(Mandatory)][string]$Key, [Parameter(Mandatory)][string]$Value)
+    $depth = 0; $i = 0; $n = $Json.Length
+    while ($i -lt $n) {
+        $c = $Json[$i]
+        if ($c -eq '"') {
+            $start = $i; $i++
+            while ($i -lt $n -and $Json[$i] -ne '"') { if ($Json[$i] -eq '\') { $i++ }; $i++ }
+            $name = $Json.Substring($start + 1, $i - $start - 1); $i++
+            if ($depth -ne 1 -or $name -cne $Key) { continue }
+            $j = $i
+            while ($j -lt $n -and [char]::IsWhiteSpace($Json[$j])) { $j++ }
+            if ($j -ge $n -or $Json[$j] -ne ':') { continue }
+            $j++
+            while ($j -lt $n -and [char]::IsWhiteSpace($Json[$j])) { $j++ }
+            if ($j -ge $n -or $Json[$j] -ne '"') { return $null }
+            $k = $j + 1
+            while ($k -lt $n -and $Json[$k] -ne '"') { if ($Json[$k] -eq '\') { $k++ }; $k++ }
+            return $Json.Substring(0, $j) + (ConvertTo-Json $Value -Compress) + $Json.Substring($k + 1)
+        }
+        if ($c -eq '{' -or $c -eq '[') { $depth++ } elseif ($c -eq '}' -or $c -eq ']') { $depth-- }
+        $i++
+    }
+    return $null
+}
+
+# Returns 'copied', 'updated' (the target had an older copy, now replaced), 'renamed' (the
+# target copy is current but had another title, now the source's) or 'exists'.
 function Copy-CodeSession {
     param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)]$Store)
     $dest = Join-Path $Store.FullName $Session.File.Name
     $result = 'copied'
     if (Test-Path -LiteralPath $dest) {
         $sourceAt = $(if ($null -ne $Session.Activity) { $Session.Activity } else { Get-SessionActivityAt $Session.File.FullName })
-        if ($sourceAt -le (Get-SessionActivityAt $dest)) { return 'exists' }
+        if ($sourceAt -le (Get-SessionActivityAt $dest)) {
+            $src = Read-ChatJson $Session.File.FullName
+            $dst = Read-ChatJson $dest
+            if ($src -and $dst -and (Test-TitleNeedsSync $src.title $dst.title $dst.previousTitles)) {
+                $text = Set-JsonTopLevelString ([System.IO.File]::ReadAllText($dest)) 'title' $src.title
+                if ($text) {
+                    [System.IO.File]::WriteAllText($dest, $text, (New-Object System.Text.UTF8Encoding($false)))
+                    return 'renamed'
+                }
+            }
+            return 'exists'
+        }
         $result = 'updated'
     }
     $targetAccount = Split-Path $Store.Parent.FullName -Leaf
@@ -2781,7 +2836,10 @@ function Show-TransferDialog {
             $item.SubItems.Add($s.Folder) | Out-Null
             $item.SubItems.Add($s.Updated.ToString('d MMM yyyy, HH:mm')) | Out-Null
             $there = $st.InTarget[$s.File.Name]
-            $item.SubItems.Add($(if ($null -eq $there) { '' } elseif ($there -lt $s.Activity) { 'older' } else { 'up to date' })) | Out-Null
+            $item.SubItems.Add($(if ($null -eq $there) { '' }
+                                 elseif ($there.At -lt $s.Activity) { 'older' }
+                                 elseif (Test-TitleNeedsSync $s.Title $there.Title $there.Previous) { 'renamed' }
+                                 else { 'up to date' })) | Out-Null
             $item.Tag = $s
             $item.Checked = $st.Checked.ContainsKey($s.File.FullName)
             $st.List.Items.Add($item) | Out-Null
@@ -2847,7 +2905,10 @@ function Show-TransferDialog {
         $store = Get-CodeSessionStore -Target $st.Targets[$index]
         if (-not $store) { return }
         Get-ChildItem -LiteralPath $store.FullName -File -Filter 'local_*.json' -ErrorAction SilentlyContinue | ForEach-Object {
-            $st.InTarget[$_.Name] = Get-SessionActivityAt $_.FullName
+            $d = Read-ChatJson $_.FullName
+            $st.InTarget[$_.Name] = [pscustomobject]@{
+                At = (Get-SessionActivity $d $_); Title = $(if ($d) { $d.title }); Previous = $(if ($d) { $d.previousTitles })
+            }
         }
     }
     $combo.Tag = $state
@@ -2895,10 +2956,10 @@ function Show-TransferDialog {
     # Local patch: no prompt here any more; an open target is offered a restart after the copy.
     $live = (Get-RunningProfileMap)[$target.Path.TrimEnd('\')]
 
-    $copied = 0; $updated = 0; $skipped = 0
+    $copied = 0; $updated = 0; $renamed = 0; $skipped = 0
     try {
         foreach ($s in $picked) {
-            switch (Copy-CodeSession -Session $s -Store $store) { 'copied' { $copied++ } 'updated' { $updated++ } default { $skipped++ } }
+            switch (Copy-CodeSession -Session $s -Store $store) { 'copied' { $copied++ } 'updated' { $updated++ } 'renamed' { $renamed++ } default { $skipped++ } }
         }
     } catch {
         Show-Message $_.Exception.Message 'Transfer failed' 'OK' 'Error' | Out-Null
@@ -2907,9 +2968,10 @@ function Show-TransferDialog {
 
     $msg = "Copied $copied chat(s) to '$($target.Name)'."
     if ($updated) { $msg += " Updated $updated older copy(ies) there." }
+    if ($renamed) { $msg += " Renamed $renamed to match." }
     if ($skipped) { $msg += " $skipped were already up to date." }
     $statusLine.Text = $msg
-    $changed = $copied + $updated
+    $changed = $copied + $updated + $renamed
     if ($changed -and -not $live) {
         if ((Show-Message "$msg`n`nOpen '$($target.Name)' now?" 'Chats copied' 'YesNo') -eq 'Yes') { Invoke-LaunchProfile -Target $target }
     } elseif ($changed) {
