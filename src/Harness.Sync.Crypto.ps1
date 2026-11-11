@@ -174,7 +174,12 @@ function Unprotect-SyncStream {
                 $cs.Write($buf, 0, $n); $left -= $n
             }
             $cs.FlushFinalBlock()
-        } finally { $cs.Dispose(); $dec.Dispose() }
+        } catch [Security.Cryptography.CryptographicException] {
+            throw 'mac-mismatch'   # the MAC held, so only a key whose AES half is wrong ends here; same answer as a wrong key
+        } finally {
+            try { $cs.Dispose() } catch [Security.Cryptography.CryptographicException] { }   # Dispose re-runs the failed final block
+            $dec.Dispose()
+        }
     } finally { $aes.Dispose(); $mac.Dispose() }
 }
 

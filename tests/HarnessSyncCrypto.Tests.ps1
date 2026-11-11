@@ -88,6 +88,10 @@ try {
     $otherKey = [byte[]]$key.Clone(); $otherKey[40] = $otherKey[40] -bxor 255
     $msg = $null; try { Unprotect-SyncFile -In $good -Out (Join-Path $tmp 'otherkey.out') -Key $otherKey } catch { $msg = $_.Exception.Message }
     Assert ($msg -eq 'mac-mismatch' -and -not (Test-Path -LiteralPath (Join-Path $tmp 'otherkey.out'))) 'wrong key: mac-mismatch and no output'
+    # a key that differs only in its AES half passes the MAC, then fails on padding: still reported as mac-mismatch, nothing written
+    $aesOnly = [byte[]]$key.Clone(); $aesOnly[3] = $aesOnly[3] -bxor 255
+    $msg = $null; try { Unprotect-SyncFile -In $good -Out (Join-Path $tmp 'aesonly.out') -Key $aesOnly } catch { $msg = $_.Exception.Message }
+    Assert ($msg -eq 'mac-mismatch' -and -not (Test-Path -LiteralPath (Join-Path $tmp 'aesonly.out'))) "a key wrong only in the AES half: got [$msg]"
     Assert-Throws { Protect-SyncFile -In $in -Out (Join-Path $tmp 'shortkey.enc') -Key ([byte[]](1..10)) } 'a key that is not 64 bytes is refused'
     Assert (-not (Test-Path -LiteralPath (Join-Path $tmp 'shortkey.enc'))) 'no file for a refused key'
     Assert-Throws { Protect-SyncFile -In (Join-Path $tmp 'missing.bin') -Out (Join-Path $tmp 'missing.enc') -Key $key } 'a missing input throws'
