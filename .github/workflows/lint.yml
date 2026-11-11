@@ -121,6 +121,14 @@ jobs:
         shell: pwsh
         run: .\tests\BuildSingleFile.Tests.ps1
 
+      - name: Harness Antigravity adapter tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\HarnessAntigravity.Tests.ps1
+
+      - name: Harness Antigravity adapter tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\HarnessAntigravity.Tests.ps1
+
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
