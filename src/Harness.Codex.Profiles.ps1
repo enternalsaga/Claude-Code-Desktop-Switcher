@@ -268,6 +268,7 @@ function Register-CodexHarness {
         DisplayName          = 'Codex'
         # Also finds spike* test profiles, which GetProfiles hides, so -Launch codex:spike1 works.
         ResolveProfile       = { param($Name) Resolve-CodexProfile -Name $Name }
+        TestProfileName      = { param($Name) Test-CodexProfileName -Name $Name }
         NewShortcut          = { param($Profile, $Directory) New-CodexShortcut -Profile $Profile -Directory $Directory }
         Detect              = { $i = Find-CodexInstall; [pscustomobject]@{ Installed = $i.Installed; Kind = $i.Kind; Exe = $i.Exe; Version = $i.Version; Aumid = $i.Aumid } }
         GetProfiles          = { Get-CodexProfiles }

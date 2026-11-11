@@ -2,7 +2,7 @@
 # Claude tray stays as it was). Add-HarnessTrayItems is called from the harness-ui-tray hook each time the
 # tray menu opens; Invoke-HarnessLaunchArg from the harness-launch hook. Uses Show-Message, Show-Prompt,
 # Get-ShortcutDirs and $fontBold from ClaudeSwitcher.ps1. The Invoke-* helpers hold the logic, so the click
-# handlers stay one line. Optional adapter keys used here: DisplayName, NewProfile, NewShortcut, ResolveProfile.
+# handlers stay one line. Optional adapter keys used here: DisplayName, NewProfile, NewShortcut, ResolveProfile, TestProfileName.
 # ASCII only.
 
 function Get-HarnessDisplayName {
@@ -24,6 +24,10 @@ function Invoke-HarnessTrayAddAccount {
     $label = Get-HarnessDisplayName $Harness
     $answer = Show-Prompt -Message "Name for the new $label account:" -Title "Add $label account" -OkText 'Next'
     if (-not $answer) { return }
+    if ($Harness.Adapter['TestProfileName'] -is [scriptblock]) {
+        $problem = & $Harness.Adapter.TestProfileName $answer.Text
+        if ($problem) { Show-Message $problem "Add $label account" 'OK' 'Warning' | Out-Null; return }
+    }
     Show-Message "Follow the sign-in steps that open next, then come back here.`r`nThe tray stays busy until the sign-in ends." "Add $label account" | Out-Null
     try {
         $state = & $Harness.Adapter.NewProfile $answer.Text

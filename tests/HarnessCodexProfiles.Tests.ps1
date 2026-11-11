@@ -210,7 +210,8 @@ try {
     Register-Harnesses
     Assert ($null -ne (Get-Harness -Name 'codex')) 'codex registered by Register-Harnesses when its function exists'
     $a = (Get-Harness -Name 'codex').Adapter
-    foreach ($k in 'Detect','GetProfiles','Launch','NewProfile','RemoveProfile','Rename','ListChats','Export','ImportNative','ImportHandoff','ImportExternalClaude','ImportNeedsClose') { Assert ($a[$k] -is [scriptblock]) "adapter lacks $k" }
+    Assert ($a['DisplayName'] -eq 'Codex') 'adapter DisplayName'
+    foreach ($k in 'ResolveProfile','TestProfileName','NewShortcut','Detect','GetProfiles','Launch','NewProfile','RemoveProfile','Rename','ListChats','Export','ImportNative','ImportHandoff','ImportExternalClaude','ImportNeedsClose') { Assert ($a[$k] -is [scriptblock]) "adapter lacks $k" }
     Register-Harness -Name 'claude' -Adapter @{ Detect = {}; GetProfiles = {}; Launch = {}; ListChats = {}; Export = {}; ImportHandoff = {}; ImportNative = {} }
     Assert ((Resolve-TransferMode -Source 'codex' -Target 'codex') -eq 'native') 'codex to codex is native'
     Assert ((Resolve-TransferMode -Source 'claude' -Target 'codex') -eq 'codex-import') 'claude to codex is codex-import'
@@ -249,6 +250,7 @@ try {
         Launch = { param($Profile) $script:Log.Add("launch:$($Profile.Id)") }
         NewProfile = { param($Name) $script:Log.Add("new:$Name"); if ($Name -eq 'boom') { throw 'kaboom' }; return $script:NewResult }
         NewShortcut = { param($Profile, $Directory) $script:Log.Add("lnk:$($Profile.Id)@$Directory") }
+        TestProfileName = { param($Name) if ($Name -eq 'bad name') { return 'Bad name.' }; return $null }
     }
     $beta = New-FakeAdapter @{
         GetProfiles = { @([pscustomobject]@{ Id = 'b1'; Name = 'Solo'; Pid = $null }) }
@@ -290,6 +292,10 @@ try {
     $script:Answer = $null
     Invoke-HarnessTrayAddAccount -Harness $alphaHarness
     Assert ($script:Messages.Count -eq 0 -and $script:Log.Count -eq 0) 'cancelled prompt does nothing'
+    $script:Answer = [pscustomobject]@{ Text = 'bad name' }
+    Invoke-HarnessTrayAddAccount -Harness $alphaHarness
+    Assert ($script:Messages[-1] -eq 'Bad name.' -and $script:Log.Count -eq 0) 'TestProfileName rejects the name before anything starts'
+    $script:Messages.Clear()
     $script:Answer = [pscustomobject]@{ Text = 'Home' }
     Invoke-HarnessTrayAddAccount -Harness $alphaHarness
     Assert (($script:Log -join ',') -eq 'new:Home' -and $script:Messages.Count -eq 1) 'valid name: one heads-up, NewProfile runs'
