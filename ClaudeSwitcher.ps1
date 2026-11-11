@@ -2237,6 +2237,9 @@ if ($AddAccount) {
 }
 
 if ($Launch) {
+    # >>> harness-launch
+    if ((Get-Command Invoke-HarnessLaunchArg -ErrorAction SilentlyContinue) -and (Invoke-HarnessLaunchArg -Value $Launch)) { return }
+    # <<< harness-launch
     $target = Resolve-ClaudeProfile -Name $Launch -SkipStatus
     if (-not $target) {
         # Used to create a fresh, empty profile, so a typo quietly became a new account.
@@ -3097,6 +3100,7 @@ $trayMenu.Add_Opening({
     $null = Add-MenuItem $trayMenu 'Add account...' { Invoke-AddAccount }
     # >>> harness-ui-tray
     if (Get-Command Show-HarnessExportDialog -ErrorAction SilentlyContinue) { $null = Add-MenuItem $trayMenu 'Export chat for handoff...' { Show-HarnessExportDialog } }
+    if (Get-Command Add-HarnessTrayItems -ErrorAction SilentlyContinue) { Add-HarnessTrayItems -Menu $trayMenu }
     # <<< harness-ui-tray
     $null = Add-MenuItem $trayMenu 'Open switcher' { Show-Switcher }
     $boot = Add-MenuItem $trayMenu 'Start with Windows' {
