@@ -85,13 +85,28 @@ function Invoke-SqliteQuery {
     } finally { [void][HarnessWinSqlite]::sqlite3_finalize($st) }
 }
 
-# Copies the database plus its -wal / -shm companions into a fresh temp folder and returns the copy's path.
-# The caller deletes the parent folder when done.
+# Returns the path of a consistent copy of the database in a fresh temp folder; the caller deletes the parent folder.
+# VACUUM INTO from a read-only connection gives one self-contained file even while the app is writing (spike S13:
+# 50/50 good, where copying the three files failed 26/50). If it fails, the file and its -wal / -shm are copied
+# as before and the reason is logged.
 function Copy-SqliteSnapshot {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { throw "SQLite file not found: $Path" }
     $dir = Join-Path ([IO.Path]::GetTempPath()) ('sqlite-snap-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $target = Join-Path $dir (Split-Path -Leaf $Path)
+    $db = $null
+    try {
+        $db = Open-SqliteReadOnly -Path $Path
+        [void](Invoke-SqliteQuery -Handle $db -Sql 'PRAGMA busy_timeout=5000')
+        [void](Invoke-SqliteQuery -Handle $db -Sql ("VACUUM INTO '" + $target.Replace("'", "''") + "'"))
+        if (-not (Test-Path -LiteralPath $target)) { throw 'VACUUM INTO produced no file' }
+        return $target
+    } catch {
+        $why = "VACUUM INTO failed for $(Split-Path -Leaf $Path), copying the files instead: $($_.Exception.Message)"
+        if (Get-Command Write-HarnessLog -ErrorAction SilentlyContinue) { Write-HarnessLog $why } else { Write-Warning $why }
+        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }
+    } finally { if ($db) { Close-Sqlite -Handle $db } }
     foreach ($suffix in '', '-wal', '-shm') {
         if (Test-Path -LiteralPath ($Path + $suffix)) { Copy-Item -LiteralPath ($Path + $suffix) -Destination (Join-Path $dir ((Split-Path -Leaf $Path) + $suffix)) }
     }

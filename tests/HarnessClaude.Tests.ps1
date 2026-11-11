@@ -7,7 +7,7 @@ $claude = Join-Path $root 'src\Harness.Claude.ps1'
 . (Import-TestFunctions -Files @($switcher) -Names @('Get-FirstValue','Get-SessionActivity','Get-SessionActivityAt','Read-ChatJson','Test-TitleNeedsSync','Set-JsonTopLevelString','Get-CodeSessionRoot','Get-CodeSessions','Get-CodeSessionStore','Copy-CodeSession'))
 . (Import-TestFunctions -Files @($core) -Names @(
     'Get-HarnessRequiredCapabilities','Register-Harness','Get-Harness','Reset-HarnessRegistry','Register-Harnesses',
-    'Get-BytesSha256Hex','Get-FileSha256Hex','Test-BundleEntryName','New-HarnessBundle','Read-ZipEntryBytes','Read-HarnessBundle','ConvertTo-CwdRef',
+    'Get-BytesSha256Hex','Get-FileSha256Hex','Test-BundleEntryName','New-HarnessBundle','Read-ZipEntryBytes','Read-HarnessBundle','Get-HarnessBundleLimits','Copy-ZipEntryChecked','ConvertTo-CwdRef','Get-HarnessMachineInfo','Get-HarnessPathRoots',
     'Get-SecretPatterns','Invoke-SecretScan','Protect-TranscriptText','Measure-SecretFindings','Protect-TranscriptEntries','Get-FirstSentence','Format-TranscriptTurn','ConvertTo-HandoffMarkdown'))
 . (Import-TestFunctions -Files @($claude) -Names @('ConvertTo-ClaudeProjectSlug','Find-ClaudeProjectDir','Get-ClaudeHomePath','Get-ClaudeToolArg','ConvertTo-ClaudeResultText','ConvertFrom-ClaudeJsonl','Get-ClaudeNativeFiles','Export-ClaudeChat','Import-ClaudeNative','Register-ClaudeHarness'))
 

@@ -145,7 +145,7 @@ try {
 # ---------------------------------------------------------------- K3: rollout transcript, export, native import
 . (Import-TestFunctions -Files @($core) -Names @(
     'Get-HarnessRequiredCapabilities', 'Register-Harness', 'Get-Harness', 'Reset-HarnessRegistry', 'Register-Harnesses',
-    'Get-BytesSha256Hex', 'Get-FileSha256Hex', 'Test-BundleEntryName', 'New-HarnessBundle', 'Read-ZipEntryBytes', 'Read-HarnessBundle', 'ConvertTo-CwdRef',
+    'Get-BytesSha256Hex', 'Get-FileSha256Hex', 'Test-BundleEntryName', 'New-HarnessBundle', 'Read-ZipEntryBytes', 'Read-HarnessBundle', 'Get-HarnessBundleLimits', 'Copy-ZipEntryChecked', 'ConvertTo-CwdRef', 'Get-HarnessMachineInfo', 'Get-HarnessPathRoots',
     'Get-SecretPatterns', 'Invoke-SecretScan', 'Protect-TranscriptText', 'Measure-SecretFindings', 'Protect-TranscriptEntries', 'Get-FirstSentence', 'Format-TranscriptTurn', 'ConvertTo-HandoffMarkdown'))
 . (Import-TestFunctions -Files @($chats) -Names @('ConvertTo-CodexToolOutput', 'Get-CodexToolArg', 'Test-CodexSystemMessage', 'ConvertFrom-CodexRollout', 'ConvertFrom-CodexItems',
     'Get-CodexThreadRow', 'Get-CodexRolloutRelPath', 'Get-CodexTranscriptEntries', 'Export-CodexChat', 'Get-CodexConfigProvider', 'Test-CodexProviderSupported', 'Import-CodexNative', 'Test-CodexImportNeedsClose'))

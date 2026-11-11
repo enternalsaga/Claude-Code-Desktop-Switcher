@@ -8,7 +8,7 @@ $chats = Join-Path $root 'src\Harness.Antigravity.Chats.ps1'
 $proto = Join-Path $root 'src\Harness.Antigravity.Proto.ps1'
 . (Import-TestFunctions -Files @($core) -Names @(
     'Get-HarnessRequiredCapabilities','Register-Harness','Get-Harness','Reset-HarnessRegistry','Register-Harnesses','Resolve-TransferMode',
-    'Get-BytesSha256Hex','Get-FileSha256Hex','Test-BundleEntryName','New-HarnessBundle','Read-ZipEntryBytes','Read-HarnessBundle','ConvertTo-CwdRef',
+    'Get-BytesSha256Hex','Get-FileSha256Hex','Test-BundleEntryName','New-HarnessBundle','Read-ZipEntryBytes','Read-HarnessBundle','Get-HarnessBundleLimits','Copy-ZipEntryChecked','ConvertTo-CwdRef','Get-HarnessMachineInfo','Get-HarnessPathRoots',
     'Get-SecretPatterns','Invoke-SecretScan','Protect-TranscriptText','Measure-SecretFindings','Protect-TranscriptEntries','Get-FirstSentence','Format-TranscriptTurn','ConvertTo-HandoffMarkdown'))
 . (Import-TestFunctions -Files @($sqlite) -Names @('Initialize-WinSqlite','ConvertTo-SqliteUtf8','Open-SqliteReadOnly','Close-Sqlite','Invoke-SqliteQuery','Copy-SqliteSnapshot'))
 . (Import-TestFunctions -Files @($chats) -Names @('ConvertFrom-AgyWorkspaceUri','Get-AgyFirstWorkspace','Get-AgyBrainTitle','Get-AgySummaryRows','ConvertTo-AgyActivity','Get-AntigravityChats','Get-AgyToolArg','Get-AgyUserText','Get-AgySystemStepTypes','ConvertFrom-AgyTranscriptJsonl','Get-AgyBrainFiles','Get-AgyStepCount','Export-AgyChat','Copy-AgyFileAtomic','Test-AgyConversationId','Test-AgyPathBelow','Import-AgyNative','Read-AgyBundleManifest','Start-AgyHandoff'))
@@ -260,7 +260,11 @@ try {
     Assert ((Import-AgyNative -BundlePath $bundle -Profile ([pscustomobject]@{ Kind = 'ide'; Name = 'Antigravity IDE'; Exe = $null; DataDir = $tgtData })) -eq 'kind-mismatch') 'kind mismatch'
     Assert (-not (Test-Path $tgtData)) 'kind mismatch writes nothing'
     Assert ((Import-AgyNative -BundlePath $bundle -Profile $tgt) -eq 'copied') 'first import copies'
-    Assert ((Get-FileSha256Hex (Join-Path $tgtData 'conversations\11111111-1111-1111-1111-111111111111.db')) -eq (Get-FileSha256Hex (Join-Path $conv '11111111-1111-1111-1111-111111111111.db'))) 'imported db is byte-identical'
+    # The exported db is a VACUUM INTO snapshot (H1d), so it matches the source by content, not byte for byte.
+    function Get-DbContentSummary($path) { $h = Open-SqliteReadOnly -Path $path; try { (@(Invoke-SqliteQuery -Handle $h -Sql 'select idx, step_type, status, hex(step_payload) as p from steps order by idx') | ForEach-Object { "$($_.idx)/$($_.step_type)/$($_.status)/$($_.p)" }) -join ';' } finally { Close-Sqlite -Handle $h } }
+    $srcSummary = Get-DbContentSummary (Join-Path $conv '11111111-1111-1111-1111-111111111111.db')
+    Assert ($srcSummary.Split(';').Count -eq 5) 'source fixture has its 5 steps'
+    Assert ((Get-DbContentSummary (Join-Path $tgtData 'conversations\11111111-1111-1111-1111-111111111111.db')) -eq $srcSummary) 'imported db has the same rows as the source'
     Assert (Test-Path (Join-Path $tgtData 'brain\11111111-1111-1111-1111-111111111111\.system_generated\logs\transcript.jsonl')) 'hidden brain folder copied'
     Assert (-not (Test-Path (Join-Path $tgtData 'conversation_summaries.db'))) 'summaries db is not created or edited'
     Assert ((Import-AgyNative -BundlePath $bundle -Profile $tgt) -eq 'exists') 'second import: exists (target not older)'

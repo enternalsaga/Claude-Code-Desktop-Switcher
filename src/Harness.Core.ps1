@@ -139,6 +139,24 @@ function Test-BundleEntryName {
     return $true
 }
 
+# Machine id/name and named folder roots come from the Sync lane (Get-SyncMachine / Get-SyncPathRoots)
+# when it is loaded; without it the values are empty, as before.
+function Get-HarnessMachineInfo {
+    if (Get-Command Get-SyncMachine -ErrorAction SilentlyContinue) {
+        $m = Get-SyncMachine
+        if ($m) { return [pscustomobject]@{ Id = $m.Id; Name = $m.Name } }
+    }
+    return [pscustomobject]@{ Id = $null; Name = $null }
+}
+
+function Get-HarnessPathRoots {
+    if (Get-Command Get-SyncPathRoots -ErrorAction SilentlyContinue) {
+        $r = Get-SyncPathRoots
+        if ($r -is [System.Collections.IDictionary]) { return $r }
+    }
+    return @{}
+}
+
 # Files: array of @{ Role; Path (entry name); SourcePath | Content }.
 function New-HarnessBundle {
     param(
@@ -146,10 +164,17 @@ function New-HarnessBundle {
         [Parameter(Mandatory)][hashtable]$Source,
         [Parameter(Mandatory)][array]$Files,
         [hashtable]$Redaction = @{ scanned = $false; findings = 0; transcriptRedacted = $false },
-        $PreviousBundleId = $null
+        $PreviousBundleId = $null,
+        [long]$MaxBytes = 512MB
     )
     Add-Type -AssemblyName System.IO.Compression
     $utf8 = New-Object Text.UTF8Encoding($false)
+    # The cap is checked on sizes alone, before any file is read or written.
+    $total = [long]0
+    foreach ($f in $Files) {
+        if ($f.ContainsKey('Content')) { $total += $utf8.GetByteCount([string]$f.Content) } else { $total += (New-Object IO.FileInfo $f.SourcePath).Length }
+    }
+    if ($total -gt $MaxBytes) { throw "bundle-too-large: $total bytes is over the $MaxBytes byte limit" }
     $entries = @()
     foreach ($f in $Files) {
         if (-not (Test-BundleEntryName $f.Path)) { throw "Unsafe bundle entry name: $($f.Path)" }
@@ -163,6 +188,11 @@ function New-HarnessBundle {
     # the working directory is redacted here (on a copy; the caller's hashtable is left alone).
     $safeSource = @{}
     foreach ($k in $Source.Keys) { $safeSource[$k] = $Source[$k] }
+    if (-not $safeSource['machineId'] -or -not $safeSource['machineName']) {
+        $mi = Get-HarnessMachineInfo
+        if (-not $safeSource['machineId']) { $safeSource['machineId'] = $mi.Id }
+        if (-not $safeSource['machineName']) { $safeSource['machineName'] = $mi.Name }
+    }
     if ($safeSource['title']) { $safeSource['title'] = Protect-TranscriptText ([string]$safeSource['title']) }
     if ($safeSource['cwd'] -is [System.Collections.IDictionary]) {
         $cwdCopy = @{}
@@ -179,21 +209,26 @@ function New-HarnessBundle {
     }
     $dir = Split-Path -Parent $OutPath
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    if (Test-Path -LiteralPath $OutPath -PathType Container) { throw "OutPath is a folder: $OutPath" }
+    # Written beside the target and moved into place last, so a failure never leaves a half-written bundle.
     $tmp = $OutPath + '.tmp'
-    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
-    $fs = [IO.File]::Create($tmp)
     try {
-        $zip = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Create)
+        $fs = [IO.File]::Create($tmp)
         try {
-            $all = @([pscustomobject]@{ Path = 'manifest.json'; Bytes = $utf8.GetBytes(($manifest | ConvertTo-Json -Depth 10)) }) + $entries
-            foreach ($e in $all) {
-                $s = $zip.CreateEntry($e.Path, [IO.Compression.CompressionLevel]::Optimal).Open()
-                try { $s.Write($e.Bytes, 0, $e.Bytes.Length) } finally { $s.Dispose() }
-            }
-        } finally { $zip.Dispose() }
-    } finally { $fs.Dispose() }
-    if (Test-Path -LiteralPath $OutPath) { Remove-Item -LiteralPath $OutPath -Force }
-    Move-Item -LiteralPath $tmp -Destination $OutPath
+            $zip = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Create)
+            try {
+                $all = @([pscustomobject]@{ Path = 'manifest.json'; Bytes = $utf8.GetBytes(($manifest | ConvertTo-Json -Depth 10)) }) + $entries
+                foreach ($e in $all) {
+                    $s = $zip.CreateEntry($e.Path, [IO.Compression.CompressionLevel]::Optimal).Open()
+                    try { $s.Write($e.Bytes, 0, $e.Bytes.Length) } finally { $s.Dispose() }
+                }
+            } finally { $zip.Dispose() }
+        } finally { $fs.Dispose() }
+        Move-Item -LiteralPath $tmp -Destination $OutPath -Force
+    } catch {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        throw
+    }
     return ($manifest | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
 }
 
@@ -204,23 +239,55 @@ function Read-ZipEntryBytes {
     try { $s.CopyTo($ms); return , $ms.ToArray() } finally { $s.Dispose(); $ms.Dispose() }
 }
 
-# Validates everything (names, format, version, listing, sha256) before writing a single file.
+# Limits for a bundle that may come from another machine (plan D6). The ratio is only judged above RatioFloor.
+function Get-HarnessBundleLimits {
+    return @{ MaxTotalBytes = 1GB; MaxEntries = 20000; MaxManifestBytes = 1MB; MaxRatio = 200; RatioFloor = 1MB }
+}
+
+# Streams one entry into $Out (when given), counting the bytes actually produced, never the sizes in the zip
+# header, and hashing on the way. Throws bundle-limit past $MaxBytes or an absurd compression ratio.
+function Copy-ZipEntryChecked {
+    param([Parameter(Mandatory)]$Entry, [IO.Stream]$Out, [Parameter(Mandatory)][long]$MaxBytes, [Parameter(Mandatory)][hashtable]$Limits)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $in = $Entry.Open()
+    try {
+        $buf = New-Object byte[] 81920; $n = [long]0
+        while (($r = $in.Read($buf, 0, $buf.Length)) -gt 0) {
+            $n += $r
+            if ($n -gt $MaxBytes) { throw "bundle-limit: $($Entry.FullName) is larger than allowed ($MaxBytes bytes)" }
+            if ($n -gt $Limits.RatioFloor -and $n -gt $Limits.MaxRatio * [Math]::Max([long]$Entry.CompressedLength, 1)) { throw "bundle-limit: $($Entry.FullName) compresses suspiciously well" }
+            [void]$sha.TransformBlock($buf, 0, $r, $null, 0)
+            if ($Out) { $Out.Write($buf, 0, $r) }
+        }
+        [void]$sha.TransformFinalBlock($buf, 0, 0)
+        return [pscustomobject]@{ Size = $n; Sha256 = (($sha.Hash | ForEach-Object { $_.ToString('x2') }) -join '') }
+    } finally { $in.Dispose(); $sha.Dispose() }
+}
+
+# Validates names, format, version, listing, sizes and sha256 while extracting into <ExtractTo>.part, which is
+# renamed to ExtractTo only when every entry is good: a failure leaves nothing behind.
 function Read-HarnessBundle {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$ExtractTo
+        [Parameter(Mandatory)][string]$ExtractTo,
+        [hashtable]$Limits = @{}
     )
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $lim = Get-HarnessBundleLimits
+    foreach ($k in $Limits.Keys) { $lim[$k] = $Limits[$k] }
     $zip = [IO.Compression.ZipFile]::OpenRead($Path)
+    $part = [IO.Path]::GetFullPath($ExtractTo).TrimEnd('\') + '.part'
     try {
+        if ($zip.Entries.Count -gt $lim.MaxEntries) { throw "bundle-limit: more than $($lim.MaxEntries) entries" }
         foreach ($e in $zip.Entries) {
             if ($e.FullName.EndsWith('/')) { continue }
             if (-not (Test-BundleEntryName $e.FullName)) { throw "Unsafe entry in bundle: $($e.FullName)" }
         }
         $mEntry = $zip.GetEntry('manifest.json')
         if (-not $mEntry) { throw 'Bundle has no manifest.json' }
-        $manifest = [Text.Encoding]::UTF8.GetString((Read-ZipEntryBytes $mEntry)) | ConvertFrom-Json
+        $mStream = New-Object IO.MemoryStream
+        try { [void](Copy-ZipEntryChecked -Entry $mEntry -Out $mStream -MaxBytes $lim.MaxManifestBytes -Limits $lim); $manifest = [Text.Encoding]::UTF8.GetString($mStream.ToArray()) | ConvertFrom-Json } finally { $mStream.Dispose() }
         if ($manifest.format -ne 'harness-bundle') { throw "Unknown bundle format: $($manifest.format)" }
         if ($manifest.version -ne 1) { throw "Unsupported bundle version: $($manifest.version)" }
         $seen = @{}
@@ -234,24 +301,33 @@ function Read-HarnessBundle {
             if ($e.FullName -eq 'manifest.json' -or $e.FullName.EndsWith('/')) { continue }
             if (-not $listed.ContainsKey($e.FullName)) { throw "Entry not listed in manifest: $($e.FullName)" }
         }
-        $payload = @{}
+        if (Test-Path -LiteralPath $part) { Remove-Item -LiteralPath $part -Recurse -Force }
+        $root = $part + '\'
+        $total = [long]0
         foreach ($f in @($manifest.files)) {
             $entry = $zip.GetEntry($f.path)
             if (-not $entry) { throw "Listed file missing from bundle: $($f.path)" }
-            if ($entry.Length -ne $f.size) { throw "Size mismatch (declared $($f.size), entry $($entry.Length)): $($f.path)" }
-            $bytes = Read-ZipEntryBytes $entry
-            if ((Get-BytesSha256Hex $bytes) -ne $f.sha256) { throw "sha256 mismatch: $($f.path)" }
-            $payload[$f.path] = $bytes
-        }
-        $root = [IO.Path]::GetFullPath($ExtractTo).TrimEnd('\') + '\'
-        foreach ($name in $payload.Keys) {
-            $target = [IO.Path]::GetFullPath((Join-Path $root ($name -replace '/', '\')))
-            if (-not $target.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "Entry escapes destination: $name" }
+            $target = [IO.Path]::GetFullPath((Join-Path $root ($f.path -replace '/', '\')))
+            if (-not $target.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "Entry escapes destination: $($f.path)" }
             $parent = Split-Path -Parent $target
             if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-            [IO.File]::WriteAllBytes($target, $payload[$name])
+            $out = [IO.File]::Create($target)
+            try { $res = Copy-ZipEntryChecked -Entry $entry -Out $out -MaxBytes ([Math]::Min([long]$f.size, $lim.MaxTotalBytes - $total)) -Limits $lim } finally { $out.Dispose() }
+            if ($res.Size -ne $f.size) { throw "Size mismatch (declared $($f.size), entry $($res.Size)): $($f.path)" }
+            if ($res.Sha256 -ne $f.sha256) { throw "sha256 mismatch: $($f.path)" }
+            $total += $res.Size
         }
+        if (Test-Path -LiteralPath $ExtractTo) {   # only an empty folder may be replaced; Delete never prompts
+            if ((Test-Path -LiteralPath $ExtractTo -PathType Leaf) -or (Get-ChildItem -LiteralPath $ExtractTo -Force | Select-Object -First 1)) { throw "Extract target exists: $ExtractTo" }
+            [IO.Directory]::Delete([IO.Path]::GetFullPath($ExtractTo))
+        }
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent ([IO.Path]::GetFullPath($ExtractTo))))
+        if (-not (Test-Path -LiteralPath $part)) { New-Item -ItemType Directory -Path $part | Out-Null }   # a bundle with no files
+        Move-Item -LiteralPath $part -Destination $ExtractTo
         return $manifest
+    } catch {
+        if (Test-Path -LiteralPath $part) { Remove-Item -LiteralPath $part -Recurse -Force -ErrorAction SilentlyContinue }
+        throw
     } finally { $zip.Dispose() }
 }
 
@@ -389,6 +465,7 @@ function ConvertTo-CwdRef {
         [Parameter(Mandatory)][string]$Path,
         [hashtable]$PathRoots = @{}
     )
+    if (-not $PathRoots -or $PathRoots.Count -eq 0) { $PathRoots = Get-HarnessPathRoots }
     $best = $null; $bestLen = -1
     foreach ($name in $PathRoots.Keys) {
         $root = ([string]$PathRoots[$name]).TrimEnd('\')
@@ -407,9 +484,17 @@ function Resolve-CwdRef {
         [Parameter(Mandatory)]$Ref,
         [hashtable]$PathRoots = @{}
     )
-    if (-not $Ref.root) { return $Ref.absolute }
+    # The ref may come from another machine, so it is validated before it becomes a path.
+    if (-not $Ref.root) {
+        $abs = [string]$Ref.absolute
+        if ($abs -match '[\x00-\x1F\x7F]' -or $abs -notmatch '^(?:[A-Za-z]:\\|\\\\)[^\\]') { return $null }
+        return $abs
+    }
     if (-not $PathRoots.ContainsKey($Ref.root)) { return $null }
     $root = ([string]$PathRoots[$Ref.root]).TrimEnd('\')
     if (-not $Ref.relative) { return $root }
-    return $root + '\' + $Ref.relative
+    $rel = [string]$Ref.relative
+    if ($rel -match '[\x00-\x1F\x7F:]' -or $rel.StartsWith('\') -or $rel.StartsWith('/')) { return $null }
+    foreach ($segment in ($rel -split '[\\/]')) { if ($segment -eq '..') { return $null } }
+    return $root + '\' + $rel
 }

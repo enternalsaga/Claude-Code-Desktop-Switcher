@@ -264,12 +264,33 @@ try {
     } finally { Close-Sqlite -Handle $db }
     Assert-Throws { Open-SqliteReadOnly -Path (Join-Path $sqlDir 'nope.sqlite') } 'missing file must throw'
 
+    # a file VACUUM INTO cannot read falls back to copying the file and its -wal / -shm
     $walSource = Join-Path $folder 'wal.sqlite'
-    Copy-Item -LiteralPath $dbPath -Destination $walSource
+    [IO.File]::WriteAllBytes($walSource, [byte[]](9, 9, 9, 9))
     [IO.File]::WriteAllBytes($walSource + '-wal', [byte[]](1, 2, 3))
     [IO.File]::WriteAllBytes($walSource + '-shm', [byte[]](4, 5))
     $walSnap = Copy-SqliteSnapshot -Path $walSource
-    Assert ((Test-Path -LiteralPath ($walSnap + '-wal')) -and (Test-Path -LiteralPath ($walSnap + '-shm'))) 'snapshot copies -wal and -shm'
+    Assert ((Test-Path -LiteralPath ($walSnap + '-wal')) -and (Test-Path -LiteralPath ($walSnap + '-shm'))) 'fallback copies -wal and -shm'
+    Assert (([IO.File]::ReadAllBytes($walSnap) -join ',') -eq '9,9,9,9') 'fallback copies the main file'
+
+    # H1d: a live WAL database (writer still open, rows only in the WAL) gives one consistent file
+    $live = Join-Path $folder 'live.sqlite'
+    $lh = [IntPtr]::Zero
+    Assert (([HarnessWinSqlite]::sqlite3_open_v2((ConvertTo-SqliteUtf8 $live), [ref]$lh, 6, [IntPtr]::Zero)) -eq 0) 'live fixture open'
+    try {
+        $liveSql = "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; create table t(id integer, v text); insert into t values(1,'in-wal'); insert into t values(2,'also-in-wal');"
+        Assert (([HarnessWinSqlite]::sqlite3_exec($lh, (ConvertTo-SqliteUtf8 $liveSql), [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero)) -eq 0) 'live fixture ddl'
+        Assert ((Test-Path -LiteralPath ($live + '-wal')) -and (Get-Item -LiteralPath ($live + '-wal')).Length -gt 0) 'the rows are in the -wal'
+        $liveSnap = Copy-SqliteSnapshot -Path $live
+        $snapFiles = @(Get-ChildItem -LiteralPath (Split-Path -Parent $liveSnap) | ForEach-Object { $_.Name })
+        Assert ($snapFiles.Count -eq 1 -and $snapFiles[0] -eq 'live.sqlite') "the snapshot is a single file: $($snapFiles -join ',')"
+        $sh = Open-SqliteReadOnly -Path $liveSnap
+        try {
+            Assert (@(Invoke-SqliteQuery -Handle $sh -Sql 'select count(*) as c from t')[0].c -eq 2) 'rows committed to the WAL are in the snapshot'
+            Assert (@(Invoke-SqliteQuery -Handle $sh -Sql 'pragma integrity_check')[0].integrity_check -eq 'ok') 'snapshot passes integrity_check'
+        } finally { Close-Sqlite -Handle $sh }
+        Remove-Item -LiteralPath (Split-Path -Parent $liveSnap) -Recurse -Force
+    } finally { [void][HarnessWinSqlite]::sqlite3_close($lh) }
     Assert ((Get-Item -LiteralPath $dbPath).Length -gt 0 -and -not (Test-Path -LiteralPath ($dbPath + '-wal'))) 'original untouched'
     Remove-Item -LiteralPath $snapDir, (Split-Path -Parent $walSnap) -Recurse -Force
 } finally { Remove-TestTempDir $sqlDir }
