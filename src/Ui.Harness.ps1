@@ -24,7 +24,8 @@ function Export-HarnessHandoffFiles {
         Copy-Item -LiteralPath (Join-Path $work 'transcript.md') -Destination $md -Force
         $entry = [ordered]@{ bundleId = $m.bundleId; source = $m.source.harness; target = $Target; at = (Get-Date).ToUniversalTime().ToString('o') }
         [IO.File]::AppendAllText((Join-Path $HandoffDir 'handoff-log.jsonl'), (($entry | ConvertTo-Json -Compress) + "`n"), (New-Object Text.UTF8Encoding($false)))
-        return [pscustomobject]@{ Path = $md; Prompt = (New-HandoffPrompt -Harness $m.source.harness -Title $m.source.title -Path $md); Manifest = $m }
+        # $script:HandoffTitleSuffix is set by Invoke-HarnessImport for a chat that changed on two machines: the new chat is named apart
+        return [pscustomobject]@{ Path = $md; Prompt = (New-HandoffPrompt -Harness $m.source.harness -Title ([string]$m.source.title + $script:HandoffTitleSuffix) -Path $md); Manifest = $m }
     } finally {
         if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
     }
@@ -41,42 +42,77 @@ function Start-HarnessHandoff {
     return [pscustomobject]@{ Path = $files.Path; Prompt = $files.Prompt; Launch = $state }
 }
 
-# Moves one chat to a target profile (or only writes the handoff file when $Target is $null) by the mode
-# Resolve-TransferMode picks. No WinForms: the dialog shows the result. Status is one of files, handoff, copied,
-# exists, imported, close-first, or provider-mismatch / not-detected (both already fell back to a handoff).
+# True when the target app must be closed before a native or Codex-import move (its chat list is not refreshed while open).
+function Test-HarnessImportBlocked {
+    param($Target, [string]$Mode)
+    if (-not $Target -or $Mode -notin 'native', 'codex-import') { return $false }
+    $to = Get-Harness -Name $Target.Harness
+    return [bool]($to.Adapter['ImportNeedsClose'] -is [scriptblock] -and (& $to.Adapter.ImportNeedsClose $Target))
+}
+
+# Step 1 of a transfer: the source adapter writes a bundle under $BundleDir. Returns the bundle path and its manifest.
+function Export-HarnessChatBundle {
+    param([Parameter(Mandatory)]$Chat, [Parameter(Mandatory)][string]$SourceHarness, [string]$BundleDir = (Join-Path (Get-HandoffDir) 'bundles'))
+    $from = Get-Harness -Name $SourceHarness
+    New-Item -ItemType Directory -Path $BundleDir -Force | Out-Null
+    $bundle = Join-Path $BundleDir ('{0}-{1}.hbundle.zip' -f $Chat.ChatId, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $manifest = & $from.Adapter.Export $Chat $bundle
+    return [pscustomobject]@{ Bundle = $bundle; Manifest = $manifest }
+}
+
+# Step 2: brings a bundle into $Target (or only writes the handoff file when $Target is $null) by the mode
+# Resolve-TransferMode picks from the bundle's own harness. -Handoff forces a handoff (a chat that changed on both
+# machines), with -TitleSuffix added to the title in the opening prompt. Status is one of files, handoff, copied,
+# updated, exists, imported, close-first, needs-root (Root says which folder to ask for), or provider-mismatch /
+# not-detected (both already fell back to a handoff). CwdMissing is set by a native import from another machine.
+function Invoke-HarnessImport {
+    param([Parameter(Mandatory)][string]$BundlePath, [Parameter(Mandatory)]$Manifest, $Target, [switch]$Handoff, [string]$TitleSuffix = '', [string]$SourceHarness = '')
+    $source = $(if ($SourceHarness) { $SourceHarness } else { [string]$Manifest.source.harness })
+    $mode = $(if (-not $Target) { 'files' } elseif ($Handoff) { 'handoff' } else { Resolve-TransferMode -Source $source -Target $Target.Harness })
+    $res = [pscustomobject]@{ Mode = $mode; Status = $mode; Bundle = $BundlePath; Manifest = $Manifest; ThreadId = $null; Path = $null; Prompt = $null; Root = $null; CwdMissing = $false }
+    if (Test-HarnessImportBlocked -Target $Target -Mode $mode) { $res.Status = 'close-first'; return $res }
+    $to = $(if ($Target) { Get-Harness -Name $Target.Harness } else { $null })
+    $script:HandoffTitleSuffix = $TitleSuffix
+    try {
+        if ($mode -eq 'files') {
+            $f = Export-HarnessHandoffFiles -BundlePath $BundlePath -Target ''
+            $res.Path = $f.Path; $res.Prompt = $f.Prompt
+            return $res
+        }
+        if ($mode -eq 'native') {
+            $r = & $to.Adapter.ImportNative $BundlePath $Target
+            # Claude between two machines answers with a hashtable; everything else with a string.
+            if ($r -is [System.Collections.IDictionary]) {
+                $res.Root = $r['Root']; $res.CwdMissing = [bool]$r['CwdMissing']
+                $r = $r['Status']
+            }
+            if ($r -ne 'provider-mismatch') { $res.Status = $(if ($r -is [string] -and $r) { $r } else { 'copied' }); return $res }
+            $res.Status = 'provider-mismatch'; $res.Mode = 'handoff'
+        } elseif ($mode -eq 'codex-import') {
+            $r = & $to.Adapter.ImportExternalClaude $BundlePath $Target
+            if ($r.Status -ne 'not-detected') { $res.Status = $r.Status; $res.ThreadId = $r.ThreadId; return $res }
+            $res.Status = 'not-detected'; $res.Mode = 'handoff'
+        }
+        $h = & $to.Adapter.ImportHandoff $BundlePath $Target
+        $res.Path = $h.Path; $res.Prompt = $h.Prompt
+        if ($res.Status -in 'native', 'codex-import', 'handoff') { $res.Status = 'handoff' }
+        return $res
+    } finally { $script:HandoffTitleSuffix = '' }
+}
+
+# Moves one chat to a target profile (or only writes the handoff file when $Target is $null): export, then import.
+# No WinForms: the dialog shows the result.
 function Invoke-HarnessTransfer {
     param(
         [Parameter(Mandatory)]$Chat, [Parameter(Mandatory)][string]$SourceHarness, $Target,
         [string]$BundleDir = (Join-Path (Get-HandoffDir) 'bundles')
     )
-    $from = Get-Harness -Name $SourceHarness
     $mode = $(if ($Target) { Resolve-TransferMode -Source $SourceHarness -Target $Target.Harness } else { 'files' })
-    $to = $(if ($Target) { Get-Harness -Name $Target.Harness } else { $null })
-    if ($to -and $mode -in 'native', 'codex-import' -and $to.Adapter['ImportNeedsClose'] -is [scriptblock] -and (& $to.Adapter.ImportNeedsClose $Target)) {
-        return [pscustomobject]@{ Mode = $mode; Status = 'close-first'; Bundle = $null; Manifest = $null; ThreadId = $null; Path = $null; Prompt = $null }
+    if (Test-HarnessImportBlocked -Target $Target -Mode $mode) {
+        return [pscustomobject]@{ Mode = $mode; Status = 'close-first'; Bundle = $null; Manifest = $null; ThreadId = $null; Path = $null; Prompt = $null; Root = $null; CwdMissing = $false }
     }
-    New-Item -ItemType Directory -Path $BundleDir -Force | Out-Null
-    $bundle = Join-Path $BundleDir ('{0}-{1}.hbundle.zip' -f $Chat.ChatId, (Get-Date -Format 'yyyyMMdd-HHmmss'))
-    $manifest = & $from.Adapter.Export $Chat $bundle
-    $res = [pscustomobject]@{ Mode = $mode; Status = $mode; Bundle = $bundle; Manifest = $manifest; ThreadId = $null; Path = $null; Prompt = $null }
-    if ($mode -eq 'files') {
-        $f = Export-HarnessHandoffFiles -BundlePath $bundle -Target ''
-        $res.Path = $f.Path; $res.Prompt = $f.Prompt
-        return $res
-    }
-    if ($mode -eq 'native') {
-        $r = & $to.Adapter.ImportNative $bundle $Target
-        if ($r -ne 'provider-mismatch') { $res.Status = $(if ($r -is [string] -and $r) { $r } else { 'copied' }); return $res }
-        $res.Status = 'provider-mismatch'; $res.Mode = 'handoff'
-    } elseif ($mode -eq 'codex-import') {
-        $r = & $to.Adapter.ImportExternalClaude $bundle $Target
-        if ($r.Status -ne 'not-detected') { $res.Status = $r.Status; $res.ThreadId = $r.ThreadId; return $res }
-        $res.Status = 'not-detected'; $res.Mode = 'handoff'
-    }
-    $h = & $to.Adapter.ImportHandoff $bundle $Target
-    $res.Path = $h.Path; $res.Prompt = $h.Prompt
-    if ($res.Status -in 'native', 'codex-import', 'handoff') { $res.Status = 'handoff' }
-    return $res
+    $exp = Export-HarnessChatBundle -Chat $Chat -SourceHarness $SourceHarness -BundleDir $BundleDir
+    return (Invoke-HarnessImport -BundlePath $exp.Bundle -Manifest $exp.Manifest -Target $Target -SourceHarness $SourceHarness)
 }
 
 # Detect says whether the app is on this machine. A harness that is not installed, or whose Detect fails, is not
@@ -107,8 +143,19 @@ function Get-HarnessTransferTargets {
 function Get-HarnessTransferMessage {
     param([Parameter(Mandatory)]$Result, [Parameter(Mandatory)]$Target)
     $name = '{0} / {1}' -f (Get-HarnessDisplayName (Get-Harness -Name $Target.Harness)), $Target.Name
+    # A native import from another machine can say the working folder is not there; every success message then adds that.
+    $folderNote = $(if ($Result.PSObject.Properties['CwdMissing'] -and $Result.CwdMissing) { " The chat's working folder does not exist on this machine yet; create it, or the chat opens without one." } else { '' })
+    if ($Result.PSObject.Properties['Divergence'] -and $Result.Divergence -eq 'diverged' -and $Result.Status -eq 'handoff') {
+        return "This chat changed on both machines, so it was not overwritten. A new chat was started in $name from the copy on Drive instead; the opening prompt is on the clipboard."
+    }
     switch ($Result.Status) {
-        'copied'            { return "Copied into $name." }
+        'copied'            { return "Copied into $name.$folderNote" }
+        'updated'           { return "Updated $name with the newer version.$folderNote" }
+        'renamed'           { return "$name already has this chat; only its title was updated." }
+        'same'              { return "$name already has this version of the chat." }
+        'needs-root'        { return "Choose where the folder '$($Result.Root)' is on this machine, then try again." }
+        'bundle-missing'    { return (Get-SyncErrorMessage -Message 'bundle-missing') }
+        'sync-conflict'     { return (Get-SyncErrorMessage -Message $(if ($Result.PSObject.Properties['Error'] -and $Result.Error) { [string]$Result.Error } else { 'sync-conflict' })) }
         'registered'        { return "The chat file was already in $name; it is now registered, so it should show in the list." }
         'copied-unregistered' { return "The chat file was copied into $name, but Codex could not register it, so it may not show in the list yet. Try the same move again." }
         'exists'            { return "$name already has this chat." }
@@ -120,11 +167,14 @@ function Get-HarnessTransferMessage {
 }
 
 function Show-HarnessExportDialog {
-    param($Source)
+    param($Source, [string]$Mode = '')
     $sources = @(Get-HarnessTransferSources)
     if (-not $sources.Count) { return }
     $targets = @(Get-HarnessTransferTargets)
-    $state = @{ Harness = $sources[0]; Profiles = @() }
+    # Google Drive is one more source (pull) and one more target (push) once sync works on this machine.
+    $syncReady = [bool]((Get-Command Test-SyncReady -ErrorAction SilentlyContinue) -and (Test-SyncReady))
+    $entries = @(Get-SyncDialogTargets -Targets $targets -SyncReady $syncReady)
+    $state = @{ Harness = $sources[0]; Profiles = @(); Drive = $false }
 
     $dlg               = New-Object System.Windows.Forms.Form
     $dlg.Text          = 'Move or hand off a chat'
@@ -141,6 +191,7 @@ function Show-HarnessExportDialog {
     $sourceBox.Location      = New-Object System.Drawing.Point(16, 14)
     $sourceBox.Size          = New-Object System.Drawing.Size(120, 26)
     foreach ($s in $sources) { $sourceBox.Items.Add((Get-HarnessDisplayName $s)) | Out-Null }
+    if ($syncReady) { $sourceBox.Items.Add('Google Drive') | Out-Null }
     $dlg.Controls.Add($sourceBox)
 
     $profileBox               = New-Object System.Windows.Forms.ComboBox
@@ -161,8 +212,9 @@ function Show-HarnessExportDialog {
     $targetBox.Location      = New-Object System.Drawing.Point(16, 330)
     $targetBox.Size          = New-Object System.Drawing.Size(570, 26)
     $targetBox.Anchor        = 'Left,Right,Bottom'
-    $targetBox.Items.Add('Handoff file only (no target)') | Out-Null
-    foreach ($t in $targets) { $targetBox.Items.Add(('{0} / {1}' -f (Get-HarnessDisplayName (Get-Harness -Name $t.Harness)), $t.Name)) | Out-Null }
+    foreach ($e in $entries) {
+        $targetBox.Items.Add($(switch ($e.Kind) { 'file' { 'Handoff file only (no target)' } 'drive' { 'Google Drive (push, encrypted)' } default { '{0} / {1}' -f (Get-HarnessDisplayName (Get-Harness -Name $e.Profile.Harness)), $e.Profile.Name } })) | Out-Null
+    }
     $dlg.Controls.Add($targetBox)
 
     $note           = New-Object System.Windows.Forms.Label
@@ -181,9 +233,11 @@ function Show-HarnessExportDialog {
 
     $refreshNote = {
         $note.Text = 'Writes a bundle and a handoff file under the switcher folder. A handoff also copies an opening prompt to the clipboard.'
-        if ($targetBox.SelectedIndex -gt 0) {
-            $t = $targets[$targetBox.SelectedIndex - 1]
-            $kind = switch (Resolve-TransferMode -Source $state.Harness.Name -Target $t.Harness) {
+        $e = $entries[[Math]::Max(0, $targetBox.SelectedIndex)]
+        if ($state.Drive) { $note.Text = 'Pick a chat from Drive and the profile that should receive it. A chat that changed on both machines arrives as a new chat.' }
+        elseif ($e.Kind -eq 'drive') { $note.Text = 'Pushes an encrypted copy of the chat to your Drive sync folder. Pull it on another machine from the same dialog.' }
+        elseif ($e.Kind -eq 'profile') {
+            $kind = switch (Resolve-TransferMode -Source $state.Harness.Name -Target $e.Profile.Harness) {
                 'native'       { 'Native copy: the chat keeps its history and can be resumed in the target.' }
                 'codex-import' { "Codex's own importer: the Claude chat becomes a Codex chat." }
                 default        { 'Handoff: the target starts a new chat from the transcript.' }
@@ -192,6 +246,14 @@ function Show-HarnessExportDialog {
         }
     }
     $loadProfiles = {
+        $state.Drive = [bool]($syncReady -and $sourceBox.SelectedIndex -eq $sources.Count)
+        $profileBox.Enabled = -not $state.Drive
+        if ($state.Drive) {
+            $profileBox.Items.Clear(); $chatList.Items.Clear(); $chatList.Tag = @()
+            $chatList.Tag = @(Get-SyncCatalogForDialog)
+            foreach ($row in $chatList.Tag) { $chatList.Items.Add((Get-SyncCatalogLine -Row $row)) | Out-Null }
+            & $refreshNote; return
+        }
         $state.Harness = $sources[[Math]::Max(0, $sourceBox.SelectedIndex)]
         $state.Profiles = @(& $state.Harness.Adapter.GetProfiles)
         $profileBox.Items.Clear()
@@ -214,24 +276,18 @@ function Show-HarnessExportDialog {
     })
     $go.Add_Click({
         if ($chatList.SelectedIndex -lt 0) { return }
-        $chat = $chatList.Tag[$chatList.SelectedIndex]
-        if ($chat.PSObject.Properties['HasRollout'] -and -not $chat.HasRollout) { Show-Message 'The file of this chat is no longer on disk, so it cannot be moved.' 'Move or hand off a chat' 'OK' 'Warning' | Out-Null; return }
-        $target = $(if ($targetBox.SelectedIndex -gt 0) { $targets[$targetBox.SelectedIndex - 1] } else { $null })
-        try {
-            $r = Invoke-HarnessTransfer -Chat $chat -SourceHarness $state.Harness.Name -Target $target
-            if ($r.Status -eq 'close-first') { Show-Message "Close $($target.Name) first, then try again. Its chat list is not refreshed while it is open." 'Move or hand off a chat' 'OK' 'Warning' | Out-Null; return }
-            if ($r.Prompt) { [System.Windows.Forms.Clipboard]::SetText($r.Prompt) }
-            $text = $(if ($target) { Get-HarnessTransferMessage -Result $r -Target $target } else { "Handoff file saved. The opening prompt is on the clipboard; paste it into a new chat." })
-            $where = (@($r.Path, $r.Bundle) | Where-Object { $_ }) -join "`r`n"
-            $warn = $(if ($r.Manifest.redaction.findings -gt 0) { "`r`n`r`nThe chat files hold $($r.Manifest.redaction.findings) possible secret(s). The handoff file is redacted; the bundle's native files are not." } else { '' })
-            Show-Message "$text`r`n`r`n$where$warn" 'Done' | Out-Null
-        } catch {
-            Show-Message "Failed: $($_.Exception.Message)" 'Move or hand off a chat' 'OK' 'Error' | Out-Null
-        }
+        $item = $chatList.Tag[$chatList.SelectedIndex]
+        if ($item.PSObject.Properties['HasRollout'] -and -not $item.HasRollout) { Show-Message 'The file of this chat is no longer on disk, so it cannot be moved.' 'Move or hand off a chat' 'OK' 'Warning' | Out-Null; return }
+        $src = $(if ($state.Drive) { @{ Kind = 'drive' } } else { @{ Kind = 'harness'; Harness = $state.Harness.Name; Profile = $state.Profiles[[Math]::Max(0, $profileBox.SelectedIndex)] } })
+        $askRoot = { param($rootName) Read-SyncFolder -Description "Where is the folder '$rootName' on this machine? The chat's working folder is inside it." }
+        $r = Invoke-HarnessDialogAction -Source $src -TargetEntry $entries[[Math]::Max(0, $targetBox.SelectedIndex)] -Item $item -AskRoot $askRoot
+        if ($r.Prompt) { [System.Windows.Forms.Clipboard]::SetText($r.Prompt) }
+        $level = switch ($r.Kind) { 'error' { 'Error' } 'warning' { 'Warning' } default { 'Information' } }
+        Show-Message ((@($r.Text, $r.Where) | Where-Object { $_ }) -join "`r`n`r`n") $(if ($r.Kind -eq 'message') { 'Done' } else { 'Move or hand off a chat' }) 'OK' $level | Out-Null
     })
 
-    $targetBox.SelectedIndex = 0
-    $sourceBox.SelectedIndex = 0
+    if ($Mode -eq 'push') { for ($i = 0; $i -lt $entries.Count; $i++) { if ($entries[$i].Kind -eq 'drive') { $targetBox.SelectedIndex = $i } } } else { $targetBox.SelectedIndex = 0 }
+    $sourceBox.SelectedIndex = $(if ($Mode -eq 'pull' -and $syncReady) { $sources.Count } else { 0 })
     [void]$dlg.ShowDialog()
     $dlg.Dispose()
 }

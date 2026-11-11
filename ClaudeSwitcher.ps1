@@ -96,6 +96,11 @@ param(
     [string]$OpenLink,
     [string]$Account,
     [string]$OpenLinksIn
+    # >>> harness-params
+    , [string]$SyncPush
+    , [string]$SyncPull
+    , [string]$SyncTarget
+    # <<< harness-params
 )
 
 $ErrorActionPreference = 'Stop'
@@ -2235,6 +2240,10 @@ if ($AddAccount) {
     if (Test-SignInRoutingOn) { Wait-RouterRetake }
     return
 }
+
+# >>> harness-cli
+if (($SyncPush -or $SyncPull) -and (Get-Command Invoke-SyncCli -ErrorAction SilentlyContinue)) { Invoke-SyncCli -Push $SyncPush -Pull $SyncPull -Target $SyncTarget; return }
+# <<< harness-cli
 
 if ($Launch) {
     # >>> harness-launch

@@ -12,7 +12,7 @@ $proto = Join-Path $root 'src\Harness.Antigravity.Proto.ps1'
     'Get-SecretPatterns','Invoke-SecretScan','Protect-TranscriptText','Measure-SecretFindings','Protect-TranscriptEntries','Get-FirstSentence','Format-TranscriptTurn','ConvertTo-HandoffMarkdown'))
 . (Import-TestFunctions -Files @($sqlite) -Names @('Initialize-WinSqlite','ConvertTo-SqliteUtf8','Open-SqliteReadOnly','Close-Sqlite','Invoke-SqliteQuery','Copy-SqliteSnapshot'))
 . (Import-TestFunctions -Files @($chats) -Names @('ConvertFrom-AgyWorkspaceUri','Get-AgyFirstWorkspace','Get-AgyBrainTitle','Get-AgySummaryRows','ConvertTo-AgyActivity','Get-AntigravityChats','Get-AgyToolArg','Get-AgyUserText','Get-AgySystemStepTypes','ConvertFrom-AgyTranscriptJsonl','Get-AgyBrainFiles','Get-AgyStepCount','Export-AgyChat','Copy-AgyFileAtomic','Test-AgyConversationId','Test-AgyPathBelow','Import-AgyNative','Read-AgyBundleManifest','Start-AgyHandoff'))
-. (Import-TestFunctions -Files @((Join-Path $root 'src\Ui.Harness.ps1')) -Names @('Invoke-HarnessTransfer'))
+. (Import-TestFunctions -Files @((Join-Path $root 'src\Ui.Harness.ps1')) -Names @('Invoke-HarnessTransfer','Test-HarnessImportBlocked','Export-HarnessChatBundle','Invoke-HarnessImport'))
 . (Import-TestFunctions -Files @($proto) -Names @('Initialize-AgyProtoWalker','ConvertFrom-AgyProtobuf','Get-AgyStepTypeTable','ConvertFrom-AgyDb'))
 . (Import-TestFunctions -Files @($profiles) -Names @('Get-AgyAppDefinitions','Get-AgyHooks','Find-AntigravityInstall','Find-AgyMainProcessId','Get-AntigravityProfiles','Start-AntigravityProfile','Register-AntigravityHarness'))
 

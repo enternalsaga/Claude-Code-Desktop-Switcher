@@ -87,6 +87,12 @@ function Add-HarnessTrayItems {
             [void]$Menu.Items.Add($bad)
         }
     }
+    # Drive sync: Push and Pull once it is set up on this machine, otherwise one entry that sets it up (Ui.Sync.ps1).
+    if (Get-Command Get-SyncTrayItems -ErrorAction SilentlyContinue) {
+        foreach ($it in @(Get-SyncTrayItems)) {
+            [void]$Menu.Items.Add((New-HarnessTrayItem -Text $it.Text -Tag $it.Action -OnClick { Invoke-SyncTrayAction -Action $this.Tag }))
+        }
+    }
 }
 
 # -Launch <harness>:<id>. Returns $false when the value is not for a registered non-Claude harness (the caller

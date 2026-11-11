@@ -490,7 +490,7 @@ while ($true) {
 
 # ---------------------------------------------------------------- K5: Invoke-HarnessTransfer dispatch
 . (Import-TestFunctions -Files @($core) -Names @('Register-Harness', 'Get-Harness', 'Get-Harnesses', 'Reset-HarnessRegistry', 'Get-HarnessRequiredCapabilities', 'Resolve-TransferMode'))
-. (Import-TestFunctions -Files @($ui) -Names @('Invoke-HarnessTransfer'))
+. (Import-TestFunctions -Files @($ui) -Names @('Invoke-HarnessTransfer','Test-HarnessImportBlocked','Export-HarnessChatBundle','Invoke-HarnessImport'))
 $tdir = New-TestTempDir
 try {
     $script:SwitcherHome = $tdir

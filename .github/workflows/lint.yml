@@ -145,6 +145,38 @@ jobs:
         shell: pwsh
         run: .\tests\HarnessAntigravity.Tests.ps1
 
+      - name: Harness sync crypto tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\HarnessSyncCrypto.Tests.ps1
+
+      - name: Harness sync crypto tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\HarnessSyncCrypto.Tests.ps1
+
+      - name: Harness sync config tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\HarnessSyncConfig.Tests.ps1
+
+      - name: Harness sync config tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\HarnessSyncConfig.Tests.ps1
+
+      - name: Harness sync store tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\HarnessSyncStore.Tests.ps1
+
+      - name: Harness sync store tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\HarnessSyncStore.Tests.ps1
+
+      - name: Harness sync UI tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\HarnessSyncUi.Tests.ps1
+
+      - name: Harness sync UI tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\HarnessSyncUi.Tests.ps1
+
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
