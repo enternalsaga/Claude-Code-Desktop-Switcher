@@ -81,18 +81,22 @@ Lane này sở hữu `tools/spikes/S2a-*`, `S3-*`, `S5-*`, `S6-*`, `S7-*` và `d
 
 **S2a: chép rollout Codex sang `CODEX_HOME` khác, cùng account, không cần user**
 
-- Tạo `CODEX_HOME` thử `%TEMP%\harness-spike\S2\home`. Chép vào đó `auth.json` của Default, chỉ trong thư mục tạm, xóa ngay sau spike; tuyệt đối không commit file này. Chép thêm `config.toml`.
+- Tạo `CODEX_HOME` thử `%TEMP%\harness-spike\S2\home`. Thư mục này **không có `auth.json`** (orchestra, 2026-11-11: không chép `auth.json` của Default ra bất kỳ đâu, kể cả `%TEMP%`). Chỉ chép `config.toml`.
 - Chép 1 rollout `.jsonl` và 1 rollout `.jsonl.zst` vào `home\sessions\YYYY\MM\DD\`.
-- Chạy `codex resume --all` dưới `CODEX_HOME` thử (dùng CLI, không mở app) và xem thread có hiện ra không. Sau đó thử `codex resume <id> "ping"` chỉ với prompt `ping`, để kiểm resume.
-  - Nếu không hiện: thử chèn dòng `threads` vào `state_5.sqlite` trong home thử bằng `sqlite3.exe` có sẵn trên máy, chỉ để làm spike.
-- Ghi lại: cơ chế nào làm thread hiện ra (tự lập chỉ mục, cần dòng `threads`, hay không được); resume có lỗi `encrypted_content` không.
-- **Dừng:** trước khi chạy `codex resume … "ping"`, kiểm tra không có `-c` nào trỏ về `~\.codex`. Lệnh chỉ dùng mức sandbox `read-only`.
+- Kiểm tra thread có hiện ra không, **không gọi model**:
+  - chạy `codex app-server` (stdio) với `CODEX_HOME` thử, gửi `initialize` rồi `thread/list`, cùng `thread/read` với `includeTurns:false`;
+  - đọc thêm `state_5.sqlite` trong home thử qua bản sao.
+  - Nếu app-server đòi đăng nhập mới chạy được, ghi lại và chuyển phần này sang S2b.
+  - Nếu thread không hiện: thử chèn dòng `threads` vào `state_5.sqlite` trong home thử bằng `sqlite3.exe` có sẵn trên máy, chỉ để làm spike, rồi lặp lại `thread/list`.
+- Ghi lại: cơ chế nào làm thread hiện ra (tự lập chỉ mục khi khởi động, cần dòng `threads`, hay không được).
+- **Không** chạy `codex resume`, không gửi turn nào. Phần thử resume chuyển sang S2b.
+- **Dừng:** trước mỗi lệnh, kiểm tra `CODEX_HOME` trỏ vào home thử và không có `-c` nào trỏ về `~\.codex`.
 
 **S3: Claude → Codex qua `externalAgentConfig/import`**
 
 - Dùng lại home thử của S2. Chạy `codex app-server` (stdio) với `CODEX_HOME` thử, gửi JSON-RPC `initialize`, rồi `externalAgentConfig/detect` (`includeHome:false`, `cwds:[<thư mục tạm>]`). Sau đó gọi `externalAgentConfig/import` với một mục `SESSIONS` trỏ vào **bản sao** của một `~\.claude\projects\…\<id>.jsonl` đặt trong thư mục tạm.
 - Lấy chữ ký message từ `codex app-server generate-json-schema --out %TEMP%\harness-spike\S3\schema`.
-- **Đạt khi:** `external_agent_session_imports.json` trong home thử có bản ghi mới, và `codex resume --all` liệt kê thread đó.
+- **Đạt khi:** `external_agent_session_imports.json` trong home thử có bản ghi mới, và `thread/list` liệt kê thread đó. Không gọi model. Nếu import đòi đăng nhập thì ghi lại, rồi chạy lại phần này trong S2b với home `spike1`.
 - Ghi thêm: `detect` có tự quét `~\.claude` thật không. Nếu có, phải truyền `cwds` hoặc `includeHome` thế nào để chỉ nhập đúng file mình chọn.
 
 **S5: transcript Antigravity và chép native**
@@ -129,7 +133,10 @@ Lane này sở hữu `tools/spikes/S1-*`, `S2b-*`, `S4-*` và `docs/specs/261111
 
 **S2b: rollout sang account khác.** Chờ S1 xong.
 
-- Lặp lại S2a với `CODEX_HOME = spike1`, nhưng giữ `auth.json` của chính spike1.
+- Lặp lại S2a với `CODEX_HOME = spike1`, dùng `auth.json` của chính spike1, tức là account thứ hai do user vừa đăng nhập. Không có auth nào khác được chép vào đây.
+- Thử resume: lấy một rollout nguồn từ Default (cùng account với Default, khác account với spike1), chép vào `spike1\sessions\…`, rồi `codex resume <id> "ping"` với `CODEX_HOME=spike1`. Chỉ dùng prompt `ping`, sandbox `read-only`.
+  - Phép thử "cùng account" không làm được vì không chép auth của Default. Ghi kết quả đó là "chưa kiểm".
+- Nếu S2a hoặc S3 ghi lại là "cần đăng nhập", chạy lại phần đó ở đây.
 - Ghi lại: resume có lỗi `encrypted_content` hay lỗi quyền không.
 - Nếu lỗi: thử bỏ các item `reasoning` có `encrypted_content` trong một bản sao rollout rồi resume lại.
 - Kết luận: native Codex khác account là Đạt, Không đạt, hoặc chỉ đạt sau khi bỏ reasoning.
@@ -205,7 +212,8 @@ Lane C sở hữu `src/Harness.Core.ps1`, `src/Harness.Claude.ps1`, `src/Ui.Harn
   - Hàm `ConvertTo-ClaudeProjectSlug`: test với ví dụ `H:\AI_Software\Claude-Code-Desktop-Switcher` → `H--AI-Software-Claude-Code-Desktop-Switcher`.
 - `tools/Build-SingleFile.ps1`: thay khối giữa `# >>> harness-src` và `# <<< harness-src` trong một bản sao `ClaudeSwitcher.ps1` bằng nội dung `src\*.ps1` theo thứ tự cố định, ghi ra `dist\ClaudeSwitcher.ps1`.
   - `dist\` được thêm vào `.gitignore`. Thay đổi này nằm trong commit của C6, vì `.gitignore` thuộc lane C.
-- `tools/Invoke-Gate.ps1`: parse cộng mọi `tests/*.Tests.ps1` trên PS 5.1. Có `pwsh` thì chạy thêm PS 7, có PSScriptAnalyzer thì chạy thêm phần phân tích. Exit khác 0 khi có lỗi.
+- `tools/Invoke-Gate.ps1`: parse cộng mọi `tests/*.Tests.ps1` trên PS 5.1, cộng `Invoke-ScriptAnalyzer -Path . -Recurse`, fail khi có lỗi mức Error giống CI. Có `pwsh` thì chạy thêm PS 7. Exit khác 0 khi có lỗi.
+- Cài PSScriptAnalyzer (orchestra cho phép, 2026-11-11): `powershell -NoProfile -Command "Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck"`. **Không cài `pwsh`**; phần PS 7 để CI kiểm.
 - Test:
   - `tests\HarnessClaude.Tests.ps1`: fixture giống `ChatTransfer.Tests.ps1`, thêm jsonl. Export rồi Import native sang profile giả ra kết quả byte-identical với `Copy-CodeSession` cũ.
   - `tests\BuildSingleFile.Tests.ps1`: file `dist` parse được, chứa đủ hàm, và không còn dòng dot-source `src\`.
@@ -257,8 +265,19 @@ GĐ2 (Codex) và GĐ3 (Antigravity) chỉ được viết plan sau khi: GĐ0 có
 
 ## 6. Cần quyết (orchestra)
 
-- **PS 7 và PSScriptAnalyzer:** máy chưa có `pwsh`, cũng chưa cài PSScriptAnalyzer. Hai lựa chọn:
-  - (a) cài `pwsh` qua winget và cài PSScriptAnalyzer (`Install-Module -Scope CurrentUser`) để gate local giống CI;
-  - (b) chấp nhận hai phần này chỉ được kiểm trên CI sau khi push.
-  - Đề xuất (a). Đây là việc cài đặt, thuộc thẩm quyền của orchestra.
-- **S2a dùng bản sao `auth.json` của Default trong `%TEMP%`:** cần orchestra đồng ý. Phương án thay thế là chỉ kiểm việc rollout có hiện trong danh sách hay không (`codex resume --all` không gọi model), bỏ bước `ping`.
+Đã quyết (orchestra, 2026-11-11):
+
+- Lane C cài PSScriptAnalyzer ở scope CurrentUser, làm ở task C6. Không cài `pwsh`; phần PS 7 để CI kiểm.
+- Không chép `auth.json` của Default ra bất kỳ đâu. S2a chỉ kiểm danh sách thread, không gọi model; phần thử resume chuyển sang S2b, dùng auth riêng của `spike1`.
+
+## 7. Worktree và người duyệt
+
+| Lane | Worktree | Nhánh | Base |
+|---|---|---|---|
+| SP-A | `H:\AI_Software\Claude-Code-Desktop-Switcher\.worktrees\spike-a` | `mh-spike-a` | cdbe124 |
+| SP-B | `H:\AI_Software\Claude-Code-Desktop-Switcher\.worktrees\spike-b` | `mh-spike-b` | cdbe124 |
+| C | `H:\AI_Software\Claude-Code-Desktop-Switcher\.worktrees\core` | `mh-core` | cdbe124 |
+
+- Người duyệt của cả ba lane: `switcher-think-multiharness` (local_16d53f2d-cb24-4b5c-8d40-db17aa4a98fe), là một session khác với các session work.
+- Lane gửi `SẴN SÀNG CHUYẾN` cho người duyệt. Người duyệt gửi `NEEDS FIX` thẳng cho lane đó, hoặc gửi `LAND OK <nhánh> <base>..<sha>` cho orchestra.
+- Commit sửa plan này nằm trên `desktop-4.29-patches`, sau cdbe124. Các lane đọc plan từ checkout chính (`H:\AI_Software\Claude-Code-Desktop-Switcher\docs\plans\…`), không đọc bản trong worktree, vì bản đó cũ hơn.
