@@ -41,74 +41,173 @@ function Start-HarnessHandoff {
     return [pscustomobject]@{ Path = $files.Path; Prompt = $files.Prompt; Launch = $state }
 }
 
+# Moves one chat to a target profile (or only writes the handoff file when $Target is $null) by the mode
+# Resolve-TransferMode picks. No WinForms: the dialog shows the result. Status is one of files, handoff, copied,
+# exists, imported, close-first, or provider-mismatch / not-detected (both already fell back to a handoff).
+function Invoke-HarnessTransfer {
+    param(
+        [Parameter(Mandatory)]$Chat, [Parameter(Mandatory)][string]$SourceHarness, $Target,
+        [string]$BundleDir = (Join-Path (Get-HandoffDir) 'bundles')
+    )
+    $from = Get-Harness -Name $SourceHarness
+    $mode = $(if ($Target) { Resolve-TransferMode -Source $SourceHarness -Target $Target.Harness } else { 'files' })
+    $to = $(if ($Target) { Get-Harness -Name $Target.Harness } else { $null })
+    if ($to -and $mode -in 'native', 'codex-import' -and $to.Adapter['ImportNeedsClose'] -is [scriptblock] -and (& $to.Adapter.ImportNeedsClose $Target)) {
+        return [pscustomobject]@{ Mode = $mode; Status = 'close-first'; Bundle = $null; Manifest = $null; ThreadId = $null; Path = $null; Prompt = $null }
+    }
+    New-Item -ItemType Directory -Path $BundleDir -Force | Out-Null
+    $bundle = Join-Path $BundleDir ('{0}-{1}.hbundle.zip' -f $Chat.ChatId, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $manifest = & $from.Adapter.Export $Chat $bundle
+    $res = [pscustomobject]@{ Mode = $mode; Status = $mode; Bundle = $bundle; Manifest = $manifest; ThreadId = $null; Path = $null; Prompt = $null }
+    if ($mode -eq 'files') {
+        $f = Export-HarnessHandoffFiles -BundlePath $bundle -Target ''
+        $res.Path = $f.Path; $res.Prompt = $f.Prompt
+        return $res
+    }
+    if ($mode -eq 'native') {
+        $r = & $to.Adapter.ImportNative $bundle $Target
+        if ($r -ne 'provider-mismatch') { $res.Status = $(if ($r -is [string] -and $r) { $r } else { 'copied' }); return $res }
+        $res.Status = 'provider-mismatch'; $res.Mode = 'handoff'
+    } elseif ($mode -eq 'codex-import') {
+        $r = & $to.Adapter.ImportExternalClaude $bundle $Target
+        if ($r.Status -ne 'not-detected') { $res.Status = $r.Status; $res.ThreadId = $r.ThreadId; return $res }
+        $res.Status = 'not-detected'; $res.Mode = 'handoff'
+    }
+    $h = & $to.Adapter.ImportHandoff $bundle $Target
+    $res.Path = $h.Path; $res.Prompt = $h.Prompt
+    if ($res.Status -in 'native', 'codex-import', 'handoff') { $res.Status = 'handoff' }
+    return $res
+}
+
+function Get-HarnessTransferMessage {
+    param([Parameter(Mandatory)]$Result, [Parameter(Mandatory)]$Target)
+    $name = '{0} / {1}' -f (Get-HarnessDisplayName (Get-Harness -Name $Target.Harness)), $Target.Name
+    switch ($Result.Status) {
+        'copied'            { return "Copied into $name." }
+        'exists'            { return "$name already has this chat." }
+        'imported'          { return "Imported into $name through Codex's own importer." }
+        'provider-mismatch' { return "The model provider of this chat is not set up in $name, so it cannot be resumed there. A handoff was made instead; the opening prompt is on the clipboard." }
+        'not-detected'      { return "Codex did not find the Claude session on this machine. A handoff was made instead; the opening prompt is on the clipboard." }
+        default             { return "Handoff into $name started. The opening prompt is on the clipboard; paste it into the new chat." }
+    }
+}
+
 function Show-HarnessExportDialog {
     param($Source)
-    $harness = Get-Harness -Name 'claude'
-    $profiles = @(& $harness.Adapter.GetProfiles)
-    if (-not $Source) { $Source = $profiles | Select-Object -First 1 }
+    $sources = @(Get-Harnesses | Where-Object { $_.Name -in 'claude', 'codex' } | Sort-Object Name)
+    if (-not $sources.Count) { return }
+    $targets = New-Object System.Collections.ArrayList   # one entry per profile of every registered harness
+    foreach ($h in (Get-Harnesses | Sort-Object Name)) {
+        try { foreach ($p in @(& $h.Adapter.GetProfiles)) { [void]$targets.Add($p) } } catch { }
+    }
+    $state = @{ Harness = $sources[0]; Profiles = @() }
 
     $dlg               = New-Object System.Windows.Forms.Form
-    $dlg.Text          = 'Export chat for handoff'
-    $dlg.Size          = New-Object System.Drawing.Size(620, 440)
-    $dlg.MinimumSize   = New-Object System.Drawing.Size(480, 340)
+    $dlg.Text          = 'Move or hand off a chat'
+    $dlg.Size          = New-Object System.Drawing.Size(620, 520)
+    $dlg.MinimumSize   = New-Object System.Drawing.Size(480, 420)
     $dlg.StartPosition = 'CenterParent'
     $dlg.ShowInTaskbar = $false
     $dlg.MinimizeBox   = $false
     $dlg.BackColor     = $bg
     $dlg.Font          = $fontUI
 
+    $sourceBox               = New-Object System.Windows.Forms.ComboBox
+    $sourceBox.DropDownStyle = 'DropDownList'
+    $sourceBox.Location      = New-Object System.Drawing.Point(16, 14)
+    $sourceBox.Size          = New-Object System.Drawing.Size(120, 26)
+    foreach ($s in $sources) { $sourceBox.Items.Add((Get-HarnessDisplayName $s)) | Out-Null }
+    $dlg.Controls.Add($sourceBox)
+
     $profileBox               = New-Object System.Windows.Forms.ComboBox
     $profileBox.DropDownStyle = 'DropDownList'
-    $profileBox.Location      = New-Object System.Drawing.Point(16, 14)
-    $profileBox.Size          = New-Object System.Drawing.Size(570, 26)
+    $profileBox.Location      = New-Object System.Drawing.Point(146, 14)
+    $profileBox.Size          = New-Object System.Drawing.Size(440, 26)
     $profileBox.Anchor        = 'Top,Left,Right'
-    foreach ($p in $profiles) { $profileBox.Items.Add($p.Name) | Out-Null }
     $dlg.Controls.Add($profileBox)
 
     $chatList          = New-Object System.Windows.Forms.ListBox
     $chatList.Location = New-Object System.Drawing.Point(16, 50)
-    $chatList.Size     = New-Object System.Drawing.Size(570, 280)
+    $chatList.Size     = New-Object System.Drawing.Size(570, 270)
     $chatList.Anchor   = 'Top,Left,Right,Bottom'
     $dlg.Controls.Add($chatList)
 
+    $targetBox               = New-Object System.Windows.Forms.ComboBox
+    $targetBox.DropDownStyle = 'DropDownList'
+    $targetBox.Location      = New-Object System.Drawing.Point(16, 330)
+    $targetBox.Size          = New-Object System.Drawing.Size(570, 26)
+    $targetBox.Anchor        = 'Left,Right,Bottom'
+    $targetBox.Items.Add('Handoff file only (no target)') | Out-Null
+    foreach ($t in $targets) { $targetBox.Items.Add(('{0} / {1}' -f (Get-HarnessDisplayName (Get-Harness -Name $t.Harness)), $t.Name)) | Out-Null }
+    $dlg.Controls.Add($targetBox)
+
     $note           = New-Object System.Windows.Forms.Label
-    $note.Text      = 'Writes a bundle and a handoff file under the switcher folder and copies an opening prompt to the clipboard.'
     $note.ForeColor = $ink
-    $note.Location  = New-Object System.Drawing.Point(16, 338)
-    $note.Size      = New-Object System.Drawing.Size(570, 20)
+    $note.Location  = New-Object System.Drawing.Point(16, 364)
+    $note.Size      = New-Object System.Drawing.Size(570, 40)
     $note.Anchor    = 'Left,Right,Bottom'
     $dlg.Controls.Add($note)
 
-    $export          = New-Object System.Windows.Forms.Button
-    $export.Text     = 'Export'
-    $export.Location = New-Object System.Drawing.Point(16, 364)
-    $export.Size     = New-Object System.Drawing.Size(108, 34)
-    $export.Anchor   = 'Left,Bottom'
-    $dlg.Controls.Add($export)
+    $go          = New-Object System.Windows.Forms.Button
+    $go.Text     = 'Go'
+    $go.Location = New-Object System.Drawing.Point(16, 416)
+    $go.Size     = New-Object System.Drawing.Size(108, 34)
+    $go.Anchor   = 'Left,Bottom'
+    $dlg.Controls.Add($go)
 
+    $refreshNote = {
+        $note.Text = 'Writes a bundle and a handoff file under the switcher folder. A handoff also copies an opening prompt to the clipboard.'
+        if ($targetBox.SelectedIndex -gt 0) {
+            $t = $targets[$targetBox.SelectedIndex - 1]
+            $kind = switch (Resolve-TransferMode -Source $state.Harness.Name -Target $t.Harness) {
+                'native'       { 'Native copy: the chat keeps its history and can be resumed in the target.' }
+                'codex-import' { "Codex's own importer: the Claude chat becomes a Codex chat." }
+                default        { 'Handoff: the target starts a new chat from the transcript.' }
+            }
+            $note.Text = "Kind: $kind"
+        }
+    }
+    $loadProfiles = {
+        $state.Harness = $sources[[Math]::Max(0, $sourceBox.SelectedIndex)]
+        $state.Profiles = @(& $state.Harness.Adapter.GetProfiles)
+        $profileBox.Items.Clear()
+        foreach ($p in $state.Profiles) { $profileBox.Items.Add($p.Name) | Out-Null }
+        if ($state.Profiles.Count) {
+            $pick = 0
+            if ($Source -and $state.Harness.Name -eq 'claude') { for ($i = 0; $i -lt $state.Profiles.Count; $i++) { if ($state.Profiles[$i].Id -eq $Source.Id) { $pick = $i } } }
+            $profileBox.SelectedIndex = $pick
+        } else { $chatList.Items.Clear(); $chatList.Tag = @() }
+        & $refreshNote
+    }
+    $sourceBox.Add_SelectedIndexChanged($loadProfiles)
+    $targetBox.Add_SelectedIndexChanged($refreshNote)
     $profileBox.Add_SelectedIndexChanged({
         $chatList.Items.Clear()
-        $chatList.Tag = @(& $harness.Adapter.ListChats $profiles[$profileBox.SelectedIndex])
-        foreach ($c in $chatList.Tag) { $chatList.Items.Add(('{0}   ({1})' -f $c.Title, $(if ($c.Cwd) { Split-Path $c.Cwd -Leaf } else { 'no folder' }))) | Out-Null }
+        if ($profileBox.SelectedIndex -lt 0) { return }
+        try { $chatList.Tag = @(& $state.Harness.Adapter.ListChats $state.Profiles[$profileBox.SelectedIndex]) }
+        catch { $chatList.Tag = @(); Show-Message "Could not list chats: $($_.Exception.Message)" 'Move or hand off a chat' 'OK' 'Error' | Out-Null; return }
+        foreach ($c in $chatList.Tag) { $chatList.Items.Add(('{0}   ({1})' -f $c.Title, $(if ($c.PSObject.Properties['HasRollout'] -and -not $c.HasRollout) { 'chat file no longer on disk' } elseif ($c.Cwd) { Split-Path $c.Cwd -Leaf } else { 'no folder' }))) | Out-Null }
     })
-    $export.Add_Click({
+    $go.Add_Click({
         if ($chatList.SelectedIndex -lt 0) { return }
         $chat = $chatList.Tag[$chatList.SelectedIndex]
+        if ($chat.PSObject.Properties['HasRollout'] -and -not $chat.HasRollout) { Show-Message 'The file of this chat is no longer on disk, so it cannot be moved.' 'Move or hand off a chat' 'OK' 'Warning' | Out-Null; return }
+        $target = $(if ($targetBox.SelectedIndex -gt 0) { $targets[$targetBox.SelectedIndex - 1] } else { $null })
         try {
-            $bundleDir = Join-Path (Get-HandoffDir) 'bundles'
-            $bundle = Join-Path $bundleDir ('{0}-{1}.hbundle.zip' -f $chat.ChatId, (Get-Date -Format 'yyyyMMdd-HHmmss'))
-            $manifest = & $harness.Adapter.Export $chat $bundle
-            $files = Export-HarnessHandoffFiles -BundlePath $bundle -Target ''
-            [System.Windows.Forms.Clipboard]::SetText($files.Prompt)
-            $warn = $(if ($manifest.redaction.findings -gt 0) { "`r`n`r`nThe chat files hold $($manifest.redaction.findings) possible secret(s). The handoff file is redacted; the bundle's native files are not." } else { '' })
-            Show-Message "Saved:`r`n$($files.Path)`r`n$bundle`r`n`r`nThe opening prompt is on the clipboard. Paste it into a new chat.$warn" 'Handoff ready' | Out-Null
+            $r = Invoke-HarnessTransfer -Chat $chat -SourceHarness $state.Harness.Name -Target $target
+            if ($r.Status -eq 'close-first') { Show-Message "Close $($target.Name) first, then try again. Its chat list is not refreshed while it is open." 'Move or hand off a chat' 'OK' 'Warning' | Out-Null; return }
+            if ($r.Prompt) { [System.Windows.Forms.Clipboard]::SetText($r.Prompt) }
+            $text = $(if ($target) { Get-HarnessTransferMessage -Result $r -Target $target } else { "Handoff file saved. The opening prompt is on the clipboard; paste it into a new chat." })
+            $where = (@($r.Path, $r.Bundle) | Where-Object { $_ }) -join "`r`n"
+            $warn = $(if ($r.Manifest.redaction.findings -gt 0) { "`r`n`r`nThe chat files hold $($r.Manifest.redaction.findings) possible secret(s). The handoff file is redacted; the bundle's native files are not." } else { '' })
+            Show-Message "$text`r`n`r`n$where$warn" 'Done' | Out-Null
         } catch {
-            Show-Message "Export failed: $($_.Exception.Message)" 'Export chat for handoff' 'OK' 'Error' | Out-Null
+            Show-Message "Failed: $($_.Exception.Message)" 'Move or hand off a chat' 'OK' 'Error' | Out-Null
         }
     })
 
-    $start = [Math]::Max(0, [Array]::FindIndex($profiles, [Predicate[object]]{ param($p) $p.Id -eq $Source.Id }))
-    if ($profiles.Count) { $profileBox.SelectedIndex = $start }
+    $targetBox.SelectedIndex = 0
+    $sourceBox.SelectedIndex = 0
     [void]$dlg.ShowDialog()
     $dlg.Dispose()
 }

@@ -172,3 +172,40 @@ Công cụ thêm: `tools/spikes/S4-CredStamp.ps1` (chỉ in tên mục và thờ
   - Tách dữ liệu agent và chạy song song: **Đạt** nếu đặt home riêng cho process con (`USERPROFILE`, `HOME`); `ANTIGRAVITY_GEMINI_DIR` không đủ.
   - Tách đăng nhập: **Không đạt** trên cùng user Windows (Credential Manager dùng chung). Hai account chỉ chạy song song nếu mỗi instance tự giữ phiên, điều chưa chứng minh. Mặc định giữ nguyên: Antigravity một account, ẩn Add account (§3.3). Native chép `<id>.db` + `brain\<id>` là khả thi về mặt hiển thị (§6, giai đoạn 3b) nhưng phần tiếp tục chat chưa kiểm.
   - Nếu sau này cho phép Add account: phải cảnh báo rằng đăng nhập ở profile mới có thể đăng xuất Default.
+
+## S8: chat Codex trong home đã có DB, transcript `.zst`, app-server song song, `codex.exe` trong package (lane 2b) — **ĐẠT**
+
+Chạy 2026-11-11 trên `spike1` (account 2, app đã đóng trừ phần S8c) và home tạm `%TEMP%\harness-spike\S8\*`. Nguồn rollout chỉ đọc từ Default. Không có turn nào gửi tới model (chỉ `initialize`, `thread/list`, `thread/read`, `thread/resume`, `thread/items/list`). Script: `tools/spikes/S8-*.ps1` (đường dẫn rollout truyền bằng tham số).
+
+### S8a: đăng ký thread vào home đã có DB, không gọi model — ĐẠT, không cần resume và không cần chèn dòng
+
+- Lệnh: `& .\tools\spikes\S8-ThreadRegister.ps1 -CodexHome <home> -Rollout <rollout tương đối dưới ~\.codex\sessions> [-SourceRoot <thư mục khác>] [-SkipResume]`. Rollout thử là bản `openai` có tin nhắn user, đổi sang id mới (`S8-MakeSyntheticRollout.ps1`) vì mọi rollout thật phù hợp đã có trong `spike1`.
+- Kết quả, lặp lại được ở cả `spike1` (5 dòng sẵn có) và home tạm có DB:
+  - Ngay sau `initialize`, `thread/list` (theo F5) **đã liệt kê** rollout vừa thả (app-server quét `sessions\`), trong khi `state_5.sqlite` chưa có dòng; sau khoảng 10 giây (hoặc ngay khi `thread/read` theo id) dòng `threads` xuất hiện trong DB. `thread/resume` (không `turn/start`) trả `ok`, `status=idle`, không đổi gì thêm. Khởi động lại app-server không làm mất thread.
+  - Thread **không có tin nhắn user** (preview rỗng) được đăng ký vào DB nhưng **không hiện** trong `thread/list` (bộ lọc hiển thị cần `preview<>''`); đó là hành vi bình thường, rollout trống cũng bị ẩn ở Default.
+- Khác với F3 (S2b ghi "home đã có DB thì thread không hiện cho tới khi resume theo id"): ở hai lần chạy này nó hiện mà không cần resume. Chưa giải thích được chắc chắn sự khác biệt (nghi do rollout S2b có preview rỗng, hoặc đo quá sớm). Hệ quả an toàn cho sản phẩm: sau khi chép rollout, **khởi một app-server trên home đích, `initialize`, `thread/read {threadId}`, chờ dòng `threads` xuất hiện (tối đa ~30 giây)**; không dùng `thread/resume` và không chèn dòng.
+- Chưa kiểm bằng mắt: cửa sổ app spike1 có hiện thread này không (không điều khiển được GUI trong spike này). S8c cho thấy app đang mở không chặn việc đăng ký.
+
+### S8b: transcript cho rollout `.zst` — ĐẠT qua app-server
+
+- Lệnh: `& .\tools\spikes\S8-TranscriptProbe.ps1 -ZstRollout <rel> [-JsonlRollout <rel>] -Resume`.
+- Cách làm được: `thread/read` rồi `thread/resume` (không `turn/start`), chờ vài giây, rồi `thread/items/list {threadId, limit}` phân trang bằng `nextCursor`. Chưa `resume` thì `items`/`turns` trả rỗng.
+- Kết quả: rollout `.zst` 73 KB cho 14 item: `userMessage` ×1, `agentMessage` ×2, `reasoning` ×6, `commandExecution` ×2, `webSearch` ×3. Mỗi phần tử có `{turnId, item, startedAtMs, completedAtMs}`. `userMessage.content[].text` và `agentMessage.text` đủ làm transcript. Rollout `.jsonl` cho cùng dạng. Không cần đăng nhập (home tạm không có `auth.json`).
+- Phương án đọc thẳng `thread_history_1.sqlite` không cần dùng.
+- Hệ quả cho K3: `.zst` lấy transcript bằng app-server trên home đích tạm hoặc chính home nguồn. Với bản chép Default thì dùng home tạm chỉ có rollout đó (không đụng Default, không cần auth).
+
+### S8c: app-server chạy song song với app đang mở trên cùng `CODEX_HOME` — an toàn trong phạm vi đã thử
+
+- Lệnh: `& .\tools\spikes\S8-ConcurrentAppServer.ps1 -Name spike1 -SyntheticRel <rel> -SyntheticRoot <root>` (mở app spike1 bằng S1, chạy app-server thứ hai cùng home, rồi chỉ đóng cây process do script mở).
+- `initialize` mất ~120 ms khi app đang chạy. 4 lần `thread/list` cách nhau 4 giây, `thread/read`, và đăng ký thread mới đều thành công; stderr không có `locked`/`busy`; dòng `threads` được ghi vào DB.
+- Giới hạn: ít thao tác, không có ghi đồng thời từ phía app. Chưa biết giao diện app đang mở có tự làm mới danh sách khi DB đổi từ bên ngoài. Quyết định cho `Test-CodexImportNeedsClose`: **trả true khi app của profile đích đang chạy** (mặc định an toàn của plan R2), dù thử nghiệm không thấy lỗi khóa; có thể nới sau khi kiểm giao diện.
+
+### S8d: `codex.exe` trong package — chạy được từ ngoài package
+
+- `<InstallLocation>\app\resources\codex.exe --version` → `codex-cli 0.167.0-alpha.3.2`, `login --help` chạy được (exit 0). Dùng được cho `codex login` (P3) và làm `CodexExe` (P1). CLI npm hiện là 0.167.1 (dự phòng). `AppId` trong manifest là `App` (khớp `Aumid = <PackageFamilyName>!App`). Đã nhắn lane 2a.
+
+### Phát hiện phụ cho K2/K3 (cần biết khi viết mã)
+
+- `threads.rollout_path` có thể không khớp tên file thật: nhiều dòng ghi `….jsonl` trong khi file trên đĩa là `….jsonl.zst`, và đường dẫn có tiền tố `\\?\`. Khi tìm rollout phải thử cả `path` và `path + '.zst'`.
+- Cột `source` của thread subagent là chuỗi JSON `{"subagent":…}`; cột `thread_source` là `subagent` (728 dòng), `user` (710), `agent_created_thread` (20), `chatgpt_handoff` (1), `onboarding_checklist` (2). Lọc chat người dùng bằng `thread_source NOT IN ('subagent')` (xem K2).
+- **Rủi ro cho giá trị của native Default → profile khác:** ở Default, 773 chat có `model_provider=codex_local_access` (đường Cockpit) và chỉ 688 dòng `openai`, trong đó hầu hết là subagent (665/688); chỉ ~3 thread người dùng `openai`. Với account thường, `Import-CodexNative` sẽ trả `provider-mismatch` cho gần như mọi chat của Default, nên đường handoff sẽ là đường chính cho Default → profile phụ.

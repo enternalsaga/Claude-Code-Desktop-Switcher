@@ -113,6 +113,22 @@ jobs:
         shell: pwsh
         run: .\tests\HarnessClaude.Tests.ps1
 
+      - name: Harness Codex profile tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\HarnessCodexProfiles.Tests.ps1
+
+      - name: Harness Codex profile tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\HarnessCodexProfiles.Tests.ps1
+
+      - name: Harness Codex chat tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\HarnessCodexChats.Tests.ps1
+
+      - name: Harness Codex chat tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\HarnessCodexChats.Tests.ps1
+
       - name: Single-file build tests (Windows PowerShell 5.1)
         shell: powershell
         run: .\tests\BuildSingleFile.Tests.ps1
