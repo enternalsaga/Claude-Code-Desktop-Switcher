@@ -1,7 +1,7 @@
 # Spec: trình quản lý chung 3 harness (Claude, Codex, Antigravity) và đồng bộ qua Google Drive
 
 - Ngày: 2026-11-11
-- Trạng thái: bản nháp, chờ orchestra duyệt
+- Trạng thái: đã duyệt (orchestra, 2026-11-11, 20955bb), Q1–Q12 theo mặc định
 - Phạm vi: chỉ thiết kế. Chưa có plan, chưa có code.
 - Nhánh gốc: `desktop-4.29-patches` (fork của `PriyanshuGeTRekT/Claude-Code-Desktop-Switcher`)
 
@@ -111,8 +111,10 @@ Ký hiệu: **[XM]** đã xác minh trên máy, **[GĐ]** là giả định, c�
 ClaudeSwitcher.ps1            entry, UI chính, Claude (upstream + các local patch hiện có)
 src/Harness.Core.ps1          registry adapter, kiểu dữ liệu chung, bundle, redaction, crypto, winsqlite
 src/Harness.Claude.ps1        adapter Claude: bọc các hàm sẵn có (Get-CodeSessions, Copy-CodeSession…)
-src/Harness.Codex.ps1         adapter Codex
-src/Harness.Antigravity.ps1   adapter Antigravity
+src/Harness.Codex.Profiles.ps1       adapter Codex: Detect, profile, launch, nhận diện instance (lane 2a)
+src/Harness.Codex.Chats.ps1          adapter Codex: ListChats, Export, ImportNative, Codex import (lane 2b)
+src/Harness.Antigravity.Profiles.ps1 adapter Antigravity: Detect, profile, launch (lane 3a)
+src/Harness.Antigravity.Chats.ps1    adapter Antigravity: ListChats, Export, ImportNative (lane 3a/3b)
 src/Sync.Drive.ps1            dò Drive, push/pull bundle, path map
 src/Ui.Harness.ps1            dialog transfer mới, tab harness, menu tray theo harness
 tools/Build-SingleFile.ps1    ghép src/*.ps1 vào giữa marker để ra dist/ClaudeSwitcher.ps1 cho bản release một file
@@ -127,6 +129,7 @@ tests/*.Tests.ps1             nạp hàm từ nhiều file qua một helper chun
 - `-Install` chép cả `src\` vào `%LOCALAPPDATA%\ClaudeProfiles\.switcher\`. Cài một dòng (`irm …`) thì dùng bản `dist` đã ghép.
 - `Show-TransferDialog` cũ giữ nguyên cho tới khi dialog mới thay thế được nó, rồi mới bỏ trong một commit riêng.
 - Tên app vẫn để "Claude Profile Switcher" cho tới khi có quyết định khác (Q1).
+- **Mỗi file chỉ một lane ghi** (orchestra, 2026-11-11). Adapter tách thành hai file `*.Profiles.ps1` và `*.Chats.ps1`, rồi gộp lại trong một hàm đăng ký nằm ở file `*.Profiles.ps1`. Hàm đăng ký nhận các năng lực về chat theo tên hàm, nên lane chat không phải sửa file profile.
 
 ### 3.2 Mô hình adapter
 
@@ -289,7 +292,8 @@ HarnessSync/
   - Khóa dẫn xuất từ passphrase bằng PBKDF2-SHA256, 600.000 vòng (`Rfc2898DeriveBytes` với `HashAlgorithmName`, có từ .NET 4.7.2), salt lấy từ `sync.json`.
   - `keyCheck` là HMAC của một hằng số, để báo sai passphrase ngay lập tức.
   - DPAPI **chỉ dùng để cache passphrase trên từng máy** (CurrentUser). Máy mới hỏi passphrase một lần.
-  - Không có dịch vụ khóa nào. Mất passphrase thì mất các bundle đã mã hóa; UI phải nói rõ điều này khi bật sync.
+  - Không có dịch vụ khóa nào. Mất passphrase thì mất các bundle đã mã hóa.
+  - **Lần đầu bật sync** (orchestra, 2026-11-11): UI bắt buộc hỏi passphrase, nhập hai lần, và hiện rõ dòng "Mất passphrase = mất bundle trên Drive (dữ liệu gốc trên máy vẫn còn)". User phải tick xác nhận đã đọc thì mới bật được.
 - Không đưa vào bundle: `auth.json`, cookies, `config.json` của profile, hoặc bất kỳ file nào nằm ngoài danh sách native của adapter. Phần này là danh sách cho phép (allowlist), không phải danh sách chặn.
 - Repo không chứa email, token Drive hay đường dẫn cá nhân. Test dùng fixture giả.
 
@@ -329,12 +333,14 @@ HarnessSync/
 
 **GĐ0: spike**, chỉ thử trên thư mục tạm và profile thử, không đụng dữ liệu thật. Mỗi spike có kết quả rõ đạt hay không đạt, ghi vào `docs/specs/` thành phụ lục.
 
+S1 và S4 là **USER ACTION**: script dựng profile tạm và launch app, rồi dừng lại để user tự đăng nhập account thứ hai. S2, S3, S5, S6 và S7 chạy không cần user. Riêng trường hợp "khác account" của S2 phải chờ S1 xong.
+
 | Spike | Câu hỏi | Đạt khi |
 |---|---|---|
-| S1 | Codex MSIX chạy 2 instance song song với `CODEX_HOME` + `CODEX_ELECTRON_USER_DATA_PATH` + `--user-data-dir` | hai cửa sổ, hai account, không chồng dữ liệu; biết đường dẫn thực tế có bị MSIX chuyển hướng không |
+| S1 (USER ACTION) | Codex MSIX chạy 2 instance song song với `CODEX_HOME` + `CODEX_ELECTRON_USER_DATA_PATH` + `--user-data-dir` | hai cửa sổ, hai account, không chồng dữ liệu; biết đường dẫn thực tế có bị MSIX chuyển hướng không |
 | S2 | Rollout Codex chép sang `CODEX_HOME` khác có hiện ra và resume được không; với cùng account và khác account | thread hiện trong app, tiếp tục được |
 | S3 | `externalAgentConfig/import` SESSIONS gọi được từ script, qua `codex app-server` stdio hoặc `proxy` | phiên Claude hiện trong Codex của profile đích |
-| S4 | Antigravity nhận `--user-data-dir` + `ANTIGRAVITY_GEMINI_DIR` để chạy hai account | hai account, `conversations` tách riêng |
+| S4 (USER ACTION) | Antigravity nhận `--user-data-dir` + `ANTIGRAVITY_GEMINI_DIR` để chạy hai account | hai account, `conversations` tách riêng |
 | S5 | `.db` của Antigravity: rút được transcript; chép sang profile khác có mở lại được không | transcript đọc được; native đạt hoặc không đạt |
 | S6 | Đọc SQLite qua `winsqlite3.dll` bằng P/Invoke trên PS 5.1 và PS 7 | đọc được bảng `threads` từ bản sao |
 | S7 | Deep link mở phiên mới kèm prompt và thư mục cho từng app | có hoặc không, kèm cú pháp |
@@ -349,12 +355,12 @@ HarnessSync/
 
 - Profile, launch, tray, shortcut (lane 2a).
 - `ListChats`, xuất, handoff Claude ↔ Codex, native Codex ↔ Codex theo S2, Codex import theo S3 (lane 2b).
-- 2a và 2b chạy song song được: cả hai chỉ ghi `src\Harness.Codex.ps1`, nhưng ở các hàm tách biệt. Chuyến của 2a land trước.
+- 2a ghi `src\Harness.Codex.Profiles.ps1`, 2b ghi `src\Harness.Codex.Chats.ps1`. Hai lane không ghi chung file nào nên chạy song song được. Lane 2a land trước vì nó chứa hàm đăng ký.
 
-**GĐ3: Antigravity**, chạy song song với GĐ2 được, vì là file riêng (`src\Harness.Antigravity.ps1`):
+**GĐ3: Antigravity**, chạy song song với GĐ2 được, vì dùng file riêng:
 
-- 3a: launch, tray, profile nếu S4 đạt, xuất transcript, handoff vào và ra.
-- 3b, tùy chọn: native theo S5.
+- 3a: launch, tray, profile nếu S4 đạt (`src\Harness.Antigravity.Profiles.ps1`); xuất transcript, handoff vào và ra (`src\Harness.Antigravity.Chats.ps1`).
+- 3b, tùy chọn: native theo S5. Lane này ghi `Harness.Antigravity.Chats.ps1` sau khi 3a land, hoặc nhận đúng hàm `Import-AgyNative` theo ngoại lệ có giới hạn.
 
 **GĐ4: Drive sync**, sau GĐ2:
 
@@ -373,7 +379,7 @@ Khi có hai lane cùng sửa `src\Ui.Harness.ps1`, áp dụng ngoại lệ có g
 | Q2 | Hỗ trợ Antigravity (app agent), Antigravity IDE, hay cả hai? | Cả hai, coi là một harness có 2 `Kind`, vì dùng chung `~\.gemini\antigravity`. Launch chọn theo `Kind`. Ưu tiên app agent |
 | Q3 | Claude → Codex dùng bộ nhập chính thức của Codex thay vì handoff? | Có, khi S3 đạt. Đây vẫn là đường do chính Codex cung cấp. Không đạt thì dùng handoff |
 | Q4 | Codex → Claude hay Antigravity → Claude có cố làm native không? | Không. Chỉ handoff, đúng quyết định "Lai" |
-| Q5 | Đồng bộ Drive mặc định có mã hóa không? | Có, bật mặc định. Passphrase do user đặt, cache bằng DPAPI trên từng máy |
+| Q5 | Đồng bộ Drive mặc định có mã hóa không? | **Chốt (orchestra, 2026-11-11):** bật mặc định. Passphrase do user đặt, cache bằng DPAPI trên từng máy. Lần đầu bật sync, UI hỏi passphrase kèm cảnh báo mất passphrase = mất bundle |
 | Q6 | File handoff ghi ở đâu? | `.switcher\handoff\` (ngoài repo). Tùy chọn ghi vào `<cwd>\.handoff\` kèm cảnh báo `.gitignore` |
 | Q7 | Chat phân kỳ giữa hai máy thì làm gì? | Nhập thành bản sao mới, tiêu đề có hậu tố máy nguồn. Không ghi đè |
 | Q8 | Giữ bao nhiêu bản bundle trên Drive cho mỗi chat? | 3 bản mới nhất. Mỗi máy chỉ dọn bản của chính nó |
