@@ -7,9 +7,9 @@ $claude = Join-Path $root 'src\Harness.Claude.ps1'
 . (Import-TestFunctions -Files @($switcher) -Names @('Get-FirstValue','Get-SessionActivity','Get-SessionActivityAt','Read-ChatJson','Test-TitleNeedsSync','Set-JsonTopLevelString','Get-CodeSessionRoot','Get-CodeSessions','Get-CodeSessionStore','Copy-CodeSession'))
 . (Import-TestFunctions -Files @($core) -Names @(
     'Get-HarnessRequiredCapabilities','Register-Harness','Get-Harness','Reset-HarnessRegistry','Register-Harnesses',
-    'Get-BytesSha256Hex','Get-FileSha256Hex','Test-BundleEntryName','New-HarnessBundle','Read-ZipEntryBytes','Read-HarnessBundle','Get-HarnessBundleLimits','Copy-ZipEntryChecked','ConvertTo-CwdRef','Get-HarnessMachineInfo','Get-HarnessPathRoots',
+    'Get-BytesSha256Hex','Get-FileSha256Hex','Test-BundleEntryName','New-HarnessBundle','Read-ZipEntryBytes','Read-HarnessBundle','Get-HarnessBundleLimits','Copy-ZipEntryChecked','ConvertTo-CwdRef','Resolve-CwdRef','Get-HarnessMachineInfo','Get-HarnessPathRoots',
     'Get-SecretPatterns','Invoke-SecretScan','Protect-TranscriptText','Measure-SecretFindings','Protect-TranscriptEntries','Get-FirstSentence','Format-TranscriptTurn','ConvertTo-HandoffMarkdown'))
-. (Import-TestFunctions -Files @($claude) -Names @('ConvertTo-ClaudeProjectSlug','Find-ClaudeProjectDir','Get-ClaudeHomePath','Get-ClaudeToolArg','ConvertTo-ClaudeResultText','ConvertFrom-ClaudeJsonl','Get-ClaudeNativeFiles','Export-ClaudeChat','Import-ClaudeNative','Register-ClaudeHarness'))
+. (Import-TestFunctions -Files @($claude) -Names @('ConvertTo-ClaudeProjectSlug','Find-ClaudeProjectDir','Get-ClaudeHomePath','Get-ClaudeToolArg','ConvertTo-ClaudeResultText','ConvertFrom-ClaudeJsonl','Get-ClaudeNativeFiles','Get-ClaudeFolderFiles','Export-ClaudeChat','Import-ClaudeNative','Resolve-ClaudeImportCwd','Register-ClaudeHarness'))
 
 function Assert-FilesIdentical($a, $b, $what) {
     Assert ((Get-FileSha256Hex $a) -eq (Get-FileSha256Hex $b)) "$what differs"
@@ -163,6 +163,97 @@ try {
     [void](Read-HarnessBundle -Path (Join-Path $fixture 'out\sub.hbundle.zip') -ExtractTo $out4)
     Assert (@($m4.files | Where-Object { $_.path -eq "native/$cli/subagents/agent-9.jsonl" }).Count -eq 1) 'subagent file is still carried as native'
     Assert (-not ([IO.File]::ReadAllText((Join-Path $out4 'transcript.md'))).Contains('SUBAGENT PROMPT') -and -not ([IO.File]::ReadAllText((Join-Path $out4 'transcript.jsonl'))).Contains('SUBAGENT PROMPT')) 'subagent text must not appear in the chat transcript'
+
+    # --- lane C: a bundle that comes from another machine (this machine is 'machine-B') ---
+    function Get-SyncMachine { [pscustomobject]@{ Id = 'machine-B'; Name = 'PCB' } }
+    $junction = $null
+    try {
+        $cliX = '11111111-2222-3333-4444-555555555555'
+        $profX = [pscustomobject]@{ Path = (Join-Path $fixture 'profX') }
+        $storeX = Join-Path $profX.Path 'claude-code-sessions\acctA\orgA'
+        New-Item -ItemType Directory -Path $storeX -Force | Out-Null
+        $writeChatX = { param($act) [IO.File]::WriteAllText((Join-Path $storeX 'local_x.json'), ('{"title":"Cross chat","cwd":"C:\\work\\demo_project","originCwd":"C:\\work\\demo_project","workingDirectory":"C:\\work\\demo_project","account":"acctA","org":"orgA","sessionId":"local_x","cliSessionId":"' + $cliX + '","lastActivityAt":' + $act + ',"createdAt":1699999999000}')) }
+        & $writeChatX 1700000000000
+        $projX = Join-Path $home1 "projects\$slug"
+        New-Item -ItemType Directory -Path (Join-Path $projX $cliX) -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $projX "$cliX.jsonl"), '{"type":"user","timestamp":"t1","message":{"role":"user","content":"first version"}}' + "`n")
+        [IO.File]::WriteAllText((Join-Path $projX "$cliX\keep.txt"), 'keep')
+
+        # C3: a junction inside <cli>\ is never followed
+        $outside = Join-Path $fixture 'outside-junction'
+        New-Item -ItemType Directory -Path $outside | Out-Null
+        [IO.File]::WriteAllText((Join-Path $outside 'secret.txt'), 'outside the chat folder')
+        $junction = Join-Path $projX "$cliX\link"
+        New-Item -ItemType Junction -Path $junction -Target $outside | Out-Null
+        $sx = @(Get-CodeSessions -Source $profX)[0]
+        $xb = Join-Path $fixture 'out\x.hbundle.zip'
+        $mx = Export-ClaudeChat -Session $sx -OutPath $xb -ClaudeHome $home1 -MachineId 'machine-A' -MachineName 'PCA' -PathRoots @{ Proj = 'C:\work' }
+        $px = @($mx.files | ForEach-Object { $_.path })
+        Assert (($px -contains "native/$cliX/keep.txt") -and -not @($px | Where-Object { $_ -like "native/$cliX/link*" }).Count) "junction content must not be exported: $($px -join ', ')"
+        Assert ($mx.source.machineId -eq 'machine-A' -and $mx.source.cwd.root -eq 'Proj' -and $mx.source.cwd.relative -eq 'demo_project') 'cross-machine fixture manifest'
+
+        # C1: unknown root asks for it and writes nothing
+        $dstX = Join-Path $fixture 'profY\claude-code-sessions\acctB\orgB'
+        New-Item -ItemType Directory -Path $dstX -Force | Out-Null
+        $homeX = Join-Path $fixture 'claudehomeX'
+        $r = Import-ClaudeNative -BundlePath $xb -Store (Get-Item -LiteralPath $dstX) -ClaudeHome $homeX -PathRoots @{ Other = 'D:\other' }
+        Assert ($r.Status -eq 'needs-root' -and $r.Root -eq 'Proj') "needs-root result: $($r | ConvertTo-Json -Compress)"
+        Assert (-not (Test-Path -LiteralPath $homeX) -and @(Get-ChildItem -LiteralPath $dstX).Count -eq 0) 'needs-root writes nothing'
+
+        # C1 + C4: known root; the folder is missing here, so the result says so
+        $rootHere = Join-Path $fixture 'projects-here'
+        $newCwd = Join-Path $rootHere 'demo_project'
+        $r = Import-ClaudeNative -BundlePath $xb -Store (Get-Item -LiteralPath $dstX) -ClaudeHome $homeX -PathRoots @{ Proj = $rootHere }
+        Assert ($r.Status -eq 'copied' -and $r.CwdMissing -eq $true) "cross-machine import result: $($r | ConvertTo-Json -Compress)"
+        $newProj = Join-Path $homeX ('projects\' + (ConvertTo-ClaudeProjectSlug $newCwd))
+        Assert (Test-Path -LiteralPath (Join-Path $newProj "$cliX.jsonl")) 'jsonl is placed under the slug of the new cwd'
+        Assert (Test-Path -LiteralPath (Join-Path $newProj "$cliX\keep.txt")) 'the <cli> folder follows the jsonl'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $homeX "projects\$slug"))) 'nothing under the old machine slug'
+        $cj = Get-Content -LiteralPath (Join-Path $dstX 'local_x.json') -Raw | ConvertFrom-Json
+        Assert ($cj.cwd -eq $newCwd -and $cj.originCwd -eq $newCwd -and $cj.workingDirectory -eq $newCwd -and $cj.account -eq 'acctB') 'cwd, originCwd and workingDirectory are rewritten, identity too'
+        New-Item -ItemType Directory -Path $newCwd -Force | Out-Null
+        $dstZ = Join-Path $fixture 'profZ\claude-code-sessions\acctB\orgB'
+        New-Item -ItemType Directory -Path $dstZ -Force | Out-Null
+        $r = Import-ClaudeNative -BundlePath $xb -Store (Get-Item -LiteralPath $dstZ) -ClaudeHome (Join-Path $fixture 'claudehomeZ') -PathRoots @{ Proj = $rootHere }
+        Assert ($r.Status -eq 'copied' -and $r.CwdMissing -eq $false) 'CwdMissing is false when the folder exists'
+        $badRoots = $null; try { [void](Import-ClaudeNative -BundlePath $xb -Store (Get-Item -LiteralPath $dstZ) -ClaudeHome (Join-Path $fixture 'claudehomeZ2') -PathRoots @{ Proj = 'rel\path' }) } catch { $badRoots = $_.Exception.Message }
+
+        # C2: a newer bundle replaces the transcript (old one kept as .bak), an older one changes nothing
+        $r = Import-ClaudeNative -BundlePath $xb -Store (Get-Item -LiteralPath $dstX) -ClaudeHome $homeX -PathRoots @{ Proj = $rootHere }
+        Assert ($r.Status -eq 'exists') "same bundle again: $($r.Status)"
+        & $writeChatX 1800000000000
+        [IO.File]::WriteAllText((Join-Path $projX "$cliX.jsonl"), '{"type":"user","timestamp":"t1","message":{"role":"user","content":"second version"}}' + "`n")
+        $sx2 = @(Get-CodeSessions -Source $profX)[0]
+        $xb2 = Join-Path $fixture 'out\x2.hbundle.zip'
+        [void](Export-ClaudeChat -Session $sx2 -OutPath $xb2 -ClaudeHome $home1 -MachineId 'machine-A' -MachineName 'PCA' -PathRoots @{ Proj = 'C:\work' })
+        $r = Import-ClaudeNative -BundlePath $xb2 -Store (Get-Item -LiteralPath $dstX) -ClaudeHome $homeX -PathRoots @{ Proj = $rootHere }
+        Assert ($r.Status -eq 'updated') "newer bundle: $($r.Status)"
+        Assert (([IO.File]::ReadAllText((Join-Path $newProj "$cliX.jsonl"))).Contains('second version')) 'transcript replaced by the newer one'
+        $baks = @(Get-ChildItem -LiteralPath $newProj -Filter "$cliX.jsonl.bak-*")
+        Assert ($baks.Count -eq 1 -and ([IO.File]::ReadAllText($baks[0].FullName)).Contains('first version')) 'the old transcript is kept as .bak'
+        $r = Import-ClaudeNative -BundlePath $xb -Store (Get-Item -LiteralPath $dstX) -ClaudeHome $homeX -PathRoots @{ Proj = $rootHere }
+        Assert ($r.Status -eq 'exists' -and ([IO.File]::ReadAllText((Join-Path $newProj "$cliX.jsonl"))).Contains('second version') -and @(Get-ChildItem -LiteralPath $newProj -Filter "$cliX.jsonl.bak-*").Count -eq 1) 'an older bundle changes nothing'
+
+        # a bundle from another machine is untrusted input: ids that are not what Claude writes are refused before any write
+        foreach ($evil in @(@{ Name = 'traversal'; Json = '..\\..\\x' }, @{ Name = 'newline'; Json = 'abc\n' }, @{ Name = 'slash'; Json = 'a/b' })) {
+            $profE = [pscustomobject]@{ Path = (Join-Path $fixture ('profEvil-' + $evil.Name)) }
+            $storeE = Join-Path $profE.Path 'claude-code-sessions\acctA\orgA'
+            New-Item -ItemType Directory -Path $storeE -Force | Out-Null
+            [IO.File]::WriteAllText((Join-Path $storeE 'local_evil.json'), ('{"title":"Evil","cwd":"C:\\work\\demo_project","account":"acctA","org":"orgA","sessionId":"local_evil","cliSessionId":"' + $evil.Json + '","lastActivityAt":1700000000000}'))
+            $eb = Join-Path $fixture ('out\evil-' + $evil.Name + '.hbundle.zip')
+            [void](Export-ClaudeChat -Session @(Get-CodeSessions -Source $profE)[0] -OutPath $eb -ClaudeHome (Join-Path $fixture 'claudehome-empty') -MachineId 'machine-A' -MachineName 'PCA' -PathRoots @{ Proj = 'C:\work' })
+            $dstE = Join-Path $fixture ('profEvilDst-' + $evil.Name + '\claude-code-sessions\acctB\orgB')
+            New-Item -ItemType Directory -Path $dstE -Force | Out-Null
+            $homeE = Join-Path $fixture ('claudehomeEvil-' + $evil.Name)
+            $emsg = $null; try { [void](Import-ClaudeNative -BundlePath $eb -Store (Get-Item -LiteralPath $dstE) -ClaudeHome $homeE -PathRoots @{ Proj = $rootHere }) } catch { $emsg = $_.Exception.Message }
+            Assert ($emsg -like '*not a UUID*') "cliSessionId '$($evil.Name)' must be refused: $emsg"
+            Assert (-not (Test-Path -LiteralPath $homeE) -and @(Get-ChildItem -LiteralPath $dstE).Count -eq 0) "nothing written for '$($evil.Name)'"
+        }
+    } finally {
+        if ($junction -and (Test-Path -LiteralPath $junction)) { [IO.Directory]::Delete($junction) }
+        Remove-Item Function:\Get-SyncMachine
+    }
+    Assert ($null -ne $badRoots -and $badRoots -like '*not valid*') "a root that is not an absolute path is refused: $badRoots"
 
     # handoff files (same machine, Claude -> file -> prompt)
     . (Import-TestFunctions -Files @((Join-Path $root 'src\Ui.Harness.ps1')) -Names @('Get-HandoffDir','New-HandoffPrompt','Export-HarnessHandoffFiles'))

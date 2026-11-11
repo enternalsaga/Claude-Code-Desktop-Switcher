@@ -78,6 +78,15 @@ function Find-ClaudeProjectDir {
     return $byCwd
 }
 
+# Every file under $Dir, without following junctions or symlinks (a link inside a chat folder could point anywhere).
+function Get-ClaudeFolderFiles {
+    param([Parameter(Mandatory)][string]$Dir)
+    foreach ($item in Get-ChildItem -LiteralPath $Dir) {
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        if ($item.PSIsContainer) { Get-ClaudeFolderFiles -Dir $item.FullName } else { $item }
+    }
+}
+
 # Files that belong to one chat, as @{Role; Path (inside the bundle); SourcePath}.
 function Get-ClaudeNativeFiles {
     param([Parameter(Mandatory)]$Session, $Data, [Parameter(Mandatory)][string]$ClaudeHome)
@@ -91,7 +100,7 @@ function Get-ClaudeNativeFiles {
     $dir = Join-Path $project $cli
     if (Test-Path -LiteralPath $dir -PathType Container) {
         $prefix = (Get-Item -LiteralPath $dir).FullName.TrimEnd('\') + '\'
-        foreach ($f in Get-ChildItem -LiteralPath $dir -Recurse -File) {
+        foreach ($f in Get-ClaudeFolderFiles -Dir $dir) {
             $files += @{ Role = 'native'; Path = ("native/$cli/" + $f.FullName.Substring($prefix.Length).Replace('\', '/')); SourcePath = $f.FullName }
         }
     }
@@ -128,13 +137,28 @@ function Export-ClaudeChat {
         -Redaction @{ scanned = $true; findings = $findings; transcriptRedacted = $true }
 }
 
-# Native import into a Claude profile on the same machine. The chat's local json goes through the existing
-# Copy-CodeSession (same account/org rewrite, same duplicate rules). The transcript jsonl and its folder
-# are only added when missing: accounts on one machine share ~\.claude\projects.
+# The working folder on this machine for a chat that came from another one: the bundle's cwd ref resolved
+# through the named folder roots. Returns $null when the ref has no folder, @{ Root } when the root is not
+# set up here yet (the caller asks the user), and throws when what comes out is not an absolute path.
+function Resolve-ClaudeImportCwd {
+    param($Ref, [hashtable]$PathRoots)
+    if (-not $Ref -or -not ($Ref.root -or $Ref.absolute)) { return $null }
+    $cwd = Resolve-CwdRef -Ref $Ref -PathRoots $PathRoots
+    if (-not $cwd -and $Ref.root -and -not $PathRoots.ContainsKey($Ref.root)) { return @{ Root = [string]$Ref.root } }
+    if (-not $cwd -or $cwd -notmatch '^(?:[A-Za-z]:\\|\\\\)') { throw 'The working folder in the bundle is not valid on this machine' }
+    return $cwd
+}
+
+# Native import into a Claude profile. The chat's local json goes through the existing Copy-CodeSession
+# (same account/org rewrite, same duplicate rules). On the same machine the transcript jsonl and its folder
+# are only added when missing (accounts there share ~\.claude\projects) and the result is Copy-CodeSession's
+# string. A bundle from another machine gets its working folder mapped through -PathRoots: the chat json's
+# cwd fields are rewritten, the transcript goes under the new folder's project (a newer one replaces the old,
+# kept as .bak-<time>), and the result is @{ Status; CwdMissing; Cwd } or @{ Status = 'needs-root'; Root }.
 function Import-ClaudeNative {
     param(
         [Parameter(Mandatory)][string]$BundlePath, [Parameter(Mandatory)]$Store,
-        [string]$ClaudeHome = (Get-ClaudeHomePath)
+        [string]$ClaudeHome = (Get-ClaudeHomePath), [hashtable]$PathRoots = (Get-HarnessPathRoots)
     )
     $work = Join-Path ([IO.Path]::GetTempPath()) ('claude-import-' + [guid]::NewGuid().ToString('N'))
     try {
@@ -142,19 +166,46 @@ function Import-ClaudeNative {
         if ($m.source.harness -ne 'claude') { throw "Not a Claude bundle: $($m.source.harness)" }
         $localRow = @($m.files | Where-Object { $_.path -match '^native/local_[^/]+\.json$' }) | Select-Object -First 1
         if (-not $localRow) { throw 'Bundle has no Claude chat file' }
-        $local = Get-Item -LiteralPath (Join-Path $work ($localRow.path -replace '/', '\'))
+        $localPath = Join-Path $work ($localRow.path -replace '/', '\')
+        $thisMachine = (Get-HarnessMachineInfo).Id
+        $cross = [bool]($m.source.machineId -and $thisMachine -and $m.source.machineId -ne $thisMachine)
+        if ($cross) {
+            # another machine's bundle is untrusted: ids are checked before anything is written
+            $cliIn = [string]$m.source.claude.cliSessionId
+            if ($cliIn -and $cliIn -notmatch '\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z') { throw 'Claude session id in bundle is not a UUID' }
+            if ($localRow.path -notmatch '\Anative/local_[A-Za-z0-9_-]+\.json\z') { throw 'Chat file name in bundle is not valid' }
+            $newCwd = Resolve-ClaudeImportCwd -Ref $m.source.cwd -PathRoots $PathRoots
+            if ($newCwd -is [hashtable]) { return @{ Status = 'needs-root'; Root = $newCwd.Root } }
+            if ($newCwd) {
+                $text = [IO.File]::ReadAllText($localPath)
+                foreach ($key in 'cwd', 'originCwd', 'workingDirectory') { $t = Set-JsonTopLevelString $text $key $newCwd; if ($t) { $text = $t } }
+                [IO.File]::WriteAllText($localPath, $text, (New-Object Text.UTF8Encoding($false)))
+            }
+        }
+        $local = Get-Item -LiteralPath $localPath
         $session = [pscustomobject]@{ File = $local; Account = $m.source.claude.account; Org = $m.source.claude.org; Activity = $(if ($null -ne $m.source.lastActivityAt) { [double]$m.source.lastActivityAt } else { $null }) }
         $cwd = Get-FirstValue (Read-ChatJson $local.FullName) 'cwd', 'originCwd', 'workingDirectory'
+        $cli = $m.source.claude.cliSessionId
+        $replace = $false
+        if ($cross) {
+            $have = Join-Path $Store.FullName $local.Name
+            $replace = ($null -ne $session.Activity) -and (Test-Path -LiteralPath $have) -and ($session.Activity -gt (Get-SessionActivityAt $have))
+        }
         if ($cwd) {
-            $project = Find-ClaudeProjectDir -ClaudeHome $ClaudeHome -Cwd $cwd -Cli $m.source.claude.cliSessionId
+            $project = Find-ClaudeProjectDir -ClaudeHome $ClaudeHome -Cwd $cwd -Cli $cli
             foreach ($f in @($m.files | Where-Object { $_.path -ne $localRow.path -and $_.role -eq 'native' })) {
                 $dest = Join-Path $project (($f.path -replace '^native/', '') -replace '/', '\')
-                if (Test-Path -LiteralPath $dest) { continue }
+                if (Test-Path -LiteralPath $dest) {
+                    if (-not ($replace -and $f.path -eq "native/$cli.jsonl")) { continue }
+                    Move-Item -LiteralPath $dest -Destination ($dest + '.bak-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) -Force
+                }
                 New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
                 Copy-Item -LiteralPath (Join-Path $work ($f.path -replace '/', '\')) -Destination $dest
             }
         }
-        return (Copy-CodeSession -Session $session -Store $Store)
+        $status = Copy-CodeSession -Session $session -Store $Store
+        if (-not $cross) { return $status }
+        return @{ Status = $status; CwdMissing = [bool]($cwd -and -not (Test-Path -LiteralPath $cwd -PathType Container)); Cwd = $cwd }
     } finally {
         if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
     }
