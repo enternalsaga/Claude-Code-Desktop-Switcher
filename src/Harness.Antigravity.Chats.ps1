@@ -244,7 +244,7 @@ function Export-AgyChat {
 # Antigravity conversation ids are UUIDs; anything else from a bundle is refused.
 function Test-AgyConversationId {
     param([string]$Id)
-    return [bool]($Id -match '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$')
+    return [bool]($Id -match '\A[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\z')
 }
 
 # True when Path is strictly inside Root (not Root itself, not outside it).
@@ -284,10 +284,16 @@ function Import-AgyNative {
         $target = Join-Path $convDir "$id.db"
         $status = 'copied'
         if (Test-Path -LiteralPath $target) {
-            $targetMs = [double]([datetimeoffset](Get-Item -LiteralPath $target).LastWriteTimeUtc).ToUnixTimeMilliseconds()
+            # the newest write to the db or its -wal counts: the app writes new steps to the -wal first
+            $newest = @($target, ($target + '-wal') | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc } | Sort-Object -Descending)[0]
+            $targetMs = [double]([datetimeoffset]$newest).ToUnixTimeMilliseconds()
             if ($null -ne $m.source.lastActivityAt -and [double]$m.source.lastActivityAt -gt $targetMs) { $status = 'updated' } else { return 'exists' }
+            # keep what is replaced: rename db, -wal and -shm to .bak-<ts> instead of deleting them
+            $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+            foreach ($suffix in '', '-wal', '-shm') {
+                if (Test-Path -LiteralPath ($target + $suffix)) { Move-Item -LiteralPath ($target + $suffix) -Destination ($target + $suffix + '.bak-' + $stamp) -Force }
+            }
         }
-        foreach ($suffix in '-wal', '-shm') { if (Test-Path -LiteralPath ($target + $suffix)) { Remove-Item -LiteralPath ($target + $suffix) -Force } }
         Copy-AgyFileAtomic -From (Join-Path $work "native\conversations\$id.db") -To $target
         $walRow = @($m.files | Where-Object { $_.path -eq "native/conversations/$id.db-wal" }) | Select-Object -First 1
         if ($walRow) { Copy-AgyFileAtomic -From (Join-Path $work "native\conversations\$id.db-wal") -To ($target + '-wal') }
@@ -295,8 +301,8 @@ function Import-AgyNative {
         if (Test-Path -LiteralPath $brainSrc) {
             $brainDst = Join-Path $Profile.DataDir "brain\$id"
             if (-not (Test-AgyPathBelow -Path $brainDst -Root (Join-Path $Profile.DataDir 'brain'))) { throw 'Conversation folder escapes the brain folder' }
-            if ($status -eq 'updated' -and (Test-Path -LiteralPath $brainDst)) { Remove-Item -LiteralPath $brainDst -Recurse -Force }
-            # file by file: Copy-Item on a folder that already exists would nest the copy inside it
+            # file by file, overwriting: files only the local side has (browser_recordings, newer notes) stay;
+            # Copy-Item on a folder that already exists would nest the copy inside it
             $prefix = (Get-Item -LiteralPath $brainSrc).FullName.TrimEnd('\') + '\'
             foreach ($f in (Get-ChildItem -LiteralPath $brainSrc -Recurse -File -Force)) {
                 Copy-AgyFileAtomic -From $f.FullName -To (Join-Path $brainDst $f.FullName.Substring($prefix.Length))
@@ -330,7 +336,8 @@ function Start-AgyHandoff {
     $result = Start-HarnessHandoff -BundlePath $BundlePath -TargetHarness 'antigravity' -Profile $Profile
     if ($Profile.Kind -ne 'ide') { return $result }
     $cwd = (Read-AgyBundleManifest -BundlePath $BundlePath).source.cwd.absolute
-    if (-not $cwd) { return $result }
+    # the manifest may come from another machine: quote only an absolute path with no control characters
+    if (-not $cwd -or $cwd -notmatch '\A(?:[A-Za-z]:\\|\\\\[^\\])' -or $cwd -match '[\x00-\x1F\x7F]') { return $result }
     $prompt = '{0} The work was done in the folder {1}; open that folder first.' -f $result.Prompt, $cwd
     & (Get-AgyHooks).SetClipboard $prompt
     $result.Prompt = $prompt

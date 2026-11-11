@@ -45,7 +45,7 @@ function Find-AgyMainProcessId {
     $dir = (Split-Path -Parent $Exe).TrimEnd('\') + '\'
     $candidates = @(& $hooks.GetProcesses (Split-Path -Leaf $Exe) | Where-Object {
         $_.CommandLine -notmatch '--type=' -and $_.CommandLine -notmatch '--import=' -and $_.CommandLine -notmatch 'AgyProfile-' -and
-        $_.ExecutablePath -and $_.ExecutablePath.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)
+        (-not $_.ExecutablePath -or $_.ExecutablePath.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase))   # unreadable path: assume it is ours, so an import never runs under a live app
     })
     if (-not $candidates.Count) { return $null }
     $ids = @($candidates | ForEach-Object { [int]$_.ProcessId })
@@ -91,6 +91,6 @@ function Register-AntigravityHarness {
         Export           = { param($Chat, $OutPath) Export-AgyChat -Chat $Chat -OutPath $OutPath }
         ImportNative     = { param($BundlePath, $Profile) Import-AgyNative -BundlePath $BundlePath -Profile $Profile }
         ImportHandoff    = { param($BundlePath, $Profile) Start-AgyHandoff -BundlePath $BundlePath -Profile $Profile }
-        ImportNeedsClose = { param($Profile) $true }
+        ImportNeedsClose = { param($Profile) [bool]($Profile.Exe -and (Find-AgyMainProcessId -Exe $Profile.Exe)) }
     }
 }
