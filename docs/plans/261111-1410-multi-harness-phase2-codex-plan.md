@@ -1,8 +1,8 @@
 # Plan: Multi-harness GĐ2, Codex
 
 - Spec: `docs/specs/261111-1200-multi-harness-manager-and-drive-sync-spec.md` (§3.2, §3.3, §5, §6, §11 GĐ2).
-- Kết quả spike: `docs/specs/261111-1200-multi-harness-spike-results.md` (SP-A, đã land ở db61536). Phần SP-B (`…-spike-results-user.md`) đang chờ land; các điểm cần dùng được tóm ở §1.
-- Base: `db61536` trên `desktop-4.29-patches`. Người duyệt: `switcher-think-multiharness` (local_16d53f2d-cb24-4b5c-8d40-db17aa4a98fe). Người land: orchestra.
+- Kết quả spike: `docs/specs/261111-1200-multi-harness-spike-results.md` (SP-A ở db61536, SP-B ở 5e223ee). Các điểm cần dùng được tóm ở §1.
+- Base: `5e223ee` trên `desktop-4.29-patches`. Người duyệt: `switcher-think-multiharness` (local_16d53f2d-cb24-4b5c-8d40-db17aa4a98fe). Người land: orchestra.
 - Lệnh kiểm tra và quy ước chung giống plan GĐ0–1 §0 (`docs/plans/261111-1206-multi-harness-phase0-1-plan.md`):
   - test là script thuần, chạy `powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\<X>.Tests.ps1`;
   - gate đầy đủ là `tools\Invoke-Gate.ps1`, chỉ orchestra chạy.
@@ -34,7 +34,8 @@ Lane 2b (chat: list, export, native, import, UI): S8 → K1 → K2 → K3 → K4
 - **Thứ tự land: 2a trước, 2b sau.**
   - 2b chỉ phụ thuộc 2a qua hợp đồng §3 (tên hàm và hình dạng object), không qua mã. Test của 2b dùng profile object giả.
   - Khi 2a đã land, 2b cắt nhánh mới từ tip đã land và cherry-pick commit của mình (không có file chung nên không xung đột), rồi báo lại.
-- `.github/workflows/lint.yml` thuộc **2b**, vì 2b land sau. 2b thêm bước CI PS 5.1/PS 7 cho **cả hai** file test (`HarnessCodexProfiles.Tests.ps1` và `HarnessCodexChats.Tests.ps1`).
+- `.github/workflows/lint.yml`: trong GĐ2, chỉ **2b** sửa file này (2b land sau). 2b thêm bước CI PS 5.1/PS 7 cho **cả hai** file test (`HarnessCodexProfiles.Tests.ps1` và `HarnessCodexChats.Tests.ps1`).
+  - Lane GĐ3 cũng thêm bước của nó. Đây là **ngoại lệ có giới hạn, chỉ được thêm**: mỗi lane chỉ nối bước của mình vào cuối danh sách test, trước bước `Install PSScriptAnalyzer`, và không sửa dòng nào có sẵn. Lane land sau giải xung đột bằng cách giữ cả hai khối.
 - `tools/Build-SingleFile.ps1` **không cần sửa**: `Harness.Codex.Profiles.ps1` và `Harness.Codex.Chats.ps1` đã có trong danh sách thứ tự, còn file mới (`Ui.Tray.ps1`, `Harness.Codex.AppServer.ps1`) được nối theo tên.
 - Profile thử `%USERPROFILE%\.codex-profiles\spike1` (account 2, đã đăng nhập) **được giữ tới khi GĐ2 land**, để làm S8 và kiểm tay (xin orchestra xác nhận, §7). Không lane nào ghi vào `~\.codex` thật. Đọc Default chỉ qua bản sao.
 
@@ -49,6 +50,8 @@ Lane 2b (chat: list, export, native, import, UI): S8 → K1 → K2 → K3 → K4
 
 - Default: `CodexHome = $env:USERPROFILE\.codex`, `UserDataDir = $null`.
 - Profile thêm: `CodexHome = %USERPROFILE%\.codex-profiles\<Id>`, `UserDataDir = <CodexHome>\electron`.
+
+**Khóa `DisplayName`** (chuỗi, tùy chọn) là khóa mới của adapter, dùng cho tray và dialog. Codex đặt `'Codex'`, Antigravity đặt `'Antigravity'`. `Register-Harness` chỉ kiểm các năng lực bắt buộc nên không cần sửa Core.
 
 **Adapter** do 2a đăng ký trong `Register-CodexHarness` (file Profiles). Các năng lực về chat gọi hàm của 2b theo tên, phân giải lúc gọi:
 
@@ -120,13 +123,18 @@ ImportNeedsClose     = { param($Profile)             Test-CodexImportNeedsClose 
 
 ### P4: tray, shortcut, `-Launch codex:<id>`
 
-- `src/Ui.Tray.ps1`, hàm `Add-HarnessTrayItems -Menu`:
-  - Submenu "Codex" gồm các profile Codex (dấu tick nếu đang chạy, bấm để launch), dải phân cách, "Add Codex account…" (hỏi tên bằng `Show-Prompt` có sẵn).
-  - Chỉ hiện khi `Find-CodexInstall` báo đã cài.
+- `src/Ui.Tray.ps1`, hàm `Add-HarnessTrayItems -Menu`. Hàm này **chung cho mọi harness**, để GĐ3 (Antigravity) không phải sửa file này:
+  - Mỗi harness đã đăng ký, trừ `claude` (tray của Claude giữ nguyên như cũ), có một submenu mang tên hiển thị của adapter (`DisplayName`; không có thì dùng tên harness viết hoa chữ đầu).
+  - Submenu liệt kê các profile của `GetProfiles` (dấu tick nếu `Pid` có giá trị, bấm thì gọi `Launch`).
+  - Chỉ khi adapter có `NewProfile` mới thêm dải phân cách và mục "Add <DisplayName> account…" (hỏi tên bằng `Show-Prompt` có sẵn). Antigravity không có `NewProfile` nên không hiện mục này.
+  - Harness có `Detect` trả `Installed=$false` thì ẩn cả submenu.
+  - Lỗi từ một adapter chỉ làm mục của adapter đó hiện "(lỗi)", không làm hỏng tray.
+  - Test với hai adapter giả: một có `NewProfile`, một không có.
 - Hook `harness-ui-tray` trong `ClaudeSwitcher.ps1`: thêm một dòng `if (Get-Command Add-HarnessTrayItems …) { Add-HarnessTrayItems -Menu $trayMenu }`. Dòng Export hiện có giữ nguyên.
-- Hook mới `harness-launch`, đặt ngay đầu khối `if ($Launch) {`, ≤ 6 dòng:
-  - nếu `$Launch` khớp `^(?<h>codex):(?<id>.+)$` thì gọi `Start-CodexProfile` cho profile đó rồi `return`;
+- Hook mới `harness-launch`, đặt ngay đầu khối `if ($Launch) {`, ≤ 6 dòng. Hook cũng chung cho mọi harness:
+  - nếu `$Launch` khớp `^(?<h>[a-z]+):(?<id>.+)$` và `Get-Harness $h` tồn tại, thì tìm profile theo `Id` hoặc `Name` trong `GetProfiles` của harness đó, gọi `Launch`, rồi `return`;
   - profile không tồn tại thì `throw` với danh sách profile, giống thông báo của Claude.
+  - Phần logic nằm trong hàm `Invoke-HarnessLaunchArg -Value` (file `Ui.Tray.ps1`, có test). Hook chỉ gọi hàm này.
 - `New-CodexShortcut -Profile -Directory`:
   - Tạo `Codex - <name>.lnk` bằng `Set-LauncherTarget -ScriptArgs "-Launch ""codex:<id>"""` (hàm có sẵn).
   - Default trỏ `shell:AppsFolder\<Aumid>`.
@@ -277,4 +285,4 @@ Chỉ dùng `spike1` và home tạm dưới `%TEMP%\harness-spike\S8`. Không gh
 ## 8. Báo cáo
 
 - Mỗi lane gửi `SẴN SÀNG CHUYẾN` cho reviewer trước. Báo cáo gồm sha, nhánh, file đã đổi, kiểm tra đã chạy kèm kết quả, phần đã kiểm tay hoặc chưa, câu hỏi mở.
-- Lane tạo worktree mới dưới `.worktrees\codex-profiles` (2a) và `.worktrees\codex-chats` (2b), cắt từ `db61536`. Orchestra tạo worktree.
+- Lane tạo worktree mới dưới `.worktrees\codex-profiles` (2a) và `.worktrees\codex-chats` (2b), cắt từ `5e223ee`. Orchestra tạo worktree.
