@@ -4,7 +4,7 @@ $core = Join-Path (Split-Path $PSScriptRoot -Parent) 'src\Harness.Core.ps1'
 . (Import-TestFunctions -Files @($core) -Names @(
     'Get-HarnessRequiredCapabilities','Register-Harness','Get-Harness','Get-Harnesses','Reset-HarnessRegistry','Resolve-TransferMode',
     'Get-SecretPatterns','Invoke-SecretScan','Protect-TranscriptText','Measure-SecretFindings','Protect-TranscriptEntries',
-    'Get-FirstSentence','Format-TranscriptTurn','ConvertTo-HandoffMarkdown'))
+    'Get-FirstSentence','Format-TranscriptTurn','ConvertTo-HandoffMarkdown','Register-Harnesses','Write-HarnessLog','Install-HarnessSource'))
 
 function New-FakeAdapter([string[]]$Extra = @()) {
     $a = @{}
@@ -41,6 +41,65 @@ $notBlock['Launch'] = 'not a scriptblock'
 Assert-Throws { Register-Harness -Name 'bad' -Adapter $notBlock } 'Non-scriptblock capability must be rejected'
 Register-Harness -Name 'minimal' -Adapter (New-FakeAdapter)
 Assert ($null -ne (Get-Harness -Name 'minimal')) 'ImportNative is optional'
+
+# --- one broken adapter must not stop the others (or the switcher) ---
+$script:LogPath = Join-Path ([IO.Path]::GetTempPath()) ('harness-reg-' + [guid]::NewGuid().ToString('N') + '.log')
+function Register-ClaudeHarness { Register-Harness -Name 'claude' -Adapter (New-FakeAdapter) }
+function Register-CodexHarness { throw 'codex adapter exploded' }
+function Register-AntigravityHarness { Register-Harness -Name 'antigravity' -Adapter (New-FakeAdapter) }
+try {
+    Register-Harnesses
+    Assert ($null -ne (Get-Harness -Name 'claude') -and $null -ne (Get-Harness -Name 'antigravity') -and $null -eq (Get-Harness -Name 'codex')) 'healthy adapters registered, broken one skipped'
+    $logText = [IO.File]::ReadAllText($script:LogPath)
+    Assert ($logText -like '*Register-CodexHarness*codex adapter exploded*') "failure is logged: $logText"
+} finally {
+    Remove-Item -LiteralPath $script:LogPath -Force -ErrorAction SilentlyContinue
+    Remove-Item Function:\Register-ClaudeHarness, Function:\Register-CodexHarness, Function:\Register-AntigravityHarness
+    $script:LogPath = $null
+}
+
+# --- installing src\ next to the installed script ---
+$inst = New-TestTempDir
+try {
+    $srcNew = Join-Path $inst 'clone\src'
+    New-Item -ItemType Directory -Path $srcNew -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $srcNew 'A.ps1'), 'new A')
+    [IO.File]::WriteAllText((Join-Path $srcNew 'B.ps1'), 'new B')
+    $scriptNew = Join-Path $inst 'clone\ClaudeSwitcher.ps1'
+    [IO.File]::WriteAllText($scriptNew, "line1`r`nline2")
+    $home1 = Join-Path $inst 'LocalApp\.switcher'
+    New-Item -ItemType Directory -Path (Join-Path $home1 'src') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $home1 'src\A.ps1'), 'old A')
+    [IO.File]::WriteAllText((Join-Path $home1 'src\Gone.ps1'), 'removed upstream')
+
+    # the user kept the installed script: its "last install" record is not this version -> leave src alone
+    [IO.File]::WriteAllText((Join-Path $home1 'ClaudeSwitcher.base.ps1'), 'an older version')
+    Assert ((Install-HarnessSource -SourceDir $srcNew -SwitcherHome $home1 -ScriptPath $scriptNew) -eq 'kept') 'kept installed script: src is not touched'
+    Assert ([IO.File]::ReadAllText((Join-Path $home1 'src\A.ps1')) -eq 'old A' -and (Test-Path -LiteralPath (Join-Path $home1 'src\Gone.ps1'))) 'src unchanged when the user kept their copy'
+
+    # installed this version (the base record equals the new script, line endings aside)
+    [IO.File]::WriteAllText((Join-Path $home1 'ClaudeSwitcher.base.ps1'), "line1`nline2")
+    Assert ((Install-HarnessSource -SourceDir $srcNew -SwitcherHome $home1 -ScriptPath $scriptNew) -eq 'installed') 'installed'
+    Assert ([IO.File]::ReadAllText((Join-Path $home1 'src\A.ps1')) -eq 'new A' -and (Test-Path -LiteralPath (Join-Path $home1 'src\B.ps1')) -and -not (Test-Path -LiteralPath (Join-Path $home1 'src\Gone.ps1'))) 'src replaced, stale file gone'
+    Assert (-not (Test-Path -LiteralPath (Join-Path $home1 'src.new')) -and -not (Test-Path -LiteralPath (Join-Path $home1 'src.old'))) 'no temp folders left behind'
+
+    # a copy that fails halfway must not cost the existing src: lock one source file exclusively
+    [IO.File]::WriteAllText((Join-Path $srcNew 'A.ps1'), 'newer A')
+    $lock = [IO.File]::Open((Join-Path $srcNew 'B.ps1'), 'Open', 'ReadWrite', 'None')
+    try {
+        $failed = Install-HarnessSource -SourceDir $srcNew -SwitcherHome $home1 -ScriptPath $scriptNew
+    } finally { $lock.Dispose() }
+    Assert ($failed -eq 'failed') "failed copy is reported: $failed"
+    Assert ([IO.File]::ReadAllText((Join-Path $home1 'src\A.ps1')) -eq 'new A' -and (Test-Path -LiteralPath (Join-Path $home1 'src\B.ps1'))) 'the previous src is still complete'
+    Assert (-not (Test-Path -LiteralPath (Join-Path $home1 'src.new'))) 'half-copied src.new is cleaned up'
+
+    # only a folder called .switcher is ever replaced
+    $other = Join-Path $inst 'LocalApp\NotSwitcher'
+    New-Item -ItemType Directory -Path (Join-Path $other 'src') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $other 'src\keep.txt'), 'x')
+    [IO.File]::WriteAllText((Join-Path $other 'ClaudeSwitcher.base.ps1'), "line1`nline2")
+    Assert ((Install-HarnessSource -SourceDir $srcNew -SwitcherHome $other -ScriptPath $scriptNew) -eq 'skipped' -and (Test-Path -LiteralPath (Join-Path $other 'src\keep.txt'))) 'other folders are never touched'
+} finally { Remove-TestTempDir $inst }
 
 # --- transfer mode ---
 Reset-HarnessRegistry
@@ -97,7 +156,19 @@ try {
     Assert ([IO.File]::ReadAllText($mfile) -eq $before) 'Measure must not modify the file'
 } finally { Remove-Item -LiteralPath $mfile -Force -ErrorAction SilentlyContinue }
 
-$notEnv = "hotkey = Ctrl+S`nmonkey = banana`nAPI_KEY=abc"
+$mid = 'cd app && TOKEN=abcdef123 npm run x'
+Assert ((Protect-TranscriptText $mid) -eq 'cd app && TOKEN=[REDACTED] npm run x') "mid-line KEY=value: $(Protect-TranscriptText $mid)"
+Assert ((Protect-TranscriptText 'run API_KEY="a b c" now') -eq 'run API_KEY=[REDACTED] now') 'quoted value with spaces, mid-line'
+Assert ((Protect-TranscriptText '{"password": "hunter2", "user": "bob"}') -eq '{"password": "[REDACTED]", "user": "bob"}') 'JSON password value'
+Assert ((Protect-TranscriptText '{"accessToken":"abc.def","client_secret" : "x\"y"}') -eq '{"accessToken":"[REDACTED]","client_secret" : "[REDACTED]"}') 'JSON camelCase and snake_case keys, escaped quote'
+Assert ((Protect-TranscriptText 'mysql --password=hunter2 --user=bob') -eq 'mysql --password=[REDACTED] --user=bob') '--password=value'
+Assert ((Protect-TranscriptText 'curl --api-key=zzz9 http://x') -eq 'curl --api-key=[REDACTED] http://x') '--api-key=value'
+foreach ($keep in '{"tokenizer": "gpt"}', '{"max_tokens": 100}', '{"monkey": "banana", "hotkey": "Ctrl+S"}', 'run --tokenizer=gpt --keys=3', 'x && monkey=banana') {
+    Assert ((Protect-TranscriptText $keep) -eq $keep) "must stay unchanged: $keep"
+    Assert ((Measure-SecretFindings -Text $keep) -eq 0) "no finding for: $keep"
+}
+Assert ((Measure-SecretFindings -Text 'a && TOKEN=x b && PASSWORD=y --password=z {"secret":"q"}') -eq 4) 'all four new shapes counted once each'
+$notEnv ="hotkey = Ctrl+S`nmonkey = banana`nAPI_KEY=abc"
 Assert ((Protect-TranscriptText $notEnv) -eq "hotkey = Ctrl+S`nmonkey = banana`nAPI_KEY=[REDACTED]") 'only UPPER_SNAKE names are treated as secrets'
 Assert ((Measure-SecretFindings -Text $notEnv) -eq 1) 'hotkey and monkey are not findings'
 
@@ -119,6 +190,11 @@ Assert ($md.Contains('Answer 50 body') -and $md.Contains('Answer 11 body') -and 
 Assert (-not $md.Contains('Answer 10 body')) 'earlier assistant text dropped'
 Assert (-not $md.Contains('Second sentence of 10.')) 'earlier turns only keep the first sentence'
 Assert ($md.Contains('Question 10.') -and $md.Contains('Question 1.')) 'earlier turns summarised mechanically'
+$emptyMd = ConvertTo-HandoffMarkdown -Entries @() -Harness 'claude' -Title 'Empty chat'
+Assert ($emptyMd.Contains('# Handoff: Empty chat')) 'empty transcript still gives a handoff file'
+$nullMd = ConvertTo-HandoffMarkdown -Entries $null -Harness 'claude' -Title 'Null chat'
+Assert ($nullMd.Contains('# Handoff: Null chat')) 'null entries tolerated'
+Assert (@(Protect-TranscriptEntries -Entries @()).Count -eq 0 -and @(Protect-TranscriptEntries -Entries $null).Count -eq 0) 'Protect-TranscriptEntries accepts empty and null'
 $small = ConvertTo-HandoffMarkdown -Entries @(New-Entries 3) -Harness 'claude' -Title 't'
 Assert ($small.Contains('Second sentence of 1.') -and $small.Contains('Answer 1 body')) 'short chat keeps everything'
 $custom = ConvertTo-HandoffMarkdown -Entries $entries -Harness 'claude' -Title 't' -KeepTurns 5

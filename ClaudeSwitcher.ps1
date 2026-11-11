@@ -289,10 +289,11 @@ Update-ClaudeInstall -AllowCache:([bool]$Launch -or [bool]$HandleLink -or [bool]
 if ($ClaudePath) { Set-Setting 'ClaudePath' $script:ClaudeApp.Exe }
 
 # >>> harness-src
-if ($PSScriptRoot -and (Test-Path -LiteralPath "$PSScriptRoot\src")) { foreach ($harnessFile in (Get-ChildItem -LiteralPath "$PSScriptRoot\src" -Filter '*.ps1')) { . $harnessFile.FullName } }
+if ($PSScriptRoot -and (Test-Path -LiteralPath "$PSScriptRoot\src")) { foreach ($harnessFile in (Get-ChildItem -LiteralPath "$PSScriptRoot\src" -Filter '*.ps1')) {
+    try { . $harnessFile.FullName } catch { try { Add-Content -LiteralPath $script:LogPath -Value ("[{0}] Skipped src\{1}: {2}" -f (Get-Date -Format 's'), $harnessFile.Name, $_.Exception.Message) } catch { } } } }
 # <<< harness-src
 # >>> harness-register
-if (Get-Command Register-Harnesses -ErrorAction SilentlyContinue) { Register-Harnesses }
+if (Get-Command Register-Harnesses -ErrorAction SilentlyContinue) { try { Register-Harnesses } catch { try { Add-Content -LiteralPath $script:LogPath -Value ("[{0}] Register-Harnesses failed: {1}" -f (Get-Date -Format 's'), $_.Exception.Message) } catch { } } }
 # <<< harness-register
 
 # ------------------------------------------------------------------- native --
@@ -1346,10 +1347,9 @@ function Install-Switcher {
             return
         }
         # >>> harness-install
-        if ($PSScriptRoot -and (Test-Path -LiteralPath "$PSScriptRoot\src") -and (Split-Path $script:SwitcherHome -Leaf) -eq '.switcher') {
-            $harnessDst = Join-Path $script:SwitcherHome 'src'   # switcher-owned: clear it so renamed or removed files do not linger
-            if (Test-Path -LiteralPath $harnessDst) { Remove-Item -LiteralPath $harnessDst -Recurse -Force }
-            Copy-Item -LiteralPath "$PSScriptRoot\src" -Destination $harnessDst -Recurse
+        # src\ is switcher-owned and replaced whole (renamed or removed files do not linger), but never when the user kept their own installed script
+        if ($PSScriptRoot -and (Test-Path -LiteralPath "$PSScriptRoot\src") -and (Get-Command Install-HarnessSource -ErrorAction SilentlyContinue)) {
+            Install-HarnessSource -SourceDir "$PSScriptRoot\src" -SwitcherHome $script:SwitcherHome -ScriptPath $script:ScriptPath | Out-Null
         }
         # <<< harness-install
     }

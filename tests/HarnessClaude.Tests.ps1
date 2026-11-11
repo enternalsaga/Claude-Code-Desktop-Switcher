@@ -117,6 +117,53 @@ try {
     [void](Import-ClaudeNative -BundlePath (Join-Path $fixture 'out\odd.hbundle.zip') -Store (Get-Item -LiteralPath $dstOdd) -ClaudeHome $home3)
     Assert (-not (Test-Path -LiteralPath (Join-Path $home3 "projects\$slug"))) 'import must not create a second copy under the slug folder'
 
+    # a chat whose transcript is not on this machine (or empty) still exports
+    $mNone = Export-ClaudeChat -Session $session -OutPath (Join-Path $fixture 'out\none.hbundle.zip') -ClaudeHome (Join-Path $fixture 'claudehome-empty')
+    $pathsNone = @($mNone.files | ForEach-Object { $_.path })
+    Assert (($pathsNone -contains 'native/local_demo.json') -and ($pathsNone -contains 'transcript.md') -and ($pathsNone -notcontains "native/$cli.jsonl")) "export without a transcript: $($pathsNone -join ', ')"
+    $noneOut = Join-Path $fixture 'none-extract'
+    [void](Read-HarnessBundle -Path (Join-Path $fixture 'out\none.hbundle.zip') -ExtractTo $noneOut)
+    Assert ((Get-Item -LiteralPath (Join-Path $noneOut 'transcript.jsonl')).Length -eq 0) 'the empty transcript.jsonl round-trips through the bundle'
+
+    # the manifest does not leak a secret that sits in the title or the working directory
+    $leakySource = @{ harness = 'claude'; chatId = 'leak'; title = "deploy with $fakeKey"; cwd = @{ absolute = "C:\work\$fakeKey\app"; root = 'Work'; relative = "$fakeKey\app" } }
+    $mLeak = New-HarnessBundle -OutPath (Join-Path $fixture 'out\leak.hbundle.zip') -Source $leakySource -Files @(@{ Role = 'transcript'; Path = 'transcript.md'; Content = 'x' })
+    $leakText = $mLeak | ConvertTo-Json -Depth 10
+    Assert (-not $leakText.Contains('ZZZZ') -and $mLeak.source.title -eq 'deploy with [REDACTED]' -and $mLeak.source.cwd.absolute -eq 'C:\work\[REDACTED]\app') "manifest title and cwd are redacted: $leakText"
+    Assert ($leakySource.title -like '*ZZZZ*') 'the caller source hashtable is not modified'
+    $zipText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes((Join-Path $fixture 'out\leak.hbundle.zip')))
+    Assert (-not $zipText.Contains('ZZZZ')) 'nothing secret in the zip bytes of a small bundle'
+
+    # hooks: a broken file in src\ must not stop ClaudeSwitcher.ps1 (runs a copy in a child process, own LOCALAPPDATA)
+    $hookRoot = Join-Path $fixture 'hookcopy'
+    New-Item -ItemType Directory -Path $hookRoot | Out-Null
+    Copy-Item -LiteralPath $switcher -Destination $hookRoot
+    Copy-Item -LiteralPath (Join-Path $root 'src') -Destination (Join-Path $hookRoot 'src') -Recurse
+    [IO.File]::WriteAllText((Join-Path $hookRoot 'src\Zz.Broken.ps1'), "throw 'broken src file'`r`n")
+    [IO.File]::WriteAllText((Join-Path $hookRoot 'src\Zy.Syntax.ps1'), "function {{{ oops`r`n")
+    [IO.File]::WriteAllText((Join-Path $hookRoot 'src\Zx.Register.ps1'), "function Register-AntigravityHarness { throw 'register exploded' }`r`n")
+    $fakeLocal = Join-Path $fixture 'fakelocal'
+    New-Item -ItemType Directory -Path $fakeLocal | Out-Null
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $fakeLocal
+        $listOut = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $hookRoot 'ClaudeSwitcher.ps1') -List 2>&1 | Out-String
+        $listExit = $LASTEXITCODE
+    } finally { $env:LOCALAPPDATA = $savedLocal }
+    Assert ($listExit -eq 0 -and $listOut -match 'Default') "-List still works with broken src files (exit $listExit): $listOut"
+    $errLog = [IO.File]::ReadAllText((Join-Path $fakeLocal 'ClaudeProfiles\switcher-error.log'))
+    Assert ($errLog.Contains('Zz.Broken.ps1') -and $errLog.Contains('Zy.Syntax.ps1') -and $errLog.Contains('register exploded')) "failures are logged: $errLog"
+
+    # a subagent jsonl must never become the chat transcript
+    $home4 = Join-Path $fixture 'claudehome4'
+    New-Item -ItemType Directory -Path (Join-Path $home4 "projects\$slug\$cli\subagents") -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $home4 "projects\$slug\$cli\subagents\agent-9.jsonl"), '{"type":"user","timestamp":"t","message":{"role":"user","content":"SUBAGENT PROMPT"}}' + "`n")
+    $m4 = Export-ClaudeChat -Session $session -OutPath (Join-Path $fixture 'out\sub.hbundle.zip') -ClaudeHome $home4
+    $out4 = Join-Path $fixture 'sub-extract'
+    [void](Read-HarnessBundle -Path (Join-Path $fixture 'out\sub.hbundle.zip') -ExtractTo $out4)
+    Assert (@($m4.files | Where-Object { $_.path -eq "native/$cli/subagents/agent-9.jsonl" }).Count -eq 1) 'subagent file is still carried as native'
+    Assert (-not ([IO.File]::ReadAllText((Join-Path $out4 'transcript.md'))).Contains('SUBAGENT PROMPT') -and -not ([IO.File]::ReadAllText((Join-Path $out4 'transcript.jsonl'))).Contains('SUBAGENT PROMPT')) 'subagent text must not appear in the chat transcript'
+
     # handoff files (same machine, Claude -> file -> prompt)
     . (Import-TestFunctions -Files @((Join-Path $root 'src\Ui.Harness.ps1')) -Names @('Get-HandoffDir','New-HandoffPrompt','Export-HarnessHandoffFiles'))
     $handoffDir = Join-Path $fixture 'handoff'

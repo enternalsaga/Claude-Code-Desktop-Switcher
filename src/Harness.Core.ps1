@@ -42,7 +42,54 @@ function Get-Harnesses {
 function Register-Harnesses {
     Reset-HarnessRegistry
     foreach ($fn in 'Register-ClaudeHarness', 'Register-CodexHarness', 'Register-AntigravityHarness') {
-        if (Get-Command $fn -CommandType Function -ErrorAction SilentlyContinue) { & $fn }
+        if (-not (Get-Command $fn -CommandType Function -ErrorAction SilentlyContinue)) { continue }
+        # One broken adapter must not take the others, or the switcher, down with it.
+        try { & $fn } catch { Write-HarnessLog "$fn failed: $($_.Exception.Message)" }
+    }
+}
+
+# Appends a line to the switcher's error log ($script:LogPath of ClaudeSwitcher.ps1); a warning when there is none.
+function Write-HarnessLog {
+    param([Parameter(Mandatory)][string]$Message)
+    if ($script:LogPath) {
+        try { Add-Content -LiteralPath $script:LogPath -Value ('[{0}] {1}' -f (Get-Date -Format 's'), $Message) } catch { }
+    } else { Write-Warning $Message }
+}
+
+# Copies the clone's src\ next to the installed script. Returns:
+#   'skipped'   not a .switcher folder (never replace anything else)
+#   'kept'      the user kept their own installed script, so its src\ stays as it is
+#   'installed' src\ replaced
+#   'failed'    the copy failed; the previous src\ is untouched
+# "Kept" is read from ClaudeSwitcher.base.ps1: Update-InstalledScript copies the new script over it
+# whenever this version was installed or merged, and leaves it alone when the user chose to keep the old copy.
+function Install-HarnessSource {
+    param([Parameter(Mandatory)][string]$SourceDir, [Parameter(Mandatory)][string]$SwitcherHome, [Parameter(Mandatory)][string]$ScriptPath)
+    if ((Split-Path $SwitcherHome -Leaf) -ne '.switcher') { return 'skipped' }
+    $base = Join-Path $SwitcherHome 'ClaudeSwitcher.base.ps1'
+    $same = $false
+    if (Test-Path -LiteralPath $base) {
+        $same = ([IO.File]::ReadAllText($base).Replace("`r`n", "`n") -ceq [IO.File]::ReadAllText($ScriptPath).Replace("`r`n", "`n"))
+    }
+    if (-not $same) { return 'kept' }
+    $dst = Join-Path $SwitcherHome 'src'
+    $new = Join-Path $SwitcherHome 'src.new'
+    $old = Join-Path $SwitcherHome 'src.old'
+    try {
+        foreach ($p in $new, $old) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force } }
+        Copy-Item -LiteralPath $SourceDir -Destination $new -Recurse -ErrorAction Stop
+        if (Test-Path -LiteralPath $dst) { Rename-Item -LiteralPath $dst -NewName 'src.old' -ErrorAction Stop }
+        try { Rename-Item -LiteralPath $new -NewName 'src' -ErrorAction Stop }
+        catch {
+            if (Test-Path -LiteralPath $old) { Rename-Item -LiteralPath $old -NewName 'src' }
+            throw
+        }
+        if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
+        return 'installed'
+    } catch {
+        Write-HarnessLog "Could not install src\: $($_.Exception.Message)"
+        if (Test-Path -LiteralPath $new) { Remove-Item -LiteralPath $new -Recurse -Force -ErrorAction SilentlyContinue }
+        return 'failed'
     }
 }
 
@@ -69,7 +116,7 @@ function Resolve-TransferMode {
 # --- Bundle v1 (harness-bundle) -------------------------------------------------
 
 function Get-BytesSha256Hex {
-    param([Parameter(Mandatory)][byte[]]$Bytes)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return (($sha.ComputeHash($Bytes) | ForEach-Object { $_.ToString('x2') }) -join '') } finally { $sha.Dispose() }
 }
@@ -106,15 +153,27 @@ function New-HarnessBundle {
     $entries = @()
     foreach ($f in $Files) {
         if (-not (Test-BundleEntryName $f.Path)) { throw "Unsafe bundle entry name: $($f.Path)" }
-        $bytes = if ($f.ContainsKey('Content')) { $utf8.GetBytes([string]$f.Content) } else { [IO.File]::ReadAllBytes($f.SourcePath) }
+        # Plain assignments in both branches: an empty byte[] coming out of an if-expression would become $null.
+        if ($f.ContainsKey('Content')) { $bytes = $utf8.GetBytes([string]$f.Content) } else { $bytes = [IO.File]::ReadAllBytes($f.SourcePath) }
         $entries += [pscustomobject]@{ Role = $f.Role; Path = $f.Path; Bytes = $bytes }
     }
     $fileRows = @($entries | ForEach-Object { [ordered]@{ role = $_.Role; path = $_.Path; size = $_.Bytes.Length; sha256 = (Get-BytesSha256Hex $_.Bytes) } })
     $lines = @($fileRows | Sort-Object { $_.path } | ForEach-Object { '{0}:{1}' -f $_.path, $_.sha256 })
+    # The manifest is readable without the passphrase and is never encrypted, so a secret in the title or
+    # the working directory is redacted here (on a copy; the caller's hashtable is left alone).
+    $safeSource = @{}
+    foreach ($k in $Source.Keys) { $safeSource[$k] = $Source[$k] }
+    if ($safeSource['title']) { $safeSource['title'] = Protect-TranscriptText ([string]$safeSource['title']) }
+    if ($safeSource['cwd'] -is [System.Collections.IDictionary]) {
+        $cwdCopy = @{}
+        foreach ($k in $safeSource['cwd'].Keys) { $cwdCopy[$k] = $safeSource['cwd'][$k] }
+        foreach ($k in 'absolute', 'relative') { if ($cwdCopy[$k]) { $cwdCopy[$k] = Protect-TranscriptText ([string]$cwdCopy[$k]) } }
+        $safeSource['cwd'] = $cwdCopy
+    }
     $manifest = [ordered]@{
         format = 'harness-bundle'; version = 1; bundleId = [guid]::NewGuid().ToString()
         chatKey = ('{0}:{1}' -f $Source.harness, $Source.chatId)
-        source = $Source; files = $fileRows
+        source = $safeSource; files = $fileRows
         lineage = [ordered]@{ previousBundleId = $PreviousBundleId; contentSha256 = (Get-BytesSha256Hex $utf8.GetBytes(($lines -join "`n"))) }
         redaction = $Redaction; encryption = $null
     }
@@ -142,7 +201,7 @@ function Read-ZipEntryBytes {
     param([Parameter(Mandatory)]$Entry)
     $s = $Entry.Open()
     $ms = New-Object IO.MemoryStream
-    try { $s.CopyTo($ms); return $ms.ToArray() } finally { $s.Dispose(); $ms.Dispose() }
+    try { $s.CopyTo($ms); return , $ms.ToArray() } finally { $s.Dispose(); $ms.Dispose() }
 }
 
 # Validates everything (names, format, version, listing, sha256) before writing a single file.
@@ -210,7 +269,11 @@ function Get-SecretPatterns {
         @{ Regex = 'xox[abp]-[A-Za-z0-9\-]{10,}'; Replacement = '[REDACTED]' },
         @{ Regex = 'AIza[0-9A-Za-z_\-]{35}'; Replacement = '[REDACTED]' },
         @{ Regex = 'Bearer\s+[A-Za-z0-9._~+/=\-]{16,}'; Replacement = 'Bearer [REDACTED]' },
-        @{ Regex = '(?im)^(?<pre>[ \t]*(?:export[ \t]+)?(?-i:[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*)[ \t]*=[ \t]*)(?!\[REDACTED\])\S[^\r\n]*'; Replacement = '${pre}[REDACTED]' }
+        @{ Regex = '(?im)^(?<pre>[ \t]*(?:export[ \t]+)?(?-i:[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*)[ \t]*=[ \t]*)(?!\[REDACTED\])\S[^\r\n]*'; Replacement = '${pre}[REDACTED]' },
+        # NAME=value in the middle of a line (single token or quoted), "password": "x" in JSON, and --password=x flags.
+        @{ Regex = '(?<![A-Za-z0-9_])(?<pre>(?-i:[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*)=)(?!\[REDACTED\])(?:"[^"\r\n]*"|''[^''\r\n]*''|[^\s"'']+)'; Replacement = '${pre}[REDACTED]' },
+        @{ Regex = '(?<pre>"[A-Za-z0-9_\-]*(?:password|passwd|secret|token|api[_-]?key|apikey)"\s*:\s*)"(?!\[REDACTED\]")(?:[^"\\\r\n]|\\.)*"'; Replacement = '${pre}"[REDACTED]"' },
+        @{ Regex = '(?<![A-Za-z0-9_])(?<pre>--?[A-Za-z0-9_\-]*(?:password|passwd|secret|token|api[_-]?key|apikey)=)(?!\[REDACTED\])(?:"[^"\r\n]*"|''[^''\r\n]*''|\S+)'; Replacement = '${pre}[REDACTED]' }
     )
 }
 
@@ -241,7 +304,7 @@ function Measure-SecretFindings {
 
 # Returns redacted copies of normalized transcript entries (role, text, ts, tool{name,arg,output}).
 function Protect-TranscriptEntries {
-    param([Parameter(Mandatory)][array]$Entries)
+    param([Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][array]$Entries)
     foreach ($e in $Entries) {
         $copy = @{ role = $e.role; text = (Protect-TranscriptText ([string]$e.text)); ts = $e.ts }
         if ($e.tool) {
@@ -286,7 +349,7 @@ function Format-TranscriptTurn {
 # (the first sentence of the user's message). The result is always redacted.
 function ConvertTo-HandoffMarkdown {
     param(
-        [Parameter(Mandatory)][array]$Entries,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][array]$Entries,
         [Parameter(Mandatory)][string]$Harness,
         [Parameter(Mandatory)][string]$Title,
         [string]$Cwd, [string]$Branch, [string[]]$Artifacts = @(), [int]$KeepTurns = 40

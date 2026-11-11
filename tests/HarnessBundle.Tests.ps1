@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_TestHelper.ps1')
 $core = Join-Path (Split-Path $PSScriptRoot -Parent) 'src\Harness.Core.ps1'
 . (Import-TestFunctions -Files @($core) -Names @(
-    'Get-FileSha256Hex','Get-BytesSha256Hex','Test-BundleEntryName','New-HarnessBundle','Read-ZipEntryBytes','Read-HarnessBundle',
+    'Get-SecretPatterns','Invoke-SecretScan','Protect-TranscriptText','Get-FileSha256Hex','Get-BytesSha256Hex','Test-BundleEntryName','New-HarnessBundle','Read-ZipEntryBytes','Read-HarnessBundle',
     'ConvertTo-CwdRef','Resolve-CwdRef'))
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem

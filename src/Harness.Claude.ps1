@@ -110,7 +110,7 @@ function Export-ClaudeChat {
     $native = @(Get-ClaudeNativeFiles -Session $Session -Data $data -ClaudeHome $ClaudeHome)
     $findings = 0
     foreach ($n in $native) { if ($n.SourcePath -match '\.(jsonl?|txt|md|log)$') { $findings += Measure-SecretFindings -Path $n.SourcePath } }
-    $jsonl = $native | Where-Object { $_.Path -like 'native/*.jsonl' } | Select-Object -First 1
+    $jsonl = $native | Where-Object { $_.Path -match '^native/[^/]+\.jsonl$' } | Select-Object -First 1
     $entries = @(); if ($jsonl) { $entries = @(Protect-TranscriptEntries -Entries (ConvertFrom-ClaudeJsonl -Path $jsonl.SourcePath)) }
     $cwd = Get-FirstValue $data 'cwd', 'originCwd', 'workingDirectory'
     $title = $(if ($Session.Title) { $Session.Title } else { $Session.Id })
