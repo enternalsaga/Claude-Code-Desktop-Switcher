@@ -228,7 +228,23 @@ try {
     Assert ($paths -contains 'native/conversations/11111111-1111-1111-1111-111111111111.db' -and $paths -contains 'native/brain/11111111-1111-1111-1111-111111111111/task.md' -and $paths -contains 'native/brain/11111111-1111-1111-1111-111111111111/.system_generated/logs/transcript.jsonl') "bundle has db and brain files: $($paths -join ',')"
     Assert (-not ($paths | Where-Object { $_ -like '*browser_recordings*' })) 'browser_recordings left out'
     Assert (-not ($paths | Where-Object { $_ -like '*-shm' })) '-shm is not bundled'
-    Assert ($mf.source.harness -eq 'antigravity' -and $mf.source.chatId -eq '11111111-1111-1111-1111-111111111111' -and $mf.source.antigravity.kind -eq 'app' -and $mf.source.antigravity.stepCount -eq 5) "source block: $($mf.source.antigravity | ConvertTo-Json -Compress)"
+    Assert ($mf.source.harness -eq 'antigravity' -and $mf.source.chatId -eq '11111111-1111-1111-1111-111111111111' -and $mf.source.antigravity.kind -eq 'app') "source block: $($mf.source.antigravity | ConvertTo-Json -Compress)"
+    # A2: stepCount and the transcript come from one source. The app's transcript.jsonl wins (2 lines here), the db has 5 steps.
+    Assert ($mf.source.antigravity.transcriptSource -eq 'jsonl' -and $mf.source.antigravity.stepCount -eq 2) "jsonl chat: stepCount from the jsonl: $($mf.source.antigravity | ConvertTo-Json -Compress)"
+    $dbOnlyId = '44444444-4444-4444-4444-444444444444'
+    Copy-Item $dbPath (Join-Path $conv "$dbOnlyId.db")
+    $dbOnly = [pscustomobject]@{ ChatId = $dbOnlyId; Title = 'db only'; Cwd = $null; Activity = 1; Parent = $null; Kind = 'app'; Format = 'db'; Profile = $appProfile }
+    $dbOnlyMf = Export-AgyChat -Chat $dbOnly -OutPath (Join-Path $fixture 'dbonly.hbundle.zip')
+    Assert ($dbOnlyMf.source.antigravity.transcriptSource -eq 'db' -and $dbOnlyMf.source.antigravity.stepCount -eq 5) "db-only chat: transcript and stepCount from the db: $($dbOnlyMf.source.antigravity | ConvertTo-Json -Compress)"
+    # A1: a junction inside brain\<id> is not followed
+    $jId = '55555555-5555-5555-5555-555555555555'
+    $jBrain = Join-Path $dataApp "brain\$jId"; $outside = Join-Path $fixture 'outside-brain'
+    New-Item -ItemType Directory -Path $jBrain, $outside -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $outside 'secret-outside.md'), 'not part of this chat'); [IO.File]::WriteAllText((Join-Path $jBrain 'task.md'), 'own file')
+    cmd /c mklink /J "$jBrain\linked" "$outside" | Out-Null
+    $jf = @(Get-AgyBrainFiles -DataDir $dataApp -Id $jId)
+    [IO.Directory]::Delete("$jBrain\linked")
+    Assert ((@($jf | Where-Object { $_.Path -like '*task.md' }).Count -eq 1) -and (@($jf | Where-Object { $_.Path -like '*secret-outside*' -or $_.Path -like '*linked*' }).Count -eq 0)) "junction not followed: $($jf.Path -join ',')"
     Assert ($mf.redaction.transcriptRedacted -and $mf.redaction.findings -ge 1) 'secret in transcript counted'
     $extract = Join-Path $fixture 'x1'
     [void](Read-HarnessBundle -Path $bundle -ExtractTo $extract)
@@ -242,6 +258,7 @@ try {
     $pbBundle = Join-Path $fixture '22222222-2222-2222-2222-222222222222.hbundle.zip'
     $pbMf = Export-AgyChat -Chat $chatPb -OutPath $pbBundle
     Assert (-not (@($pbMf.files | ForEach-Object { $_.path }) -like 'native/conversations/*') -and $pbMf.source.antigravity.format -eq 'pb') '.pb bundle has no conversation file'
+    Assert ($pbMf.source.antigravity.transcriptSource -eq 'none') '.pb bundle: no transcript source'
     Assert ((Import-AgyNative -BundlePath $pbBundle -Profile $appProfile) -eq 'no-native') '.pb bundle: no-native'
     Assert-Throws { [void](Export-AgyChat -Chat $chat1 -OutPath (Join-Path $fixture 'big.zip') -MaxDbMB 0.000001) } 'a database over the limit is refused'
     $big = Export-AgyChat -Chat $chat1 -OutPath (Join-Path $fixture 'big.zip') -MaxDbMB 0.000001 -AllowLarge

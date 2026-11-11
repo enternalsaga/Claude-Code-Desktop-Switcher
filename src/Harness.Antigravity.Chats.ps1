@@ -133,15 +133,16 @@ function Get-AgySystemStepTypes {
 # A tool call comes from PLANNER_RESPONSE.tool_calls; the content of the following tool step becomes its output.
 # Lines that are not valid JSON are skipped and counted in $Skipped (a [ref]).
 function ConvertFrom-AgyTranscriptJsonl {
-    param([Parameter(Mandatory)][string]$Path, [ref]$Skipped)
+    param([Parameter(Mandatory)][string]$Path, [ref]$Skipped, [ref]$Steps)
     $entries = New-Object Collections.Generic.List[object]
     $pending = New-Object Collections.Generic.Queue[object]
     $system = Get-AgySystemStepTypes
-    $bad = 0
+    $bad = 0; $lineCount = 0
     foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8)) {
         if (-not $line.Trim()) { continue }
         $o = $null
         try { $o = $line | ConvertFrom-Json } catch { $bad++; continue }
+        if ($o) { $lineCount++ }   # every readable line is one step, system steps included (the same unit the db's steps table counts)
         if (-not $o -or $system -contains $o.type) { continue }
         switch ($o.type) {
             'USER_INPUT' {
@@ -163,6 +164,7 @@ function ConvertFrom-AgyTranscriptJsonl {
         }
     }
     if ($Skipped) { $Skipped.Value = $bad }
+    if ($Steps) { $Steps.Value = $lineCount }
     return $entries.ToArray()
 }
 
@@ -174,10 +176,15 @@ function Get-AgyBrainFiles {
     $dir = Join-Path $DataDir "brain\$Id"
     if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return @() }
     $prefix = (Get-Item -LiteralPath $dir).FullName.TrimEnd('\') + '\'
-    foreach ($f in (Get-ChildItem -LiteralPath $dir -Recurse -File -Force)) {
-        $rel = $f.FullName.Substring($prefix.Length)
-        if (($rel -split '\\') -contains 'browser_recordings') { continue }
-        @{ Role = 'native'; Path = ("native/brain/$Id/" + $rel.Replace('\', '/')); SourcePath = $f.FullName }
+    # walked by hand: Get-ChildItem -Recurse follows junctions and symlinks out of the chat's folder
+    $pending = New-Object Collections.Generic.Stack[string]; $pending.Push($dir)
+    while ($pending.Count) {
+        foreach ($item in (Get-ChildItem -LiteralPath $pending.Pop() -Force)) {
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if ($item.PSIsContainer) { if ($item.Name -ne 'browser_recordings') { $pending.Push($item.FullName) }; continue }
+            $rel = $item.FullName.Substring($prefix.Length)
+            @{ Role = 'native'; Path = ("native/brain/$Id/" + $rel.Replace('\', '/')); SourcePath = $item.FullName }
+        }
     }
 }
 
@@ -201,7 +208,7 @@ function Export-AgyChat {
     )
     $id = $Chat.ChatId; $dataDir = $Chat.Profile.DataDir
     $files = @(Get-AgyBrainFiles -DataDir $dataDir -Id $id)
-    $entries = @(); $stepCount = $null; $snapDir = $null
+    $entries = @(); $stepCount = $null; $snapDir = $null; $transcriptSource = 'none'
     try {
         if ($Chat.Format -eq 'db') {
             $dbPath = Join-Path $dataDir "conversations\$id.db"
@@ -210,9 +217,16 @@ function Export-AgyChat {
             $snap = Copy-SqliteSnapshot -Path $dbPath; $snapDir = Split-Path -Parent $snap
             $files += @(@{ Role = 'native'; Path = "native/conversations/$id.db"; SourcePath = $snap })
             if (Test-Path -LiteralPath ($snap + '-wal')) { $files += @(@{ Role = 'native'; Path = "native/conversations/$id.db-wal"; SourcePath = ($snap + '-wal') }) }
-            $stepCount = Get-AgyStepCount -SnapshotDb $snap
+            # stepCount and the transcript come from the same source: the app's transcript.jsonl when there is one, else the db
             $jsonl = $files | Where-Object { $_.Path -like "native/brain/$id/.system_generated/logs/transcript.jsonl" } | Select-Object -First 1
-            if ($jsonl) { $entries = @(ConvertFrom-AgyTranscriptJsonl -Path $jsonl.SourcePath) } else { $entries = @(ConvertFrom-AgyDb -Path $dbPath) }
+            if ($jsonl) {
+                $jsonlSteps = 0
+                $entries = @(ConvertFrom-AgyTranscriptJsonl -Path $jsonl.SourcePath -Steps ([ref]$jsonlSteps))
+                $stepCount = $jsonlSteps; $transcriptSource = 'jsonl'
+            } else {
+                $entries = @(ConvertFrom-AgyDb -Path $dbPath)
+                $stepCount = Get-AgyStepCount -SnapshotDb $snap; $transcriptSource = 'db'
+            }
         }
         # the core helpers reject an empty entry list, so an empty transcript gets a one-line note in transcript.md only
         $note = @(@{ role = 'user'; text = '(No transcript is available for this conversation; see the listed artifacts.)'; ts = $null })
@@ -229,7 +243,7 @@ function Export-AgyChat {
             chatId = $id; parentChatId = $Chat.Parent; title = $Chat.Title
             cwd = $(if ($Chat.Cwd) { ConvertTo-CwdRef -Path $Chat.Cwd -PathRoots $PathRoots } else { @{ absolute = $null; root = $null; relative = $null } })
             createdAt = $null; lastActivityAt = $Chat.Activity
-            antigravity = @{ kind = $Chat.Kind; format = $Chat.Format; stepCount = $stepCount }
+            antigravity = @{ kind = $Chat.Kind; format = $Chat.Format; stepCount = $stepCount; transcriptSource = $transcriptSource }
         }
         $files += @(@{ Role = 'transcript'; Path = 'transcript.md'; Content = $md }, @{ Role = 'transcript'; Path = 'transcript.jsonl'; Content = $jsonLines })
         return New-HarnessBundle -OutPath $OutPath -Source $source -Files $files -PreviousBundleId $PreviousBundleId `

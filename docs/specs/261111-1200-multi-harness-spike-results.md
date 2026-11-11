@@ -209,3 +209,35 @@ Chạy 2026-11-11 trên `spike1` (account 2, app đã đóng trừ phần S8c) v
 - `threads.rollout_path` có thể không khớp tên file thật: nhiều dòng ghi `….jsonl` trong khi file trên đĩa là `….jsonl.zst`, và đường dẫn có tiền tố `\\?\`. Khi tìm rollout phải thử cả `path` và `path + '.zst'`.
 - Cột `source` của thread subagent là chuỗi JSON `{"subagent":…}`; cột `thread_source` là `subagent` (728 dòng), `user` (710), `agent_created_thread` (20), `chatgpt_handoff` (1), `onboarding_checklist` (2). Lọc chat người dùng bằng `thread_source NOT IN ('subagent')` (xem K2).
 - **Rủi ro cho giá trị của native Default → profile khác:** ở Default, 773 chat có `model_provider=codex_local_access` (đường Cockpit) và chỉ 688 dòng `openai`, trong đó hầu hết là subagent (665/688); chỉ ~3 thread người dùng `openai`. Với account thường, `Import-CodexNative` sẽ trả `provider-mismatch` cho gần như mọi chat của Default, nên đường handoff sẽ là đường chính cho Default → profile phụ.
+
+## S13: snapshot SQLite nhất quán bằng `VACUUM INTO` trên DB WAL đang ghi — **ĐẠT**
+
+Chạy 2026-11-11, Windows PowerShell 5.1, `winsqlite3.dll` (SQLite 3.53.4). Script: `tools\spikes\S13-SqliteSnapshotConsistency.ps1` (chỉ ghi dưới `%TEMP%`, xóa sạch khi xong).
+
+- Cách thử: một process riêng ghi liên tục vào DB WAL (commit mỗi 20 dòng kèm blob 2 KB, thỉnh thoảng `DELETE`), DB tăng tới ~70 MB. Process chính mở kết nối **chỉ đọc** (`SQLITE_OPEN_READONLY`), chạy `PRAGMA busy_timeout=5000` rồi `VACUUM INTO '<tmp>'` 50 lần, mỗi bản chạy `PRAGMA integrity_check`.
+- Kết quả: **50/50 bản `ok`**, không lỗi `locked`/`busy`. Thời gian mỗi lần: min 121 ms, trung bình 492 ms, max 1172 ms (DB ~70 MB, đang bị ghi liên tục).
+- So với cách hiện tại (`Copy-SqliteSnapshot` chép `.db`, `-wal`, `-shm` từng file) trong cùng điều kiện: **26/50 lần hỏng**, chủ yếu do `Copy-Item` ném lỗi vì `-shm` đang bị khóa một phần ("another process has locked a portion of the file"). Lần chép được vẫn có thể lệch giữa ba file.
+- Kết luận cho H1d: dùng `VACUUM INTO` từ kết nối chỉ đọc, không cần `sqlite3_backup_*`. Giữ đường lui về chép file (kèm log) khi `VACUUM INTO` lỗi. Cần `busy_timeout`. Bản vacuum chỉ có một file, không mang `-wal`/`-shm`.
+- Lưu ý: `VACUUM INTO` dựng lại cả DB nên với DB lớn tốn thời gian và dung lượng tạm tương đương; đặt trần kích thước ở nơi gọi.
+
+## S10: ngữ nghĩa ghi/đọc trên Google Drive for desktop (DriveFS) — **ĐẠT, kèm hai ràng buộc cho lane S**
+
+Chạy 2026-11-11, Windows PowerShell 5.1, ổ Drive của một account (My Drive đọc theo nhãn volume, không in tên). Script: `tools\spikes\S10-DriveFsSemantics.ps1 -DriveRoot <My Drive>`; chỉ ghi dưới `<My Drive>\HarnessSync-test\s10\` và `%TEMP%`, đã xóa sạch (script tự kiểm).
+
+- **(a) tmp rồi rename, bên đọc cùng máy (process thứ hai): ĐẠT.** Writer ghi `a-final.bin.tmp-<guid>` (2 MB, đầu và đuôi mang cùng số đếm) rồi rename đè lên `a-final.bin` 40 lần; bên đọc lặp liên tục: khoảng 1.000-1.300 lượt đọc mỗi đợt, **0 lượt thấy file dở** (mọi bản đọc đủ 2 MB, đầu khớp đuôi), thấy đủ 40 phiên bản. Hai lỗi mở file xảy ra thoáng qua lúc đang rename: `being used by another process` và `Access ... is denied`. Cả hai đều là lỗi mở, không phải dữ liệu dở, nên bên đọc chỉ cần thử lại. (Số `missing` lớn trong log là do bên đọc chạy trước khi writer khởi động xong, không có ý nghĩa.)
+- **Ràng buộc 1: cách rename.** `Move-Item -Force` đè lên file đang có thất bại **37/40** khi bên đọc đang mở file không kèm `FileShare.Delete` (`Cannot create a file when that file already exists`); không có bên đọc thì 40/40 đạt. Gọi thẳng `MoveFileEx(tmp, dest, MOVEFILE_REPLACE_EXISTING)` qua P/Invoke đạt **40/40 cả khi có bên đọc**. `Write-SyncFileAtomic` (S2) dùng `MoveFileEx` kèm thử lại có hạn, không dùng `Move-Item -Force`. Bên đọc mở file với `FileShare.ReadWrite | Delete`. (`[IO.File]::Replace` chưa thử trọn vẹn vì lỗi tham số; không cần dùng.)
+- **(b) mở file ngay sau khi ghi, lúc DriveFS đang tải lên: ĐẠT.** File 50 MB ghi xong trong ~0,3 s. Ngay sau đó mở được ở cả ba chế độ (đọc loại trừ, đọc chia sẻ, mở ghi), không bị khóa; sha của bản đọc ngay sau khi ghi khớp bản đã ghi; rename ngay sau khi ghi cũng được.
+- **(c) chép 50 MB về `%TEMP%`: ĐẠT.** Lần đầu 386-415 ms, các lần sau 42-62 ms (bản đã nằm trong cache cục bộ của DriveFS); sha khớp 3/3, và khớp cả lần chép sau 15 giây. Lưu ý: số này là file do máy này vừa ghi nên đã có sẵn cục bộ. Với file do máy khác đẩy lên, DriveFS có thể phải tải về trước (chế độ stream), thời gian sẽ phụ thuộc mạng. Chưa đo được trên một máy thứ hai.
+- **(d) ghi trùng tên trên cùng một máy: ĐẠT.** Ghi đè hai lần rồi đè bằng rename, chờ 20 s: **không** sinh file `tên (1).ext`; nội dung cuối là bản mới nhất. `CreateNew` lên tên có sẵn bị từ chối bình thường. **Chưa kiểm được:** xung đột thật khi hai máy ghi cùng tên, vì cần máy thứ hai. Thiết kế "mỗi file chỉ một máy ghi" (D8, S1) vẫn giữ; bên đọc vẫn bỏ qua `* (n).*`.
+- **Kết luận cho lane S:** (1) S2 ghi bằng tmp + `MoveFileEx` thay thế, kèm kiểm sha sau khi ghi; (2) S5 thử lại có hạn (vài lần, cách nhau 200-500 ms) khi mở hoặc chép file lỗi `used by another process`/`access denied`, rồi kiểm sha theo row; (3) không cần giữ trần kích thước riêng cho việc chép 50 MB.
+
+## S12: rollout Codex có cwd không tồn tại trên máy — **ĐẠT**
+
+Chạy 2026-11-11 trong home tạm `%TEMP%\harness-spike\S12\home` (đã xóa), `codex app-server` trong package, không gọi model. Script: `tools\spikes\S12-CodexMissingCwd.ps1 -SourceRollout <rollout .jsonl chỉ đọc>`. Rollout thử là bản chép của một rollout thật, đổi thread id và đổi mọi chỗ ghi cwd (`session_meta` và các dòng khác) sang `Z:\NoSuchRoot\SomeProject` (không tồn tại); bản đối chứng đổi sang `%TEMP%` (tồn tại).
+
+- Home rỗng: app-server tự tạo `state_5.sqlite` ngay lần khởi động đầu. Thả hai rollout vào `sessions\`, khởi động lại, đợi 12 s, rồi `thread/read {includeTurns:false}`.
+- **Cwd không tồn tại: `thread/read` thành công và dòng `threads` được đăng ký**, `archived=0`. Cột `cwd` mang đúng chuỗi trong rollout (`Z:\NoSuchRoot\SomeProject`), không bị đổi hay làm rỗng. `thread/read` trả cùng cwd đó.
+- Đối chứng cwd tồn tại: cũng đăng ký; cột `cwd` được chuẩn hóa thành dạng `\\?\C:\...` (tiền tố `\\?\`), còn `thread/read` trả đường dẫn thường. Tức app-server chỉ chuẩn hóa (canonicalize) được khi đường dẫn có thật, nếu không thì giữ nguyên chuỗi.
+- Hai thread đều **không** hiện trong `thread/list` (bản rollout nguồn chép không có tin nhắn user thích hợp trong phạm vi lọc của list, như S8a đã ghi về preview rỗng). Nên kết quả này chỉ chứng minh đăng ký dòng `threads`, không chứng minh hiển thị. Hai thread cư xử giống nhau, nên không có dấu hiệu cwd thiếu làm khác đi.
+- Không thử được: cửa sổ ChatGPT/Codex có hiện thread có cwd thiếu và mở tiếp (resume) được không. Cần mắt người nếu muốn chắc.
+- Kết luận cho D5/lane C: Codex khác máy có thể chép native nguyên bản (không cần viết lại cwd để đăng ký được). UI chỉ nên cảnh báo khi cwd nguồn không tồn tại trên máy này. Khuyến nghị: hỏi người dùng có muốn dùng handoff khi cwd thiếu, vì resume trong thư mục không có là điều chưa kiểm.
