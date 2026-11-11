@@ -79,11 +79,38 @@ function Invoke-HarnessTransfer {
     return $res
 }
 
+# Detect says whether the app is on this machine. A harness that is not installed, or whose Detect fails, is not
+# offered: moving a chat into it would write into a home no app uses.
+function Test-HarnessInstalled {
+    param([Parameter(Mandatory)]$Harness)
+    try {
+        $d = & $Harness.Adapter.Detect
+        if ($d -is [bool]) { return $d }
+        return [bool]($d -and $d.PSObject.Properties['Installed'] -and $d.Installed)
+    } catch { return $false }
+}
+
+function Get-HarnessTransferSources {
+    return @(Get-Harnesses | Where-Object { $_.Name -in 'claude', 'codex' -and (Test-HarnessInstalled $_) } | Sort-Object Name)
+}
+
+# One entry per profile of every installed harness.
+function Get-HarnessTransferTargets {
+    $list = New-Object System.Collections.ArrayList
+    foreach ($h in (Get-Harnesses | Sort-Object Name)) {
+        if (-not (Test-HarnessInstalled $h)) { continue }
+        try { foreach ($p in @(& $h.Adapter.GetProfiles)) { [void]$list.Add($p) } } catch { }
+    }
+    return $list.ToArray()
+}
+
 function Get-HarnessTransferMessage {
     param([Parameter(Mandatory)]$Result, [Parameter(Mandatory)]$Target)
     $name = '{0} / {1}' -f (Get-HarnessDisplayName (Get-Harness -Name $Target.Harness)), $Target.Name
     switch ($Result.Status) {
         'copied'            { return "Copied into $name." }
+        'registered'        { return "The chat file was already in $name; it is now registered, so it should show in the list." }
+        'copied-unregistered' { return "The chat file was copied into $name, but Codex could not register it, so it may not show in the list yet. Try the same move again." }
         'exists'            { return "$name already has this chat." }
         'imported'          { return "Imported into $name through Codex's own importer." }
         'provider-mismatch' { return "The model provider of this chat is not set up in $name, so it cannot be resumed there. A handoff was made instead; the opening prompt is on the clipboard." }
@@ -94,12 +121,9 @@ function Get-HarnessTransferMessage {
 
 function Show-HarnessExportDialog {
     param($Source)
-    $sources = @(Get-Harnesses | Where-Object { $_.Name -in 'claude', 'codex' } | Sort-Object Name)
+    $sources = @(Get-HarnessTransferSources)
     if (-not $sources.Count) { return }
-    $targets = New-Object System.Collections.ArrayList   # one entry per profile of every registered harness
-    foreach ($h in (Get-Harnesses | Sort-Object Name)) {
-        try { foreach ($p in @(& $h.Adapter.GetProfiles)) { [void]$targets.Add($p) } } catch { }
-    }
+    $targets = @(Get-HarnessTransferTargets)
     $state = @{ Harness = $sources[0]; Profiles = @() }
 
     $dlg               = New-Object System.Windows.Forms.Form

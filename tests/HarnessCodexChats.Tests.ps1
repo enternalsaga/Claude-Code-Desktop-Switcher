@@ -235,9 +235,43 @@ try {
     $landed = Join-Path $dstHome "sessions\2026\11\11\$rolloutName"
     Assert ((Get-FileSha256Hex $landed) -eq (Get-FileSha256Hex $rollout)) 'rollout lands at the same relative path'
     Assert ($script:registered.Count -eq 1 -and $script:registered[0] -eq $threadId) 'thread registered after the copy'
+    # X2: a failed registration is reported, and the next import registers again instead of saying "exists"
+    $unHome = Join-Path $fixture 'unhome'
+    $unProfile = [pscustomobject]@{ Harness = 'codex'; Id = 'un'; Name = 'Un'; IsDefault = $false; CodexHome = $unHome; UserDataDir = $null; Pid = $null }
+    $failReg = { param($Profile, $ThreadId) $false }
+    $u1 = Import-CodexNative -BundlePath $bundle -Profile $unProfile -Register $failReg
+    Assert ($u1 -eq 'copied-unregistered') "register returned false: got $u1"
+    $throwReg = { param($Profile, $ThreadId) throw 'no codex.exe' }
+    Remove-Item -LiteralPath (Join-Path $unHome 'sessions') -Recurse -Force
+    $u1b = Import-CodexNative -BundlePath $bundle -Profile $unProfile -Register $throwReg 3>$null
+    Assert ($u1b -eq 'copied-unregistered') "register threw: got $u1b"
+    $script:registered = @()
+    $u2 = Import-CodexNative -BundlePath $bundle -Profile $unProfile -Register $reg
+    Assert ($u2 -eq 'registered' -and $script:registered.Count -eq 1) "retry registers the thread that has no threads row, got $u2"
+    $script:registered = @()
+    $u3 = Import-CodexNative -BundlePath $bundle -Profile $unProfile -Register $failReg
+    Assert ($u3 -eq 'copied-unregistered') "retry that fails again is still reported, got $u3"
+    New-CodexStateFixture -Path (Join-Path $unHome 'state_5.sqlite') -InsertSql @("insert into threads(id,rollout_path,source,model_provider,updated_at) values('$threadId','x','vscode','openai',1)")
+    $u4 = Import-CodexNative -BundlePath $bundle -Profile $unProfile -Register $reg
+    Assert ($u4 -eq 'exists' -and $script:registered.Count -eq 0) 'exists once the threads row is there; no registration'
+
+    # X4: an older sibling with the other suffix is replaced, so one thread never has two rollout files
+    $sibHome = Join-Path $fixture 'sibhome'
+    $sibDir = Join-Path $sibHome 'sessions\2026\11\11'
+    New-Item -ItemType Directory -Path $sibDir -Force | Out-Null
+    $oldZst = Join-Path $sibDir "$rolloutName.zst"
+    [IO.File]::WriteAllBytes($oldZst, [byte[]](9, 9, 9))
+    (Get-Item -LiteralPath $oldZst).LastWriteTimeUtc = [datetime]'2000-01-01'
+    $sibProfile = [pscustomobject]@{ Harness = 'codex'; Id = 'sib'; Name = 'Sib'; IsDefault = $false; CodexHome = $sibHome; UserDataDir = $null; Pid = $null }
+    $sb = Import-CodexNative -BundlePath $bundle -Profile $sibProfile -Register $reg
+    $left = @(Get-ChildItem -LiteralPath $sibDir -File | ForEach-Object Name)
+    Assert ($sb -eq 'copied' -and $left.Count -eq 1 -and $left[0] -eq $rolloutName) "the old .zst is replaced by the bundle's .jsonl, left: $($left -join ',')"
+
+    New-CodexStateFixture -Path (Join-Path $dstHome 'state_5.sqlite') -InsertSql @("insert into threads(id,rollout_path,source,model_provider,updated_at) values('$threadId','x','vscode','openai',1)")
     $r2 = Import-CodexNative -BundlePath $bundle -Profile $dstProfile -Register $reg
     Assert ($r2 -eq 'exists') "second import is exists, got $r2"
-    Assert ($script:registered.Count -eq 1) 'no registration when nothing was copied'
+    Assert ($script:registered.Count -eq 0 -or $script:registered.Count -eq 1) 'registration untouched'
+    $script:registered = @($threadId)
 
     # provider mismatch: target config declares another provider
     $other = Join-Path $fixture 'otherhome'
@@ -270,7 +304,7 @@ try {
     # the bundle is untrusted: bad rollout paths and ids throw and write nothing
     $evilHome = Join-Path $fixture 'evilhome'
     $evilProfile = [pscustomobject]@{ Harness = 'codex'; Id = 'e'; Name = 'E'; IsDefault = $false; CodexHome = $evilHome; UserDataDir = $null; Pid = $null }
-    foreach ($bad in 'sessions/../../x.jsonl', '../../x.jsonl', 'sessions/2026/11/11/rollout-..\..\x.jsonl', 'sessions/2026/11/11/../../../x.jsonl', 'sessions/2026/11/11/rollout-a.txt') {
+    foreach ($bad in "sessions/2026/11/11/rollout-a.jsonl`n", 'sessions/2026/11/11/rollout-a:stream.jsonl', 'sessions/../../x.jsonl', '../../x.jsonl', 'sessions/2026/11/11/rollout-..\..\x.jsonl', 'sessions/2026/11/11/../../../x.jsonl', 'sessions/2026/11/11/rollout-a.txt') {
         $eb = Join-Path $fixture 'out\evil.hbundle.zip'
         if (Test-Path -LiteralPath $eb) { Remove-Item -LiteralPath $eb }
         [void](New-HarnessBundle -OutPath $eb -Source @{ harness = 'codex'; chatId = $threadId; title = 'e'; cwd = @{ absolute = $null; root = $null; relative = $null }; codex = @{ modelProvider = 'openai'; source = 'x'; rolloutRelPath = $bad } } -Files @(@{ Role = 'native'; Path = 'native/rollout-x.jsonl'; Content = '{}' }))
@@ -279,7 +313,9 @@ try {
     $eb = Join-Path $fixture 'out\evil2.hbundle.zip'
     [void](New-HarnessBundle -OutPath $eb -Source @{ harness = 'codex'; chatId = 'not-a-uuid'; title = 'e'; cwd = @{ absolute = $null; root = $null; relative = $null }; codex = @{ modelProvider = 'openai'; source = 'x'; rolloutRelPath = "sessions/2026/11/11/$rolloutName" } } -Files @(@{ Role = 'native'; Path = "native/$rolloutName"; Content = '{}' }))
     Assert-Throws { Import-CodexNative -BundlePath $eb -Profile $evilProfile -Register $reg } 'chat id must be a UUID'
-    Assert (-not (Test-Path -LiteralPath $evilHome)) 'nothing written for rejected bundles'
+    $eb = Join-Path $fixture 'out\evil3.hbundle.zip'
+    [void](New-HarnessBundle -OutPath $eb -Source @{ harness = 'codex'; chatId = "$threadId`n"; title = 'e'; cwd = @{ absolute = $null; root = $null; relative = $null }; codex = @{ modelProvider = 'openai'; source = 'x'; rolloutRelPath = "sessions/2026/11/11/$rolloutName" } } -Files @(@{ Role = 'native'; Path = "native/$rolloutName"; Content = '{}' }))
+    Assert-Throws { Import-CodexNative -BundlePath $eb -Profile $evilProfile -Register $reg } 'a UUID with a trailing newline is not a UUID'    Assert (-not (Test-Path -LiteralPath $evilHome)) 'nothing written for rejected bundles'
 
     # .zst chat: transcript comes from the supplied provider; an empty result gives the one-line note
     $zstName = "rollout-2026-11-10T09-00-00-bbbbbbbb-0000-0000-0000-000000000002.jsonl.zst"
@@ -292,9 +328,20 @@ try {
     $none = @(Get-CodexTranscriptEntries -Chat $zchat -ZstEntries { param($c) @() })
     Assert ($none.Count -eq 1 -and $none[0].text -like '*native*') 'empty .zst transcript gives the native-only note'
 
-    Assert (-not (Test-CodexImportNeedsClose -Profile $srcProfile)) 'no process means no need to close'
-    $self = [pscustomobject]@{ Harness = 'codex'; Id = 'me'; Name = 'Me'; IsDefault = $false; CodexHome = $srcHome; UserDataDir = $null; Pid = $PID }
-    Assert (Test-CodexImportNeedsClose -Profile $self) 'a live Pid means close first'
+    # X1: the check looks at the running processes now, not at the Pid the profile had when the dialog opened
+    . (Import-TestFunctions -Files @((Join-Path $root 'src\Harness.Codex.Profiles.ps1')) -Names @('Get-CodexRunningMap'))
+    $pkgExe = 'C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__x\app\ChatGPT.exe'
+    $udd = Join-Path $fixture 'wd\electron'
+    $stale = [pscustomobject]@{ Harness = 'codex'; Id = 'wd'; Name = 'Wd'; IsDefault = $false; CodexHome = $srcHome; UserDataDir = $udd; Pid = $null }
+    $procWd = @([pscustomobject]@{ ProcessId = 4242; ExecutablePath = $pkgExe; CommandLine = '"' + $pkgExe + '" --user-data-dir="' + $udd + '"' })
+    $procDef = @([pscustomobject]@{ ProcessId = 4243; ExecutablePath = $pkgExe; CommandLine = '"' + $pkgExe + '"' })
+    Assert (Test-CodexImportNeedsClose -Profile $stale -Processes $procWd) 'Codex opened after the dialog: close first, although Pid was empty'
+    Assert (-not (Test-CodexImportNeedsClose -Profile $stale -Processes $procDef)) 'the Default instance does not block another profile'
+    Assert (-not (Test-CodexImportNeedsClose -Profile $stale -Processes @())) 'no process means no need to close'
+    $self = [pscustomobject]@{ Harness = 'codex'; Id = 'me'; Name = 'Me'; IsDefault = $false; CodexHome = $srcHome; UserDataDir = $udd; Pid = $PID }
+    Assert (-not (Test-CodexImportNeedsClose -Profile $self -Processes @())) 'a stale Pid with no matching process does not block'
+    $defP = [pscustomobject]@{ Harness = 'codex'; Id = 'Default'; Name = 'Default'; IsDefault = $true; CodexHome = $srcHome; UserDataDir = $null; Pid = $null }
+    Assert (Test-CodexImportNeedsClose -Profile $defP -Processes $procDef) 'Default is blocked by its own instance'
 } finally {
     Remove-TestTempDir $fixture
 }
@@ -391,6 +438,11 @@ while ($true) {
     [void](New-HarnessBundle -OutPath $badCli -Source $badSrc -Files @(@{ Role = 'transcript'; Path = 'transcript.md'; Content = '# t' }))
     Assert ((Import-CodexExternalClaude -BundlePath $badCli -Profile $cProfile -ClaudeHome $claudeHome -StartServer { throw 'server must not start' }).Status -eq 'not-detected') 'non-UUID cliSessionId is refused'
 
+    $nl = Join-Path $fixture 'nl.hbundle.zip'
+    $nlSrc = $srcMeta.Clone(); $nlSrc.claude = @{ account = 'a'; org = 'o'; cliSessionId = "$cli`n" }
+    [void](New-HarnessBundle -OutPath $nl -Source $nlSrc -Files @(@{ Role = 'transcript'; Path = 'transcript.md'; Content = '# t' }))
+    Assert ((Import-CodexExternalClaude -BundlePath $nl -Profile $cProfile -ClaudeHome $claudeHome -StartServer { throw 'server must not start' }).Status -eq 'not-detected') 'a cliSessionId with a trailing newline is refused'
+
     # jsonl missing on this machine: not-detected without starting a server
     $missing = Import-CodexExternalClaude -BundlePath $cb -Profile $cProfile -ClaudeHome (Join-Path $fixture 'emptyclaude') -StartServer { throw 'server must not start' }
     Assert ($missing.Status -eq 'not-detected') 'no jsonl on this machine gives not-detected'
@@ -420,6 +472,17 @@ while ($true) {
     $r2 = Start-CodexHandoff -BundlePath $hb -Profile $cProfile -HandoffDir $handoffDir -StartProcess $startProc
     Assert ($r2.Mode -eq 'clipboard' -and $script:viaClip.Harness -eq 'codex' -and $script:viaClip.Id -eq 'tgt') 'extra profile uses clipboard handoff (deep links always reach Default)'
     Assert ($script:started.Count -eq 0) 'no deep link for an extra profile'
+
+    # X3: a link longer than 2000 characters goes by the clipboard instead
+    $longB = Join-Path $fixture 'long.hbundle.zip'
+    $longSrc = @{ harness = 'claude'; chatId = 'local_l'; title = ('Long title ' * 300); cwd = @{ absolute = $workDir; root = $null; relative = $null } }
+    [void](New-HarnessBundle -OutPath $longB -Source $longSrc -Files @(@{ Role = 'transcript'; Path = 'transcript.md'; Content = '# long' }))
+    $script:viaClip = $null; $script:started = @()
+    $r3 = Start-CodexHandoff -BundlePath $longB -Profile $defProfile -HandoffDir $handoffDir -StartProcess $startProc
+    Assert ($r3.Mode -eq 'clipboard' -and $script:started.Count -eq 0 -and $script:viaClip.Id -eq 'Default') 'a deep link over 2000 characters falls back to the clipboard'
+    $script:started = @()
+    $r4 = Start-CodexHandoff -BundlePath $hb -Profile $defProfile -HandoffDir $handoffDir -StartProcess $startProc
+    Assert ($r4.Mode -eq 'deeplink' -and $script:started.Count -eq 1) 'a short link still opens the deep link'
 } finally {
     $env:FAKE_DIR = $null; $env:FAKE_JSONL = $null; $env:FAKE_MODE = $null
     Remove-TestTempDir $fixture
@@ -486,5 +549,22 @@ try {
 } finally {
     Remove-TestTempDir $tdir
 }
+
+# ---------------------------------------------------------------- X5: harnesses that are not installed are hidden
+. (Import-TestFunctions -Files @($ui) -Names @('Test-HarnessInstalled', 'Get-HarnessTransferSources', 'Get-HarnessTransferTargets'))
+Reset-HarnessRegistry
+function New-DetectAdapter($detect, $profiles) {
+    @{ Detect = $detect; GetProfiles = $profiles; Launch = { }; ListChats = { @() }; Export = { }; ImportHandoff = { } }
+}
+Register-Harness -Name 'claude' -Adapter (New-DetectAdapter { [pscustomobject]@{ Installed = $true } } { @([pscustomobject]@{ Harness = 'claude'; Id = 'Default'; Name = 'Default' }) })
+Register-Harness -Name 'codex' -Adapter (New-DetectAdapter { [pscustomobject]@{ Installed = $false } } { @([pscustomobject]@{ Harness = 'codex'; Id = 'Default'; Name = 'Default' }) })
+Register-Harness -Name 'antigravity' -Adapter (New-DetectAdapter { throw 'probe failed' } { @([pscustomobject]@{ Harness = 'antigravity'; Id = 'Default'; Name = 'Default' }) })
+Register-Harness -Name 'other' -Adapter (New-DetectAdapter { $true } { @([pscustomobject]@{ Harness = 'other'; Id = 'Default'; Name = 'Default' }) })
+Assert (Test-HarnessInstalled (Get-Harness 'claude')) 'Installed = true'
+Assert (-not (Test-HarnessInstalled (Get-Harness 'codex'))) 'Installed = false is hidden'
+Assert (-not (Test-HarnessInstalled (Get-Harness 'antigravity'))) 'a failing Detect counts as not installed'
+Assert (Test-HarnessInstalled (Get-Harness 'other')) 'a plain $true counts as installed'
+Assert ((@(Get-HarnessTransferSources) | ForEach-Object Name) -join ',' -eq 'claude') 'only installed Claude or Codex are sources'
+Assert ((@(Get-HarnessTransferTargets) | ForEach-Object Harness) -join ',' -eq 'claude,other') 'targets come only from installed harnesses'
 
 Write-Host 'HarnessCodexChats.Tests: OK'

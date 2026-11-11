@@ -303,8 +303,8 @@ function Import-CodexNative {
         if ($m.source.harness -ne 'codex') { throw "Not a Codex bundle: $($m.source.harness)" }
         $rel = [string]$m.source.codex.rolloutRelPath
         # The bundle may come from another machine: check every value that ends up in a path or an RPC call.
-        if ($rel -notmatch '^sessions/\d{4}/\d{2}/\d{2}/rollout-[0-9A-Za-z_.:-]+\.jsonl(\.zst)?$' -or $rel.Contains('..')) { throw "Unsafe rollout path in bundle: $rel" }
-        if ([string]$m.source.chatId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { throw "Chat id in bundle is not a UUID: $($m.source.chatId)" }
+        if ($rel -notmatch '\Asessions/\d{4}/\d{2}/\d{2}/rollout-[0-9A-Za-z_.-]+\.jsonl(\.zst)?\z' -or $rel.Contains('..')) { throw "Unsafe rollout path in bundle: $rel" }
+        if ([string]$m.source.chatId -notmatch '\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z') { throw "Chat id in bundle is not a UUID: $($m.source.chatId)" }
         $dest = [IO.Path]::GetFullPath((Join-Path $Profile.CodexHome ($rel -replace '/', '\')))
         $sessionsRoot = [IO.Path]::GetFullPath((Join-Path $Profile.CodexHome 'sessions')).TrimEnd('\') + '\'
         if (-not $dest.StartsWith($sessionsRoot, [StringComparison]::OrdinalIgnoreCase)) { throw "Rollout path leaves the sessions folder: $rel" }
@@ -313,15 +313,29 @@ function Import-CodexNative {
         $from = Join-Path $work "native\$leaf"
         $siblings = @($dest, ($dest -replace '\.zst$', ''), ($dest -replace '\.jsonl$', '.jsonl.zst')) | Select-Object -Unique
         $present = @($siblings | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }) | Select-Object -First 1
+        $chatId = [string]$m.source.chatId
+        # $true unless the registration threw or answered $false.
+        $tryRegister = {
+            try { $res = @(& $Register $Profile $chatId); return -not ($res.Count -and -not $res[-1]) }
+            catch { Write-Warning "Could not register the thread: $($_.Exception.Message)"; return $false }
+        }
         if ($present) {
-            if ((Get-FileSha256Hex $present) -eq (Get-FileSha256Hex $from)) { return 'exists' }
-            $mtimeMs = [DateTimeOffset]::new((Get-Item -LiteralPath $present).LastWriteTimeUtc).ToUnixTimeMilliseconds()
-            if ($null -eq $m.source.lastActivityAt -or [double]$m.source.lastActivityAt -le $mtimeMs) { return 'exists' }
+            $same = ((Get-FileSha256Hex $present) -eq (Get-FileSha256Hex $from))
+            if (-not $same) {
+                $mtimeMs = [DateTimeOffset]::new((Get-Item -LiteralPath $present).LastWriteTimeUtc).ToUnixTimeMilliseconds()
+                $same = ($null -eq $m.source.lastActivityAt -or [double]$m.source.lastActivityAt -le $mtimeMs)
+            }
+            if ($same) {
+                # The file is already here. A copy whose registration failed earlier has no threads row: try again.
+                if (Get-CodexThreadRow -Profile $Profile -ChatId $chatId) { return 'exists' }
+                return $(if (& $tryRegister) { 'registered' } else { 'copied-unregistered' })
+            }
         }
         New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
         Copy-Item -LiteralPath $from -Destination $dest -Force
-        try { [void](& $Register $Profile $m.source.chatId) } catch { Write-Warning "Copied the rollout but could not register the thread: $($_.Exception.Message)" }
-        return 'copied'
+        # One rollout per thread: drop the older file of the other suffix (.jsonl vs .jsonl.zst) once the new one is in.
+        foreach ($old in @($siblings | Where-Object { $_ -ne $dest -and (Test-Path -LiteralPath $_ -PathType Leaf) })) { Remove-Item -LiteralPath $old -Force }
+        return $(if (& $tryRegister) { 'copied' } else { 'copied-unregistered' })
     } finally {
         if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
     }
@@ -330,8 +344,11 @@ function Import-CodexNative {
 # Spike S8c found no lock trouble with the app open, but the open app may not refresh its list, so the safe answer
 # is to ask for it to be closed.
 function Test-CodexImportNeedsClose {
-    param([Parameter(Mandatory)]$Profile)
-    return [bool]($Profile.Pid -and (Get-Process -Id $Profile.Pid -ErrorAction SilentlyContinue))
+    param([Parameter(Mandatory)]$Profile, $Processes)
+    # Looked up now: the Pid a profile carried when a dialog opened can be minutes old.
+    $key = $(if ($Profile.IsDefault) { '' } else { ([string]$Profile.UserDataDir).TrimEnd('\') })
+    $map = $(if ($PSBoundParameters.ContainsKey('Processes')) { Get-CodexRunningMap -Processes $Processes } else { Get-CodexRunningMap })
+    return $map.ContainsKey($key)
 }
 
 # ---- Claude -> Codex -------------------------------------------------------------------------------------------
@@ -377,7 +394,7 @@ function Import-CodexExternalClaude {
         $m = Read-HarnessBundle -Path $BundlePath -ExtractTo $work
         if ($m.source.harness -ne 'claude') { throw "Not a Claude bundle: $($m.source.harness)" }
         $cli = [string]$m.source.claude.cliSessionId
-        if ($cli -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { return @{ Status = 'not-detected'; ThreadId = $null } }
+        if ($cli -notmatch '\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z') { return @{ Status = 'not-detected'; ThreadId = $null } }
         $cwd = Resolve-CwdRef -Ref $m.source.cwd
         $dir = Find-ClaudeProjectDir -ClaudeHome $ClaudeHome -Cwd ([string]$cwd) -Cli $cli
         $jsonl = Join-Path $dir "$cli.jsonl"
@@ -426,13 +443,16 @@ function Start-CodexHandoff {
         [Parameter(Mandatory)][string]$BundlePath, [Parameter(Mandatory)]$Profile,
         [string]$HandoffDir = (Get-HandoffDir), [scriptblock]$StartProcess = { param($u) Start-Process $u }
     )
-    if (-not $Profile.IsDefault) {
+    $viaClipboard = {
         $r = Start-HarnessHandoff -BundlePath $BundlePath -TargetHarness 'codex' -Profile $Profile
         return [pscustomobject]@{ Mode = 'clipboard'; Path = $r.Path; Prompt = $r.Prompt }
     }
+    if (-not $Profile.IsDefault) { return (& $viaClipboard) }
     $files = Export-HarnessHandoffFiles -BundlePath $BundlePath -HandoffDir $HandoffDir -Target 'codex'
     $cwd = Resolve-CwdRef -Ref $files.Manifest.source.cwd
     $path = $(if ($cwd -and (Test-Path -LiteralPath $cwd -PathType Container)) { [string]$cwd } else { '' })
-    [void](& $StartProcess (New-CodexDeepLink -Prompt $files.Prompt -Path $path))
+    $url = New-CodexDeepLink -Prompt $files.Prompt -Path $path
+    if ($url.Length -gt 2000) { return (& $viaClipboard) }   # long URLs are cut off by the shell and the app
+    [void](& $StartProcess $url)
     return [pscustomobject]@{ Mode = 'deeplink'; Path = $files.Path; Prompt = $files.Prompt }
 }
