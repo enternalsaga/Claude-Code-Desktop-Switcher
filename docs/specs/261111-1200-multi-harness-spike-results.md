@@ -91,3 +91,84 @@
 
 - Hệ quả cho spec §5 (handoff vào harness đích): Claude và Codex dùng deep link (kèm giới hạn độ dài prompt: Claude 14336 ký tự; nên đưa prompt ngắn "đọc file handoff tại <đường dẫn>" thay vì cả transcript); Antigravity cả hai app rơi về clipboard.
 - Cảnh báo cho UI: link `claude://` và `codex://` đi tới app đã đăng ký scheme ở MSIX (một instance), **không** chọn được profile phụ. Với profile không phải Default, link có thể mở nhầm instance. Phải kiểm bằng SP-B/GĐ2 hoặc mặc định chép clipboard cho profile phụ.
+
+# Kết quả spike SP-B (cần user đăng nhập)
+
+Lane `switcher-work-2`, nhánh `mh-spike-b`, 2026-11-11. Orchestra sẽ nối file này vào `261111-1200-multi-harness-spike-results.md` khi land.
+Profile thử: `%USERPROFILE%\.codex-profiles\spike1` (Codex). Không chép `auth.json` nào ra khỏi Default.
+
+## S1: hai account Codex song song: **Đạt** (đăng nhập GUI không dùng được, xem ghi chú)
+
+- Lệnh: `tools/spikes/S1-CodexProfile.ps1 -Name spike1` (đặt `CODEX_HOME`, `CODEX_ELECTRON_USER_DATA_PATH` cho process con, chạy `ChatGPT.exe --user-data-dir=<spike1\electron>`), rồi `-Check`.
+- Bằng chứng:
+  - Hai `ChatGPT.exe` chính (không có `--type=`) chạy song song: PID 25828 (Default, cmdline không có tham số) và PID 38772 (`--user-data-dir="...\spike1\electron"`). `Win32_Process` phân biệt được qua `--user-data-dir=`. Khớp spec §3.3.
+  - `CODEX_HOME=spike1` được app tôn trọng: app-server riêng tạo `state_5.sqlite`, `logs_2.sqlite`, `config.toml`, `installation_id`... ngay trong `spike1\`. Default giữ nguyên.
+  - Dữ liệu Electron của spike1 nằm ở `spike1\electron\Default\...` (Cookies, Local Storage...), không thấy gì tên `spike` trong `Packages\OpenAI.Codex_*\LocalCache`. Các file `LocalCache\Roaming\Codex\...` đổi giờ là do instance Default ghi. Không có chuyển hướng MSIX cho đường dẫn nằm ngoài AppData, khớp giả thuyết ở §3.3.
+  - Sau đăng nhập: `spike1\auth.json` sha12 `EF273B3E1B79`, Default `5B0D4C3B6EDC`, khác nhau. `auth_mode` spike1 = `chatgpt` (khóa `auth_mode, OPENAI_API_KEY, tokens, last_refresh`). `account_id` băm sha8: Default `E3B0C442` (đây là hash chuỗi rỗng: Default không có `tokens.account_id`), spike1 `8E61FA26`. Tức hai account khác nhau.
+- **Phát hiện phụ (quan trọng cho UI):** trong cửa sổ test (instance thứ hai, `hasExplicitUserDataPath`), nút **Continue to sign in** / **Sign in another way** bấm không phản ứng, không mở trình duyệt, không có cổng 1455 nào được mở. Đã thử đưa cửa sổ lên foreground, vẫn không được. Cách làm được: `CODEX_HOME=spike1 codex.exe login` (CLI) mở server `127.0.0.1:1455` và link OAuth, user đăng nhập trong Chrome, ghi `spike1\auth.json`.
+- Hệ quả cho spec:
+  - §3.3: "Đăng nhập lần đầu ngay trong app" **không chắc dùng được**. Phương án chắc chắn: nút "Add Codex account" chạy `codex login` với `CODEX_HOME` của profile (đường dẫn `codex.exe` ở `app\resources\codex.exe` của package hoặc CLI trong PATH), rồi mới launch app. Cần kiểm lại trên app mở lại sau khi đã có `auth.json` (S2b).
+  - Cổng 1455 là cổng cố định của login callback: hai lần `codex login` song song sẽ xung đột. Phải đăng nhập tuần tự.
+
+## S2b: rollout Codex sang account khác (native), cộng deep link và thread `exec`: **Đạt một phần**
+
+Công cụ: `tools/spikes/S2b-AppServerProbe.py` (JSON-RPC qua stdio với `CODEX_HOME` thử; bản PowerShell bị codex từ chối dòng đầu `expected value at line 1 column 1`, cùng nội dung ghi từ Python thì được nhận). Chỉ dùng auth của chính `spike1` (account thứ hai), sandbox `read-only`, prompt `ping`. Không chép `auth.json` nào.
+
+### Kết quả theo câu hỏi
+
+1. **Cùng account, home không có auth (quyết định của orchestra).**
+   - Tạo rollout trong spike1 bằng `codex exec --sandbox read-only "ping"` (account 2, trả `Pong.`), chép sang `%TEMP%\harness-spike\S2b\home-noauth\sessions\2026\11\11\` (home chỉ có thư mục `sessions`).
+   - `codex app-server` với home đó, không đăng nhập: `thread/list` mặc định trả `[]`; thêm `sourceKinds:["cli","vscode","exec","appServer","unknown"]` thì thấy thread, `path` trỏ vào home mới; `thread/read includeTurns:false` đọc được. Không cần đăng nhập để liệt kê.
+   - Cơ chế: Codex **tự lập chỉ mục khi khởi động** (home chưa có `state_5.sqlite` nên được quét và dựng lại). Không phải chèn dòng `threads`.
+   - Hai chi tiết: (i) `thread/list` mặc định **ẩn thread `source=exec`** (`originator=codex_exec`); (ii) app-server in cảnh báo "Refusing to create helper binaries under temporary dir" nhưng vẫn chạy.
+2. **Khác account, rollout lấy từ Default chép vào `spike1\sessions\…`** (spike1 đã có `state_5.sqlite` từ trước).
+   - `thread/list` **không liệt kê** rollout vừa thả vào (DB đã có, không quét lại), nhưng `thread/read` theo id vẫn đọc được (preview rỗng).
+   - `codex exec resume <id> "ping"` dưới account 2:
+     - rollout `01a1af66…` (`model_provider=codex_local_access`, tạo qua công cụ Cockpit): **lỗi** `modelProviderNotConfigured`, nghĩa là chat gắn provider không có trong `config.toml` đích. Không liên quan đến account.
+     - rollout `01a1b9d7…` (`openai`, `.jsonl` 179 KB): **resume được**, trả `Pong.`.
+     - rollout `01a18331…` (`openai`, `.jsonl.zst` 9,5 KB): **resume được**; sau resume, file trong spike1 thành `.jsonl` (Codex tự giải nén).
+     - Sau các lần resume, cả hai thread `openai` **hiện trong `thread/list`** của spike1 (resume cũng đăng ký thread vào DB), thread `codex_local_access` thì không.
+   - **Chưa kiểm:** mục `reasoning` có `encrypted_content`. Cả ba rollout nguồn đều không có item `reasoning` (các rollout `openai` còn lại của Default là `.zst` không giải nén được tại chỗ). Vì vậy giả thuyết ở spec §2.2 chưa được kiểm chứng hay bác bỏ.
+   - **Chưa kiểm:** "cùng account với Default" (không chép auth Default, theo quyết định).
+3. **Deep link (a)**, khi spike1 đang chạy cùng Default và hai Claude:
+   - `codex://threads/new?prompt=ping-test&path=<tmp>`: mở vào **Default** (PID 25828), không vào spike1. Composer của Default điền sẵn `ping-test`, project `work` (đường dẫn `…\harness-spike\S2b\work`), chưa gửi. Một tiến trình kích hoạt (PID 35092, log rỗng) chuyển link rồi thoát. Lý do hợp lý: instance Default giữ khóa single-instance, spike1 (có `--user-data-dir`) không giữ khóa nên không nhận link.
+   - `claude://code/new?q=ping-test&folder=<tmp>`: mở vào Claude **Default** (PID 50200), không vào `ClaudeProfile-Account 2`. Session mới, composer `ping-test`, thư mục `work`, chưa gửi.
+   - Hệ quả: deep link **luôn rơi vào instance Default**, không chọn được profile. Khi handoff vào profile khác thì không dùng link được; dùng clipboard hoặc ghi vào chính DB/app-server của profile đó.
+   - Tác dụng phụ trên máy user: Codex Default có thêm project `work` và bản nháp `ping-test` trong composer; Claude Default có bản nháp `ping-test`. Chưa gửi. User có thể xóa tay.
+4. **Thread `exec` (b):** app Codex của spike1 (mở lại sau khi đăng nhập, đọc auth của spike1 từ `CODEX_HOME`) **hiện** thread `ping` (đã tạo bằng `codex exec`) đầu mục Recents. API `thread/list` mặc định thì ẩn loại này. Giao diện app khác với Default: tên "ChatGPT", danh sách Recents của account 2.
+
+### Kết luận
+- Native Codex sang account khác: **Đạt** cho rollout `openai` (cả `.jsonl` và `.zst`), với điều kiện chat không gắn provider riêng (`codex_local_access` không dùng được). Phần reasoning mã hóa: **chưa kiểm**.
+- Hệ quả cho spec §6: nhập native cần để Codex đích đăng ký thread. Hai cách đã thấy hoạt động: (a) thả vào `sessions\…` khi home chưa có DB (tự lập chỉ mục); (b) khi đã có DB thì resume theo id (`codex exec resume <id>`) làm thread hiện ra, nhưng đó là một lệnh gọi model (một turn). Chưa thử chèn dòng `threads` vào DB của spike1. Switcher phải kiểm `model_provider` của rollout so với `config.toml` đích trước khi chép.
+- §9 (UI): `thread/list` mặc định ẩn `source=exec`; khi liệt kê chat để chuyển, truyền `sourceKinds` đầy đủ.
+
+## S4: hai account Antigravity: **Một phần** (tách dữ liệu được, đăng nhập thì không tách được)
+
+Mục này gồm hai đợt. Đợt 1: dừng trước đăng nhập vì lo ghi đè credential. Đợt 2 (bổ sung bên dưới, mục "Đợt 2"): user đã chấp nhận rủi ro và đăng nhập account thứ hai.
+
+Lệnh: `tools/spikes/S4-AgyProfile.ps1 -Name spike1 [-FakeHome] [-App 'Antigravity IDE']`, rồi `-Check`.
+
+- **`ANTIGRAVITY_GEMINI_DIR` và `ANTIGRAVITY_APP_DATA_DIR` không tách được dữ liệu agent** (giả thuyết §3.3 sai ở điểm này).
+  - Chạy `Antigravity.exe --user-data-dir=%LOCALAPPDATA%\AgyProfile-spike1` kèm hai biến đó: `language_server.exe` của instance thử ghi `hub_59665.json` vào `~\.gemini\antigravity\daemon\` thật và `reconcile checked 144 conversations`, tức là đọc đúng kho conversation của Default. Instance thử còn ghi các file mô tả MCP (`antigravity\mcp\*`) vào `~\.gemini` thật lúc khởi động (có thể do instance Default cùng lúc; chưa phân biệt được). Đã tắt ngay instance này.
+  - Trong binary, `ANTIGRAVITY_GEMINI_DIR` chỉ xuất hiện cạnh đường dẫn `…/run/credentials-cache`; thư mục gốc lấy từ cờ `--app_data_dir antigravity` (tên tương đối dưới thư mục `.gemini` của home).
+  - File thừa còn lại trong thư mục thật: `~\.gemini\antigravity\daemon\hub_59665.json` (file khám phá hub của instance thử, đã chết). Orchestra quyết định xóa hay giữ.
+- **Cách tách đã chạy được: đổi home của process con** (`-FakeHome`: `USERPROFILE` và `HOME` trỏ vào `%USERPROFILE%\.gemini-profiles\spike1\home`). Khi đó toàn bộ `.gemini\antigravity\{conversations,brain,daemon,bin,…}` nằm trong home giả, `reconcile checked 0 conversations`, thư mục `daemon` thật không đổi. Antigravity IDE cũng chạy được kiểu này, ghi vào `home\.gemini\antigravity-ide` và `home\.antigravity-ide`.
+- **Trả lời Q2:** hai app **không** dùng chung `~\.gemini\antigravity`. IDE dùng `~\.gemini\antigravity-ide` (thư mục riêng, có sẵn trên máy) và `~\.antigravity-ide\extensions`.
+- **Điều chặn: đăng nhập không tách theo profile.** Instance thử (userData mới, home giả, không có file credential nào trong đó) vẫn báo `Auth succeeded` và chào đúng tên account Default. Credential nằm trong **Windows Credential Manager**, mục `gemini:antigravity` (khóa theo tên, không theo profile). Đăng nhập account Google thứ hai trong cửa sổ thử nhiều khả năng **ghi đè mục này** và làm Default bị đăng xuất hoặc đổi account. Vì vậy mình **không nhờ user đăng nhập** (không có cách quay lại an toàn), và các phép thử còn lại của S4 (chat mới trong `conversations` của spike1, hai instance cùng account khác nhau, chép native `.db` + `brain\<id>`) **chưa chạy**.
+- Hệ quả cho spec:
+  - §3.3 / §6: Antigravity chỉ có một account trên mỗi user Windows. Theo phương án đã nêu ở §3.3, ẩn nút Add account cho Antigravity; launch và handoff vẫn dùng được.
+  - Nếu muốn thử tiếp: cần user chấp nhận có thể phải đăng nhập lại Default, hoặc dùng một user Windows khác. Chưa kiểm xem `-FakeHome` có đổi tên mục Credential Manager hay không (mục vẫn là `gemini:antigravity` theo quan sát).
+
+### Đợt 2: đăng nhập account thứ hai (user chấp nhận rủi ro, 2026-11-11)
+
+Công cụ thêm: `tools/spikes/S4-CredStamp.ps1` (chỉ in tên mục và thời điểm sửa của Credential Manager, không đọc nội dung).
+
+- **Credential bị ghi đè:** mục `gemini:antigravity` có `LastWritten` **13:58:50** trước khi đăng nhập, **14:01:53** sau khi user đăng nhập trong cửa sổ spike1 (đúng lúc đăng nhập xong). Nội dung không đọc, nhưng thời điểm trùng với đăng nhập ở spike1 cho thấy mục dùng chung đã bị thay bằng account thứ hai. Instance Default đang chạy giữ token trong bộ nhớ, **chưa kiểm** nó đổi account hay bị đăng xuất khi khởi động lại (không khởi động lại app của user). `~\.gemini\oauth_creds.json` và `google_accounts.json` thật không đổi (sửa lần cuối 2026-06-07).
+- **Dữ liệu agent đúng chỗ:** chat user vừa tạo nằm ở `.gemini-profiles\spike1\home\.gemini\antigravity\conversations\<id>.db` (+ `-wal`, `-shm`, `annotations`, `conversation_summaries.db`). `~\.gemini\antigravity\conversations` thật vẫn 44 file `.db`, thư mục `daemon` thật không thêm file. Đăng nhập mở trình duyệt mặc định của user (Firefox) với profile nằm trong home giả của spike1: cả `USERPROFILE` lẫn `appdata` bị đổi, nên Firefox tạo profile mới trong `home\appdata\…`.
+- **Chạy song song:** instance spike1 (`--user-data-dir=…\AgyProfile-spike1`) chạy cùng Default (hai nhóm tiến trình Antigravity riêng, mỗi nhóm một `language_server.exe`).
+- **Chép native (thử):** đóng spike1, chép một `<id>.db` (266 KB) và thư mục `brain\<id>` từ Default sang `home\.gemini\antigravity\`, mở lại spike1. Log: `reconcile checked 2 conversations, restored 1, cached 1` và sidebar hiện một conversation lấy từ bản chép (cùng project). Tức là Antigravity tự nhận `<id>.db` mới khi khởi động. **Chưa kiểm** tiếp tục chat (cần gọi model dưới account khác) và việc conversation gắn account phía server.
+- Một thay đổi trong thư mục thật chưa rõ nguồn: `~\.gemini\config\config.json` sửa lúc 14:00:14, trong lúc cả hai instance chạy. Không phân biệt được là Default hay spike1 ghi.
+- **Kết luận cho spec:**
+  - Tách dữ liệu agent và chạy song song: **Đạt** nếu đặt home riêng cho process con (`USERPROFILE`, `HOME`); `ANTIGRAVITY_GEMINI_DIR` không đủ.
+  - Tách đăng nhập: **Không đạt** trên cùng user Windows (Credential Manager dùng chung). Hai account chỉ chạy song song nếu mỗi instance tự giữ phiên, điều chưa chứng minh. Mặc định giữ nguyên: Antigravity một account, ẩn Add account (§3.3). Native chép `<id>.db` + `brain\<id>` là khả thi về mặt hiển thị (§6, giai đoạn 3b) nhưng phần tiếp tục chat chưa kiểm.
+  - Nếu sau này cho phép Add account: phải cảnh báo rằng đăng nhập ở profile mới có thể đăng xuất Default.
