@@ -89,6 +89,38 @@ jobs:
         shell: pwsh
         run: .\tests\InstallUpdate.Tests.ps1
 
+      - name: Harness core tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\HarnessCore.Tests.ps1
+
+      - name: Harness core tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\HarnessCore.Tests.ps1
+
+      - name: Harness bundle tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\HarnessBundle.Tests.ps1
+
+      - name: Harness bundle tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\HarnessBundle.Tests.ps1
+
+      - name: Harness Claude adapter tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\HarnessClaude.Tests.ps1
+
+      - name: Harness Claude adapter tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\HarnessClaude.Tests.ps1
+
+      - name: Single-file build tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\BuildSingleFile.Tests.ps1
+
+      - name: Single-file build tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\BuildSingleFile.Tests.ps1
+
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck

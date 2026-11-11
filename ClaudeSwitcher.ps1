@@ -288,6 +288,13 @@ function Update-ClaudeInstall {
 Update-ClaudeInstall -AllowCache:([bool]$Launch -or [bool]$HandleLink -or [bool]$OpenLink)
 if ($ClaudePath) { Set-Setting 'ClaudePath' $script:ClaudeApp.Exe }
 
+# >>> harness-src
+if ($PSScriptRoot -and (Test-Path -LiteralPath "$PSScriptRoot\src")) { foreach ($harnessFile in (Get-ChildItem -LiteralPath "$PSScriptRoot\src" -Filter '*.ps1')) { . $harnessFile.FullName } }
+# <<< harness-src
+# >>> harness-register
+if (Get-Command Register-Harnesses -ErrorAction SilentlyContinue) { Register-Harnesses }
+# <<< harness-register
+
 # ------------------------------------------------------------------- native --
 
 # Compiling this costs a moment, so it only happens on paths that need it.
@@ -1338,6 +1345,13 @@ function Install-Switcher {
             $script:InstallCancelled = $true
             return
         }
+        # >>> harness-install
+        if ($PSScriptRoot -and (Test-Path -LiteralPath "$PSScriptRoot\src") -and (Split-Path $script:SwitcherHome -Leaf) -eq '.switcher') {
+            $harnessDst = Join-Path $script:SwitcherHome 'src'   # switcher-owned: clear it so renamed or removed files do not linger
+            if (Test-Path -LiteralPath $harnessDst) { Remove-Item -LiteralPath $harnessDst -Recurse -Force }
+            Copy-Item -LiteralPath "$PSScriptRoot\src" -Destination $harnessDst -Recurse
+        }
+        # <<< harness-install
     }
     New-SwitcherShortcut -Directory ([Environment]::GetFolderPath('Desktop'))
     New-SwitcherShortcut -Directory (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs')
@@ -2999,6 +3013,9 @@ $miLaunch.Font = $fontBold
 $null       = Add-MenuItem $menu 'Rename...'              { Invoke-RenameProfile } 'F2'
 $null       = Add-MenuItem $menu 'Add shortcuts'          { Invoke-AddShortcuts }
 $null       = Add-MenuItem $menu 'Transfer Code chats...' { $btnTransfer.PerformClick() }
+# >>> harness-ui-menu
+if (Get-Command Show-HarnessExportDialog -ErrorAction SilentlyContinue) { $null = Add-MenuItem $menu 'Export chat for handoff...' { Show-HarnessExportDialog -Source (Get-SelectedProfile) } }
+# <<< harness-ui-menu
 $null       = Add-MenuItem $menu 'Open folder'            { Invoke-OpenFolder }
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 $miDelete   = Add-MenuItem $menu 'Delete'                 { Invoke-DeleteProfile } 'Del'
@@ -3078,6 +3095,9 @@ $trayMenu.Add_Opening({
     }
     $trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
     $null = Add-MenuItem $trayMenu 'Add account...' { Invoke-AddAccount }
+    # >>> harness-ui-tray
+    if (Get-Command Show-HarnessExportDialog -ErrorAction SilentlyContinue) { $null = Add-MenuItem $trayMenu 'Export chat for handoff...' { Show-HarnessExportDialog } }
+    # <<< harness-ui-tray
     $null = Add-MenuItem $trayMenu 'Open switcher' { Show-Switcher }
     $boot = Add-MenuItem $trayMenu 'Start with Windows' {
         $lnk = Get-StartupShortcutPath
