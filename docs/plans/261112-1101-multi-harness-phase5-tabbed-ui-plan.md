@@ -262,3 +262,70 @@ Kiểm tra: `tests\HarnessUiMain.Tests.ps1`, `tests\HarnessUiStatus.Tests.ps1`, 
 - Không còn đường nào trong menu hoặc tray mở `Show-HarnessExportDialog`.
 - Cửa sổ cũ vẫn chạy khi không có `src\Ui.Main.ps1` (test V2a).
 - UV1 đến UV6 đạt trên máy thật.
+
+## 7. Bổ sung 2026-11-12 (lane V4): chỉ tải khi bấm nút, thêm lọc và sắp xếp
+
+User dùng thử cửa sổ tab (`24fd64d`) và phản hồi:
+- "Chỉ fetch khi bấm nút nào đó, chứ mỗi lần switch qua lại profile rất lâu."
+- "Cho filter và sort để dễ lọc."
+
+### 7.1 Nguyên nhân (đọc code)
+
+- `Ui.Main.ps1` dòng 215 và 236: khi chọn profile khác, `Update-ChatPanel -Reload` được gọi, và hàm này chạy `ListChats`. Với Codex, mỗi lần như vậy là một snapshot `VACUUM INTO` của `state_5.sqlite`, cộng với việc đọc rollout.
+- `Ui.Main.ps1` dòng 277–281: khi đổi tab mà lần tải trước đã quá 30 giây, `Invoke-MainRefresh` được gọi. Hàm này đọc lại catalog trên Drive rồi `ListChats` lại.
+- `Ui.Main.ps1` dòng 284: lần tải đầu tự chạy 300 ms sau khi form hiện.
+- `Ui.MainDrive.ps1` `Get-MainLocalChats`: mỗi lần refresh liệt kê chat của **mọi profile của mọi harness**, và đây là phần tốn nhất.
+
+### 7.2 Quy tắc mới: chỉ đọc dữ liệu khi người dùng bấm
+
+| Sự kiện | Hành vi mới |
+|---|---|
+| Mở cửa sổ, đổi tab, chọn profile khác | **Không** gọi `ListChats`, **không** đọc Drive. Profile đã có cache thì hiện ngay từ cache, kèm dòng "Loaded 10:42". Chưa có cache thì danh sách trống, kèm dòng "Chats not loaded yet" và một nút nổi `Load chats` ở giữa danh sách |
+| Bấm `Refresh` hoặc `Load chats` trong khung chat | `ListChats` cho **profile đang chọn** và đọc lại catalog trên Drive (`Update-MainCatalog`, nhẹ). Ghi vào cache `harness|profileId` |
+| Bấm `Refresh` trong tab Drive | Đọc catalog và `Get-MainLocalChats` (đọc tất cả, chỉ ở đây) |
+| Push, Pull, Move, Choose folder xong | Chỉ tải lại profile đang chọn và catalog, không đọc mọi profile. Riêng tab Drive được đánh dấu "cần Refresh" (chữ mờ "Press Refresh to update") |
+| Chấm báo trên nhãn tab Drive | Tính từ catalog đang có trong cache. Không có catalog thì không có chấm |
+
+- Bỏ timer tải đầu và bỏ quy tắc 30 giây khi đổi tab.
+- `Detect` vẫn được cache như trước.
+- Cache chỉ nằm trong bộ nhớ, không ghi ra file. Đóng app là mất.
+
+### 7.3 Lọc và sắp xếp
+
+**Khung chat (3 tab harness):**
+- Giữ ô tìm kiếm.
+- Thêm ô thả xuống `Show:` với các mục `All`, `Needs action` (DriveNewer, Diverged, LocalNewer, CwdMissing), `Not on Drive`, `On Drive`, `Folder missing`.
+- Bấm tiêu đề cột để sắp xếp. Bấm lần nữa để đảo chiều. Tiêu đề cột đang sắp có thêm ký hiệu chiều, tạo lúc chạy bằng `[char]0x25B2` / `[char]0x25BC` để mã nguồn vẫn ASCII.
+- Quy tắc sắp:
+  - `Title` và `Folder` theo chữ, không phân biệt hoa thường.
+  - `Last active` theo số `Activity`, không theo chữ hiển thị.
+  - `Drive` theo mức cần xử lý: Diverged, DriveNewer, LocalNewer, NotOnDrive, Synced, NoSync.
+- Mặc định sắp `Last active` giảm dần.
+
+**Tab Drive:**
+- Thêm ô tìm kiếm theo tiêu đề.
+- Thêm ô thả xuống `Harness:` (All, Claude, Codex, Antigravity), đặt cạnh nút chọn All / Needs action.
+- Bấm tiêu đề cột để sắp: Title, Harness, From, Last active (theo số), On this machine (theo mức cần xử lý).
+
+**Ghi nhớ:** lựa chọn lọc và sắp được nhớ theo từng panel trong settings, ở các khóa `Ui.ChatView.<harness>` và `Ui.DriveView`, dạng `{ show, sortColumn, descending }`.
+
+### 7.4 Lane V4
+
+| Lane | File sở hữu | Phụ thuộc |
+|---|---|---|
+| V4 | `src/Ui.Main.ps1`, `src/Ui.MainChats.ps1`, `src/Ui.MainDrive.ps1`, `tests/HarnessUiMain.Tests.ps1`, `tools/Render-UiPreview.ps1` | `24fd64d` |
+
+| # | Việc | Test (viết trước) |
+|---|---|---|
+| V4a | Bỏ tải tự động (§7.2). Thêm cache theo `harness|profileId` và nút `Load chats` | Đếm số lần adapter giả bị gọi `ListChats`. Đổi profile, đổi tab, form hiện: 0 lần. Bấm Refresh: 1 lần, chỉ cho profile đang chọn. Quay lại profile đã tải: 0 lần, danh sách lấy từ cache. `Get-MainLocalChats` chỉ chạy khi bấm Refresh ở tab Drive |
+| V4b | `Select-ChatListRows -Text -Show` và `Sort-ChatListRows -Column -Descending` (hàm thuần), ô `Show:`, sắp theo tiêu đề cột | Mỗi bộ lọc trên 5 chat giả. Sắp `Last active` theo số (chat "yesterday" đứng sau "11:11" khi giảm dần). Sắp `Drive` theo mức cần xử lý. Đảo chiều đúng |
+| V4c | Tab Drive: ô tìm kiếm, ô `Harness:`, sắp theo cột (dùng chung kiểu hàm thuần với V4b) | Lọc theo harness kết hợp Needs action. Sắp theo From và theo Last active |
+| V4d | Ghi nhớ lọc và sắp (`Ui.ChatView.*`, `Ui.DriveView`) | Đặt giá trị, dựng panel mới, đọc lại đúng |
+| V4e | Chụp lại ảnh preview: tab Claude khi chưa tải (nút `Load chats`), sau khi tải có sắp và lọc, tab Drive có lọc | Script chạy không lỗi. Gửi đường dẫn PNG |
+
+Kiểm tra: `tests/HarnessUiMain.Tests.ps1`, `tests/HarnessUiStatus.Tests.ps1`, `tests/BuildSingleFile.Tests.ps1`.
+
+**Nghiệm thu:**
+- UV7: đổi qua lại giữa các profile và các tab phải tức thì.
+- UV8: chỉ khi bấm `Load chats` / `Refresh` mới có thời gian chờ.
+- UV9: lọc và sắp đúng như trên.
