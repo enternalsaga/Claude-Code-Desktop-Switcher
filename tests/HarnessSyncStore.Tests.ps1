@@ -153,6 +153,8 @@ try {
     $b5 = New-TestBundle 'thread-3' $t3 500 'codex'
     $row5 = Push-SyncBundle -Root $drive -BundlePath $b5.Path -Key $key -Chat (New-TestChat 'thread-3' $t3 500 'codex')
     Use-Machine $idA 'MACHINE-A'
+    # one settings file stands for both machines here; machine A has never seen B's versions, so it has no predecessor
+    $st = Get-SyncState; $st.Remove('claude:local_c2'); Set-SyncState -State $st
     $b6 = New-TestBundle 'local_c2' $t2 2500
     [void](Push-SyncBundle -Root $drive -BundlePath $b6.Path -Key $key -Chat (New-TestChat 'local_c2' $t2 2500))
 
@@ -276,6 +278,28 @@ try {
     [IO.File]::WriteAllText($indexA, (($lines -join "`n") + "`n"))
     Remove-SyncOldBundles -Root $drive -Keep 3 3>$null
     Assert (Test-Path -LiteralPath $victim) 'cleanup never deletes outside bundles/'
+
+    # ---------------------------------------------------------------- lineage: a replaced version never wins the catalog
+    function Push-Lin($machineId, $machineName, $chatId, $activity, $prev = $null) {
+        Use-Machine $machineId $machineName
+        $b = New-TestBundle $chatId "Lineage $chatId" $activity
+        $a = @{ Root = $drive; BundlePath = $b.Path; Key = $key; Chat = (New-TestChat $chatId "Lineage $chatId" $activity) }
+        if ($prev) { $a['PreviousBundleId'] = $prev }
+        return (Push-SyncBundle @a)
+    }
+    $r0 = Push-Lin $idA 'PCA' 'lin1' 100
+    $r1 = Push-Lin $idA 'PCA' 'lin1' 1000      # previous = r0 from the state of this machine
+    Assert ($r1.previousBundleId -eq $r0.bundleId) 'without -PreviousBundleId the state decides the predecessor'
+    $r2 = Push-Lin $idB 'PCB' 'lin1' 900 $r1.bundleId   # B saw A's r1 and replaced it on purpose, with an older activity
+    Assert ($r2.previousBundleId -eq $r1.bundleId) '-PreviousBundleId is written into the row'
+    $c = @(Get-SyncCatalog -Root $drive -Key $key | Where-Object { $_.chatKey -eq 'claude:lin1' })
+    Assert ($c.Count -eq 1 -and $c[0].bundleId -eq $r2.bundleId) "a replaced version loses even with later activity: $($c.bundleId -join ',')"
+    # two real heads (both continue r0): the latest activity still wins
+    $s0 = Push-Lin $idA 'PCA' 'lin2' 100
+    $s1 = Push-Lin $idA 'PCA' 'lin2' 1000
+    $s2 = Push-Lin $idB 'PCB' 'lin2' 900 $s0.bundleId
+    $c = @(Get-SyncCatalog -Root $drive -Key $key | Where-Object { $_.chatKey -eq 'claude:lin2' })
+    Assert ($c.Count -eq 1 -and $c[0].bundleId -eq $s1.bundleId) "two heads: the latest activity wins, got $($c.bundleId -join ',')"
 } finally {
     $env:COMPUTERNAME = $savedName
     Remove-TestTempDir $tmp

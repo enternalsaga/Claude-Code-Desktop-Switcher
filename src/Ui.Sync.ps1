@@ -1,5 +1,5 @@
 # Ui.Sync.ps1 - Drive sync from the user's side: push, pull, first-time setup and the CLI (phase 4, lane U).
-# The functions at the top are plain logic (tested without a window); Show-SyncSetupDialog is the only WinForms code.
+# The functions at the top are plain logic (tested without a window); the setup wizard is in Ui.SyncWizard.ps1.
 # Needs Harness.Core, Harness.Sync.* and Ui.Harness. The passphrase is never logged or shown. ASCII only.
 
 # ---- errors the user can act on ------------------------------------------------------------------------------------------
@@ -40,13 +40,13 @@ function Get-SyncSession {
 # Export the chat, encrypt it onto Drive, keep the newest 3 bundles of this machine, and delete the plain local bundle.
 # -Profile is the profile the chat came from (kept in the sync state). Returns the index row.
 function Invoke-SyncPush {
-    param([Parameter(Mandatory)]$Chat, [Parameter(Mandatory)][string]$SourceHarness, $Profile, [string]$BundleDir = (Join-Path (Get-HandoffDir) 'bundles'))
+    param([Parameter(Mandatory)]$Chat, [Parameter(Mandatory)][string]$SourceHarness, $Profile, [string]$BundleDir = (Join-Path (Get-HandoffDir) 'bundles'), [string]$PreviousBundleId)
     $s = Get-SyncSession
     $pushChat = $Chat.PSObject.Copy()
     if ($Profile -and -not $pushChat.PSObject.Properties['Profile']) { $pushChat | Add-Member -NotePropertyName Profile -NotePropertyValue $Profile }
     $exp = Export-HarnessChatBundle -Chat $Chat -SourceHarness $SourceHarness -BundleDir $BundleDir
     try {
-        $row = Push-SyncBundle -Root $s.Root -BundlePath $exp.Bundle -Key $s.Key -Chat $pushChat
+        $row = Push-SyncBundle -Root $s.Root -BundlePath $exp.Bundle -Key $s.Key -Chat $pushChat -PreviousBundleId $PreviousBundleId
         Remove-SyncOldBundles -Root $s.Root
     } finally { Remove-Item -LiteralPath $exp.Bundle -Force -ErrorAction SilentlyContinue }
     return $row
@@ -63,19 +63,44 @@ function Get-SyncLocalChat {
     return (@(& $h.Adapter.ListChats $Target) | Where-Object { $_ -and [string]$_.ChatId -eq $id } | Select-Object -First 1)
 }
 
+# What the user chose for a chat that changed on both machines: handoff (bring theirs in as a new chat), push (mine
+# becomes the latest) or cancel. The buttons' names also work; anything unknown cancels, the safe answer.
+function Resolve-SyncDivergedChoice {
+    param($Choice)
+    switch ([string]$Choice) {
+        { $_ -in 'handoff', 'theirs' } { return 'handoff' }
+        { $_ -in 'push', 'mine' } { return 'push' }
+        default { return 'cancel' }
+    }
+}
+
+function New-SyncPullResult {
+    param([string]$Status, [string]$Divergence, $Manifest)
+    return [pscustomobject]@{ Divergence = $Divergence; Mode = 'native'; Status = $Status; Bundle = $null; Manifest = $Manifest; ThreadId = $null; Path = $null; Prompt = $null; Root = $null; CwdMissing = $false }
+}
+
 # Brings one catalog row into $Target. Divergence says what was found: new and update are imported (natively when
-# the harness allows), diverged becomes a handoff whose title names the other machine, same does nothing. The result
-# is Invoke-HarnessImport's plus Divergence; Status 'needs-root' (with Root) means the caller asks for that folder,
-# calls Set-SyncPathRoot and pulls again. The decrypted bundle never outlives the call.
+# the harness allows), same does nothing, diverged asks -OnDiverged (called with the row and the local chat; it answers
+# handoff, push or cancel) and without it becomes a handoff whose title names the other machine. 'push' sends the
+# local chat as the latest version (Status pushed-mine), 'cancel' does nothing (Status cancelled). The result is
+# Invoke-HarnessImport's plus Divergence; Status 'needs-root' (with Root) means the caller asks for that folder, calls
+# Set-SyncPathRoot and pulls again. The decrypted bundle never outlives the call.
 function Invoke-SyncPull {
-    param([Parameter(Mandatory)]$Row, [Parameter(Mandatory)]$Target)
+    param([Parameter(Mandatory)]$Row, [Parameter(Mandatory)]$Target, [scriptblock]$OnDiverged)
     $s = Get-SyncSession
     $zip = Receive-SyncBundle -Root $s.Root -Row $Row -Key $s.Key
     try {
         $manifest = Read-SyncBundleManifest -Path $zip
-        $div = Get-SyncDivergence -Row $Row -LocalChat (Get-SyncLocalChat -Row $Row -Target $Target)
-        if ($div -eq 'same') {
-            return [pscustomobject]@{ Divergence = $div; Mode = 'native'; Status = 'same'; Bundle = $null; Manifest = $manifest; ThreadId = $null; Path = $null; Prompt = $null; Root = $null; CwdMissing = $false }
+        $local = Get-SyncLocalChat -Row $Row -Target $Target
+        $div = Get-SyncDivergence -Row $Row -LocalChat $local
+        if ($div -eq 'same') { return (New-SyncPullResult -Status 'same' -Divergence $div -Manifest $manifest) }
+        if ($div -eq 'diverged' -and $OnDiverged) {
+            $choice = Resolve-SyncDivergedChoice (& $OnDiverged $Row $local)
+            if ($choice -eq 'cancel') { return (New-SyncPullResult -Status 'cancelled' -Divergence $div -Manifest $manifest) }
+            if ($choice -eq 'push') {
+                [void](Invoke-SyncPush -Chat $local -SourceHarness ([string]$Target.Harness) -Profile $Target -PreviousBundleId ([string]$Row.bundleId))
+                return (New-SyncPullResult -Status 'pushed-mine' -Divergence $div -Manifest $manifest)
+            }
         }
         if ($div -eq 'diverged') { $res = Invoke-HarnessImport -BundlePath $zip -Manifest $manifest -Target $Target -Handoff -TitleSuffix " (from $($Row.MachineName))" }
         else { $res = Invoke-HarnessImport -BundlePath $zip -Manifest $manifest -Target $Target }
@@ -161,109 +186,6 @@ function Get-SyncCatalogForDialog {
     catch { Show-Message (Get-SyncErrorMessage -Message $_.Exception.Message) 'Drive sync' 'OK' 'Error' | Out-Null; return @() }
 }
 
-# The setup dialog: a thin shell over Get-SyncSetupChoices, Test-SyncSetupInput and Invoke-SyncSetup (all tested).
-# Uses the colours and fonts of ClaudeSwitcher.ps1 and Show-Message. Returns $true when sync was set up.
-function Show-SyncSetupDialog {
-    $choices = New-Object System.Collections.ArrayList
-    foreach ($c in @(Get-SyncSetupChoices)) { [void]$choices.Add($c) }
-
-    $dlg               = New-Object System.Windows.Forms.Form
-    $dlg.Text          = 'Set up Drive sync'
-    $dlg.Size          = New-Object System.Drawing.Size(560, 440)
-    $dlg.StartPosition = 'CenterParent'
-    $dlg.ShowInTaskbar = $false; $dlg.MinimizeBox = $false; $dlg.MaximizeBox = $false
-    $dlg.FormBorderStyle = 'FixedDialog'
-    $dlg.BackColor     = $bg
-    $dlg.Font          = $fontUI
-
-    $mkLabel = {
-        param($text, $y, $h)
-        $l = New-Object System.Windows.Forms.Label
-        $l.Text = $text; $l.ForeColor = $ink
-        $l.Location = New-Object System.Drawing.Point(16, $y); $l.Size = New-Object System.Drawing.Size(520, $h)
-        $dlg.Controls.Add($l)
-        return $l
-    }
-    $null = & $mkLabel 'Where should the synced chats be kept?' 14 20
-    $where = New-Object System.Windows.Forms.ComboBox
-    $where.DropDownStyle = 'DropDownList'
-    $where.Location = New-Object System.Drawing.Point(16, 38); $where.Size = New-Object System.Drawing.Size(400, 26)
-    foreach ($c in $choices) { [void]$where.Items.Add($c.Text) }
-    $dlg.Controls.Add($where)
-    $other = New-Object System.Windows.Forms.Button
-    $other.Text = 'Other folder...'
-    $other.Location = New-Object System.Drawing.Point(424, 36); $other.Size = New-Object System.Drawing.Size(112, 28)
-    $dlg.Controls.Add($other)
-
-    $mkPass = {
-        param($y)
-        $t = New-Object System.Windows.Forms.TextBox
-        $t.UseSystemPasswordChar = $true
-        $t.Location = New-Object System.Drawing.Point(16, $y); $t.Size = New-Object System.Drawing.Size(520, 26)
-        $dlg.Controls.Add($t)
-        return $t
-    }
-    $null = & $mkLabel 'Passphrase' 78 20
-    $pass1 = & $mkPass 100
-    $null = & $mkLabel 'Type it again' 134 20
-    $pass2 = & $mkPass 156
-
-    $ack = New-Object System.Windows.Forms.CheckBox
-    $ack.Text = 'Losing the passphrase means losing the bundles on Drive (the chats on this machine are kept).'
-    $ack.ForeColor = $ink
-    $ack.Location = New-Object System.Drawing.Point(16, 200); $ack.Size = New-Object System.Drawing.Size(520, 44)
-    $dlg.Controls.Add($ack)
-
-    $note = & $mkLabel '' 256 80
-
-    $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = 'Set up'
-    $ok.Location = New-Object System.Drawing.Point(16, 350); $ok.Size = New-Object System.Drawing.Size(108, 34)
-    $dlg.Controls.Add($ok)
-    $cancel = New-Object System.Windows.Forms.Button
-    $cancel.Text = 'Cancel'; $cancel.DialogResult = 'Cancel'; $dlg.CancelButton = $cancel
-    $cancel.Location = New-Object System.Drawing.Point(132, 350); $cancel.Size = New-Object System.Drawing.Size(108, 34)
-    $dlg.Controls.Add($cancel)
-
-    # The folder the user picked by hand is kept next to the Drive accounts; Existing says whether sync.json is already there.
-    $refresh = {
-        $c = $(if ($where.SelectedIndex -ge 0) { $choices[$where.SelectedIndex] } else { $null })
-        $existing = [bool]($c -and $c.Existing)
-        $pass2.Enabled = -not $existing; $ack.Enabled = -not $existing
-        $note.Text = $(if (-not $c) { 'Pick a Google Drive account, or another folder that Drive (or anything else) keeps in sync.' }
-                       elseif ($existing) { 'This folder already holds synced chats. Type the passphrase that was chosen on the first machine.' }
-                       else { 'The chats are encrypted on this machine before they reach the folder. Choose a passphrase you will not lose: it is the only way to read them on another machine.' })
-    }
-    $where.Add_SelectedIndexChanged($refresh)
-    $other.Add_Click({
-        $path = Read-SyncFolder -Description 'Pick the folder that holds the synced chats (create an empty one first if needed).'
-        if (-not $path) { return }
-        $entry = [pscustomobject]@{ Kind = 'custom'; Path = $path; Text = "Folder: $path"; Existing = (Test-Path -LiteralPath (Join-Path $path 'sync.json')) }
-        [void]$choices.Add($entry); [void]$where.Items.Add($entry.Text); $where.SelectedIndex = $where.Items.Count - 1
-    })
-    $script:SyncSetupDone = $false
-    $ok.Add_Click({
-        $c = $(if ($where.SelectedIndex -ge 0) { $choices[$where.SelectedIndex] } else { $null })
-        if (-not $c) { Show-Message 'Pick where the chats should be kept.' 'Set up Drive sync' 'OK' 'Warning' | Out-Null; return }
-        $problems = @(Test-SyncSetupInput -Passphrase $pass1.Text -Confirmation $pass2.Text -Acknowledged $ack.Checked -Existing:([bool]$c.Existing))
-        if ($problems.Count) { Show-Message ($problems -join "`r`n") 'Set up Drive sync' 'OK' 'Warning' | Out-Null; return }
-        $dlg.UseWaitCursor = $true
-        try {
-            $r = $(if ($c.Kind -eq 'drive') { Invoke-SyncSetup -DriveToken $c.Token -Passphrase $pass1.Text } else { Invoke-SyncSetup -CustomPath $c.Path -Passphrase $pass1.Text })
-            $script:SyncSetupDone = $true
-            Show-Message $(if ($r.FirstMachine) { 'Drive sync is set up. Push a chat from the tray menu, then pull it on your other machine.' } else { 'This machine now uses the existing sync folder. Pull chats from the tray menu.' }) 'Set up Drive sync' | Out-Null
-            $dlg.Close()
-        } catch {
-            Show-Message (Get-SyncErrorMessage -Message $_.Exception.Message) 'Set up Drive sync' 'OK' 'Error' | Out-Null
-        } finally { $dlg.UseWaitCursor = $false }
-    })
-    & $refresh
-    [void]$dlg.ShowDialog()
-    $pass1.Text = ''; $pass2.Text = ''
-    $dlg.Dispose()
-    return $script:SyncSetupDone
-}
-
 # ---- what the dialogs and the tray show ---------------------------------------------------------------------------------
 
 # lastActivityAt as local "yyyy-MM-dd HH:mm"; the adapters store milliseconds or seconds since 1970.
@@ -295,7 +217,7 @@ function Invoke-SyncTrayAction {
     param([Parameter(Mandatory)][string]$Action)
     try {
         switch ($Action) {
-            'setup' { [void](Show-SyncSetupDialog) }
+            'setup' { [void](Show-SyncSetupWizard) }
             'push'  { Show-HarnessExportDialog -Mode push }
             'pull'  { Show-HarnessExportDialog -Mode pull }
         }
@@ -315,15 +237,17 @@ function Get-SyncDialogTargets {
 # Pull; when the bundle's working folder is under a root this machine has not set (needs-root), -AskRoot is called
 # with the root's name and returns a full path (or $null to give up). The answer is remembered and the pull repeated.
 function Invoke-SyncPullAskingRoot {
-    param([Parameter(Mandatory)]$Row, [Parameter(Mandatory)]$Target, [scriptblock]$AskRoot)
+    param([Parameter(Mandatory)]$Row, [Parameter(Mandatory)]$Target, [scriptblock]$AskRoot, [scriptblock]$OnDiverged)
     $asked = @{}
-    $res = Invoke-SyncPull -Row $Row -Target $Target
+    $pull = @{ Row = $Row; Target = $Target }
+    if ($OnDiverged) { $pull['OnDiverged'] = $OnDiverged }
+    $res = Invoke-SyncPull @pull
     while ($res.Status -eq 'needs-root' -and $AskRoot -and -not $asked.ContainsKey([string]$res.Root)) {
         $asked[[string]$res.Root] = $true
         $path = & $AskRoot $res.Root
         if (-not $path) { break }
         Set-SyncPathRoot -Name ([string]$res.Root) -Path ([string]$path)
-        $res = Invoke-SyncPull -Row $Row -Target $Target
+        $res = Invoke-SyncPull @pull
     }
     return $res
 }
@@ -332,12 +256,12 @@ function Invoke-SyncPullAskingRoot {
 # @{ Kind = 'drive' }; $TargetEntry comes from Get-SyncDialogTargets; $Item is a chat (harness source) or a catalog row.
 # Returns Kind (message | warning | error), Text, Prompt (for the clipboard) and Where (files written).
 function Invoke-HarnessDialogAction {
-    param([Parameter(Mandatory)]$Source, [Parameter(Mandatory)]$TargetEntry, $Item, [scriptblock]$AskRoot)
+    param([Parameter(Mandatory)]$Source, [Parameter(Mandatory)]$TargetEntry, $Item, [scriptblock]$AskRoot, [scriptblock]$OnDiverged)
     $out = { param($kind, $text, $prompt, $where) [pscustomobject]@{ Kind = $kind; Text = $text; Prompt = $prompt; Where = $where } }
     try {
         if ($Source.Kind -eq 'drive') {
             if ($TargetEntry.Kind -ne 'profile') { return (& $out 'warning' 'Pick the profile that should receive the chat.' $null $null) }
-            $r = Invoke-SyncPullAskingRoot -Row $Item -Target $TargetEntry.Profile -AskRoot $AskRoot
+            $r = Invoke-SyncPullAskingRoot -Row $Item -Target $TargetEntry.Profile -AskRoot $AskRoot -OnDiverged $OnDiverged
             if ($r.Status -eq 'needs-root') { return (& $out 'warning' (Get-HarnessTransferMessage -Result $r -Target $TargetEntry.Profile) $null $null) }
             return (& $out 'message' (Get-HarnessTransferMessage -Result $r -Target $TargetEntry.Profile) $r.Prompt $r.Path)
         }

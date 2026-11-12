@@ -9,6 +9,7 @@ $root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $root 'src\Ui.Tray.ps1')
 . (Join-Path $root 'src\Ui.Harness.ps1')
 . (Join-Path $root 'src\Ui.Sync.ps1')
+. (Join-Path $root 'src\Ui.SyncWizard.ps1')
 
 # No window is opened and nothing real is touched: the "Drive" is a temp folder, settings and switcher home are temp,
 # the adapters are fakes, the passphrase is made up and key derivation is lowered to 1000 rounds.
@@ -137,6 +138,51 @@ try {
     Assert ($res.Prompt.Contains('First chat (from PCA)')) "the title carries the machine name: $($res.Prompt)"
     Assert ((Get-SyncState)['fakea:chat-1'].lastBundleId -eq $stateBefore) 'a handoff does not move the sync state'
     Assert (-not $script:HandoffTitleSuffix) 'the title suffix does not leak into later handoffs'
+
+    # V3a: the user picks what happens to a diverged chat
+    Assert ((Resolve-SyncDivergedChoice 'handoff') -eq 'handoff' -and (Resolve-SyncDivergedChoice 'theirs') -eq 'handoff' -and (Resolve-SyncDivergedChoice 'push') -eq 'push' -and (Resolve-SyncDivergedChoice 'mine') -eq 'push' -and (Resolve-SyncDivergedChoice 'cancel') -eq 'cancel') 'choice mapping'
+    Assert ((Resolve-SyncDivergedChoice $null) -eq 'cancel' -and (Resolve-SyncDivergedChoice 'whatever') -eq 'cancel') 'anything unknown cancels'
+    $localChat = [pscustomobject]@{ Harness = 'fakea'; ChatId = 'chat-1'; Title = 'Local copy'; Activity = ($row2.lastActivityAt + 5000) }
+    $script:chatsOf['a2'] = @($localChat)
+    $tempBefore = Get-TempSyncDirs
+    $idxB = Join-Path $drive "index\$idB.jsonl"
+    function Get-IdxCount { if (Test-Path -LiteralPath $idxB) { @([IO.File]::ReadAllLines($idxB)).Count } else { 0 } }
+    $rowsBefore = (Get-IdxCount)
+    $script:imports.Clear(); $script:asked = $null
+    $res = Invoke-SyncPull -Row $row3 -Target $profA2 -OnDiverged { param($r, $c) $script:asked = @($r.bundleId, $c.ChatId); 'cancel' }
+    Assert ($res.Status -eq 'cancelled' -and $res.Divergence -eq 'diverged' -and $script:imports.Count -eq 0) "cancel does nothing: $($res | ConvertTo-Json -Compress)"
+    Assert ($script:asked[0] -eq $row3.bundleId -and $script:asked[1] -eq 'chat-1') 'the callback gets the row and the local chat'
+    Assert ((Get-SyncState)['fakea:chat-1'].lastBundleId -eq $stateBefore -and (Get-IdxCount) -eq $rowsBefore -and (Get-TempSyncDirs) -eq $tempBefore) 'cancel changes nothing and leaves no temp file'
+    $res = Invoke-SyncPull -Row $row3 -Target $profA2 -OnDiverged { 'handoff' }
+    Assert ($res.Status -eq 'handoff' -and $script:imports[0][0] -eq 'handoff') 'handoff through the callback behaves like the default'
+    $script:imports.Clear()
+    $stateSnap = Get-SyncState
+    $res = Invoke-SyncPull -Row $row3 -Target $profA2 -OnDiverged { 'push' }
+    Assert ($res.Status -eq 'pushed-mine' -and $res.Divergence -eq 'diverged' -and $script:imports.Count -eq 0) "push mine: $($res | ConvertTo-Json -Compress)"
+    Assert ((Get-IdxCount) -eq $rowsBefore + 1) 'this machine pushed its own copy as a new row'
+    Assert ((Get-SyncState)['fakea:chat-1'].lastBundleId -ne $stateBefore -and (Get-TempSyncDirs) -eq $tempBefore) 'the state follows the push and no temp file is left'
+    # the pushed row replaces A's version in the catalog even though its activity is older (lineage), so B is in sync with
+    # it and A sees it as an ordinary newer version instead of never hearing about B's copy
+    $head = @(Get-SyncCatalog -Root $drive -Key $key | Where-Object { $_.chatKey -eq 'fakea:chat-1' })
+    Assert ($head.Count -eq 1 -and $head[0].previousBundleId -eq $row3.bundleId -and $head[0].machineId -eq $idB) "push mine heads the catalog: $($head | ConvertTo-Json -Compress)"
+    Assert ((Get-SyncDivergence -Row $head[0] -LocalChat $localChat) -eq 'same') 'on the machine that pushed mine the chat is in sync'
+    $stateAfterPush = Get-SyncState
+    $stateA = Get-SyncState; $stateA['fakea:chat-1'] = @{ lastBundleId = $row3.bundleId; localChatId = 'chat-1'; harness = 'fakea'; profileId = 'a1'; localActivityAtSync = 1900000000000 }
+    Set-SyncState -State $stateA
+    Assert ((Get-SyncDivergence -Row $head[0] -LocalChat ([pscustomobject]@{ Harness = 'fakea'; ChatId = 'chat-1'; Activity = 1900000000000 })) -eq 'update') 'the other machine, unchanged since it pushed, is offered B''s copy as an update'
+    Set-SyncState -State $stateAfterPush
+    Set-SyncState -State $stateSnap   # back to the diverged situation, to test a callback that fails
+    Assert ((Get-SyncState)['fakea:chat-1'].lastBundleId -eq $stateBefore) 'state restored for the next case'
+    $script:imports.Clear(); $res = $null
+    try { $res = Invoke-SyncPull -Row $row3 -Target $profA2 -OnDiverged { throw 'the callback failed' } } catch { }
+    Assert ($null -eq $res -and $script:imports.Count -eq 0) 'a failing callback never imports'
+    Assert ((Get-TempSyncDirs) -eq $tempBefore) 'and leaves no temp file'
+    # the same choice through the dialog's action, with a fake window
+    $script:imports.Clear()
+    $act = Invoke-HarnessDialogAction -Source @{ Kind = 'drive' } -TargetEntry ([pscustomobject]@{ Kind = 'profile'; Profile = $profA2 }) -Item $row3 -OnDiverged { 'cancel' }
+    Assert ($act.Kind -eq 'message' -and $act.Text -eq 'Nothing was changed.' -and $script:imports.Count -eq 0) "cancel through Invoke-HarnessDialogAction: $($act | ConvertTo-Json -Compress)"
+    $act = Invoke-HarnessDialogAction -Source @{ Kind = 'drive' } -TargetEntry ([pscustomobject]@{ Kind = 'profile'; Profile = $profA2 }) -Item $row3 -OnDiverged { 'handoff' }
+    Assert ($act.Kind -eq 'message' -and $script:imports.Count -eq 1 -and $script:imports[0][0] -eq 'handoff') 'handoff through Invoke-HarnessDialogAction'
 
     # a root the user has not set yet: nothing is recorded, the temp file is gone
     $script:chatsOf['a2'] = @()
@@ -362,6 +408,75 @@ try {
     Assert (-not (Test-HandleLinkAlone -Bound @{ HandleLink = 'claude://x'; SyncPush = 'a:b:c' })) '-HandleLink next to -SyncPush is refused'
     Assert (-not (Test-HandleLinkAlone -Bound @{ HandleLink = 'claude://x'; SyncPull = 'a' })) '-HandleLink next to -SyncPull is refused'
     Assert (Test-HandleLinkAlone -Bound @{ SyncPush = 'a:b:c' }) 'a sync switch alone is fine'
+
+    # ---------------------------------------------------------------- V3b: the diverged choice window (built, never shown)
+    $divRow = [pscustomobject]@{ Title = 'Their title'; MachineName = 'PCA' }
+    $f = New-SyncDivergedForm -Row $divRow -Chat ([pscustomobject]@{ Title = 'My copy' })
+    try {
+        Assert ($f.Handoff.Text -like 'Bring theirs in*' -and $f.Push.Text -like 'Push mine*' -and $f.Cancel.Text -eq 'Cancel') 'three buttons with the agreed labels'
+        Assert ([object]::ReferenceEquals($f.Form.AcceptButton, $f.Handoff)) 'the default (Enter) is bring theirs in as a new chat'
+        Assert ([object]::ReferenceEquals($f.Form.CancelButton, $f.Cancel)) 'Escape cancels'
+        Assert ((@($f.Form.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and $_.Text -like '*PCA*' -and $_.Text -like '*My copy*' })).Count -eq 1) 'the text names the chat and the other machine'
+        Assert ([string]$f.Handoff.DialogResult -eq 'Yes' -and [string]$f.Push.DialogResult -eq 'No' -and [string]$f.Cancel.DialogResult -eq 'Cancel') 'each button closes with its own result'
+    } finally { $f.Form.Dispose() }
+    Assert ((Get-HarnessTransferMessage -Result (New-Res 'pushed-mine') -Target $profA2) -like 'Pushed*latest*') 'pushed-mine message'
+    Assert ((Get-HarnessTransferMessage -Result (New-Res 'cancelled') -Target $profA2) -eq 'Nothing was changed.') 'cancelled message'
+
+    # ---------------------------------------------------------------- V3d: the move dialog's one-line hint (pure)
+    $hn = { param($mode) Get-HarnessMoveHint -Mode $mode -TargetName 'Codex / Work' }
+    Assert ((& $hn 'native') -like '*Codex / Work*' -and (& $hn 'native') -like '*copied*') "native hint: $(& $hn 'native')"
+    Assert ((& $hn 'codex-import') -like '*Codex / Work*' -and (& $hn 'codex-import') -like '*Codex*import*') "codex-import hint: $(& $hn 'codex-import')"
+    Assert ((& $hn 'handoff') -like '*Codex / Work*' -and (& $hn 'handoff') -like '*clipboard*') "handoff hint: $(& $hn 'handoff')"
+    Assert ((& $hn 'files') -like '*file*') "files hint: $(& $hn 'files')"
+    Assert ((& $hn 'native') -ne (& $hn 'handoff') -and (& $hn 'native') -ne (& $hn 'codex-import')) 'the hints differ'
+    Assert ((Get-HarnessMoveHint -Mode (Resolve-TransferMode -Source 'fakea' -Target 'fakea') -TargetName 'x') -like '*copied*') 'fakea to fakea reads as native'
+    Assert ((Get-HarnessMoveHint -Mode (Resolve-TransferMode -Source 'fakea' -Target 'fakeb') -TargetName 'x') -like '*clipboard*') 'fakea to fakeb reads as handoff'
+
+    # ---------------------------------------------------------------- V3c: the 3-step setup wizard (pure state + the finish action)
+    $w = { param($h) $base = @{ Page = 1; Choice = $null; Passphrase = ''; Confirmation = ''; Acknowledged = $false }; foreach ($k in $h.Keys) { $base[$k] = $h[$k] }; Get-SyncWizardStep -State $base }
+    $newCh = [pscustomobject]@{ Kind = 'custom'; Path = $setupDrive; Text = 'Folder'; Existing = $false }
+    $oldCh = [pscustomobject]@{ Kind = 'custom'; Path = $setupDrive; Text = 'Folder'; Existing = $true }
+    $s = & $w @{}
+    Assert ($s.Page -eq 1 -and -not $s.CanNext -and -not $s.CanBack -and -not $s.CanFinish) 'step 1 without a choice has no Next'
+    $s = & $w @{ Choice = $newCh }
+    Assert ($s.Page -eq 1 -and $s.CanNext -and -not $s.CanBack) 'step 1 with a choice can go on'
+    $s = & $w @{ Page = 2; Choice = $newCh }
+    Assert ($s.Page -eq 2 -and $s.CanBack -and -not $s.CanNext -and -not $s.Existing -and $s.Problems.Count -ge 2) "step 2 of a new folder needs the passphrase twice and the tick: $($s.Problems -join '|')"
+    $s = & $w @{ Page = 2; Choice = $newCh; Passphrase = $okPass; Confirmation = $okPass; Acknowledged = $true }
+    Assert ($s.CanNext -and $s.Problems.Count -eq 0) 'step 2 is complete with a matching passphrase and the tick'
+    $s = & $w @{ Page = 2; Choice = $oldCh; Passphrase = 'x' }
+    Assert ($s.Existing -and $s.CanNext -and $s.Problems.Count -eq 0) 'joining an existing folder: one passphrase field is enough'
+    $s = & $w @{ Page = 2; Choice = $oldCh }
+    Assert ($s.Existing -and -not $s.CanNext -and $s.Problems.Count -eq 1) 'joining an existing folder: still not empty'
+    Assert (-not (($s | ConvertTo-Json -Depth 4) -like '*twelve chars*')) 'the step never carries the passphrase'
+    $s = & $w @{ Page = 3; Choice = $newCh }
+    Assert ($s.Page -eq 3 -and $s.CanBack -and $s.CanFinish -and -not $s.CanNext) 'step 3 can finish'
+    $s = & $w @{ Page = 7; Choice = $newCh }
+    Assert ($s.Page -eq 3) 'a page number out of range is clamped'
+
+    # Finish: Invoke-SyncSetup, then the ticked roots. Fakes for the suggestions; real sync folder in a temp dir.
+    $wizDrive = Join-Path $tmp 'wizdrive'; New-Item -ItemType Directory -Path $wizDrive -Force | Out-Null
+    $rootDir = Join-Path $tmp 'wizroot'; New-Item -ItemType Directory -Path $rootDir -Force | Out-Null
+    Use-Machine $idA 'PCW'; Set-SyncSetting 'CustomPath' $null; Set-SyncSetting 'DriveAccountToken' $null
+    $script:SwitcherHome = Join-Path $tmp 'home-wizard'
+    $state = @{ Page = 3; Choice = [pscustomobject]@{ Kind = 'custom'; Path = $wizDrive; Text = 'Folder'; Existing = $false }; Passphrase = $okPass; Confirmation = $okPass; Acknowledged = $true }
+    $before = Get-SyncPathRoots
+    $res = Complete-SyncWizard -State $state -Roots @(@{ Name = 'Proj'; Path = $rootDir }, @{ Name = 'Bad name!'; Path = $rootDir }) -Iterations 1000 -MinIterations 1000
+    Assert ($res.Root -eq $wizDrive -and $res.FirstMachine -eq $true) "wizard finish sets sync up: $($res | ConvertTo-Json -Compress)"
+    Assert ((Get-SyncPathRoots)['Proj'] -eq $rootDir) 'the ticked folder root is saved'
+    Assert ($res.RootErrors.Count -eq 1 -and $res.RootErrors[0] -like '*Bad name!*') 'a bad root is reported, the others still get saved'
+    Assert ($null -ne (Get-SyncSession).Key) 'the key is cached after the wizard'
+    Assert (-not ([IO.File]::ReadAllText($script:SettingsPath)).Contains($okPass)) 'the wizard never writes the passphrase to the settings'
+    $msg = $null; try { Complete-SyncWizard -State @{ Page = 3; Choice = $newCh; Passphrase = 'short'; Confirmation = 'short'; Acknowledged = $true } -Roots @() } catch { $msg = $_.Exception.Message }
+    Assert ($msg -and -not $msg.Contains('short''')) 'finishing with bad input is refused'
+    $msg = $null; try { Complete-SyncWizard -State @{ Page = 3; Choice = $null } -Roots @() } catch { $msg = $_.Exception.Message }
+    Assert ($msg) 'finishing without a choice is refused'
+    # the suggestion list: V1's Get-SuggestedPathRoots when it exists, nothing otherwise
+    function Get-SuggestedPathRoots { param([string[]]$Cwds) @(@{ Name = 'Fake'; Path = 'C:\fake' }) }
+    $sug = @(Get-SyncWizardRoots -Cwds @('C:\fake\x'))
+    Assert ($sug.Count -eq 1 -and $sug[0].Name -eq 'Fake') 'suggestions come from Get-SuggestedPathRoots'
+    Remove-Item function:\Get-SuggestedPathRoots
+    Assert (@(Get-SyncWizardRoots -Cwds @('C:\fake\x')).Count -eq 0) 'without Get-SuggestedPathRoots there are no suggestions'
 
     Write-Output 'PASS: sync UI helpers.'
 } finally {

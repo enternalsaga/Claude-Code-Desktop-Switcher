@@ -241,16 +241,23 @@ function Get-SyncMachineNames {
 function Get-SyncCatalog {
     param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][byte[]]$Key)
     $names = Get-SyncMachineNames -Root $Root
-    $best = @{}
+    $all = New-Object Collections.Generic.List[object]
     $indexDir = Join-Path $Root 'index'
     $files = $(if (Test-Path -LiteralPath $indexDir) { @(Get-ChildItem -LiteralPath $indexDir -File -Filter '*.jsonl') } else { @() })
     foreach ($f in $files) {
         if ($f.Name -notmatch ('\A(' + $script:SyncGuidPattern + ')\.jsonl\z')) { continue }   # skips tmp files and "name (1).jsonl"
         $mid = $Matches[1]
-        foreach ($r in @(Read-SyncIndexRows -Path $f.FullName -MachineId $mid)) {
-            $cur = $best[$r.chatKey]
-            if (-not $cur -or $r.lastActivityAt -gt $cur.lastActivityAt -or ($r.lastActivityAt -eq $cur.lastActivityAt -and $r.pushedAt -gt $cur.pushedAt)) { $best[$r.chatKey] = $r }
-        }
+        foreach ($r in @(Read-SyncIndexRows -Path $f.FullName -MachineId $mid)) { $all.Add($r) }
+    }
+    # A version that another version names as its predecessor was replaced on purpose (a "push mine"), even when its
+    # activity is later; among what is left the latest activity wins.
+    $replaced = @{}
+    foreach ($r in $all) { if ($r.previousBundleId) { $replaced[$r.chatKey + '|' + $r.previousBundleId] = $true } }
+    $best = @{}
+    foreach ($r in $all) {
+        if ($replaced.ContainsKey($r.chatKey + '|' + $r.bundleId)) { continue }
+        $cur = $best[$r.chatKey]
+        if (-not $cur -or $r.lastActivityAt -gt $cur.lastActivityAt -or ($r.lastActivityAt -eq $cur.lastActivityAt -and $r.pushedAt -gt $cur.pushedAt)) { $best[$r.chatKey] = $r }
     }
     $out = foreach ($r in $best.Values) {
         $title = [string]$r.chatKey
@@ -298,7 +305,7 @@ function Write-SyncMachineFile {
 # Encrypts the bundle, writes it under bundles/, adds a row to this machine's index (rewritten whole, decision D8),
 # updates machines/<id>.json and the sync state. Returns the new row.
 function Push-SyncBundle {
-    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$BundlePath, [Parameter(Mandatory)][byte[]]$Key, [Parameter(Mandatory)]$Chat)
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$BundlePath, [Parameter(Mandatory)][byte[]]$Key, [Parameter(Mandatory)]$Chat, [string]$PreviousBundleId)
     $m = Read-SyncBundleManifest -Path $BundlePath
     $chatKey = [string]$m.chatKey
     if ($chatKey -notmatch $script:SyncChatKeyPattern -or $chatKey.Contains('..')) { throw "bundle-invalid: unsafe chat key '$chatKey'" }
@@ -316,7 +323,7 @@ function Push-SyncBundle {
     $activity = $(if ($null -ne $Chat.Activity) { $Chat.Activity } else { $m.source.lastActivityAt })
     $title = $(if ($m.source.title) { [string]$m.source.title } else { [string]$Chat.Title })
     $row = [pscustomobject][ordered]@{
-        bundleId = [string]$m.bundleId; chatKey = $chatKey; previousBundleId = $(if ($state.ContainsKey($chatKey)) { $state[$chatKey].lastBundleId } else { $null })
+        bundleId = [string]$m.bundleId; chatKey = $chatKey; previousBundleId = $(if ($PreviousBundleId) { $PreviousBundleId } elseif ($state.ContainsKey($chatKey)) { $state[$chatKey].lastBundleId } else { $null })
         contentSha256 = $m.lineage.contentSha256; harness = $harness; titleEnc = (Protect-SyncString -Text $title -Key $Key)
         lastActivityAt = $(if ($null -ne $m.source.lastActivityAt) { $m.source.lastActivityAt } else { $activity }); path = $rel
         size = (Get-Item -LiteralPath $dest).Length; sha256 = (Get-SyncFileSha256 $dest); machineId = $machine.Id; pushedAt = (Get-Date).ToUniversalTime().ToString('o')

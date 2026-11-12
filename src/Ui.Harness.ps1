@@ -153,6 +153,8 @@ function Get-HarnessTransferMessage {
         'updated'           { return "Updated $name with the newer version.$folderNote" }
         'renamed'           { return "$name already has this chat; only its title was updated." }
         'same'              { return "$name already has this version of the chat." }
+        'pushed-mine'       { return 'Pushed this machine''s version to Drive as the latest. The other machine will see that the chat changed on both.' }
+        'cancelled'         { return 'Nothing was changed.' }
         'needs-root'        { return "Choose where the folder '$($Result.Root)' is on this machine, then try again." }
         'bundle-missing'    { return (Get-SyncErrorMessage -Message 'bundle-missing') }
         'sync-conflict'     { return (Get-SyncErrorMessage -Message $(if ($Result.PSObject.Properties['Error'] -and $Result.Error) { [string]$Result.Error } else { 'sync-conflict' })) }
@@ -280,7 +282,8 @@ function Show-HarnessExportDialog {
         if ($item.PSObject.Properties['HasRollout'] -and -not $item.HasRollout) { Show-Message 'The file of this chat is no longer on disk, so it cannot be moved.' 'Move or hand off a chat' 'OK' 'Warning' | Out-Null; return }
         $src = $(if ($state.Drive) { @{ Kind = 'drive' } } else { @{ Kind = 'harness'; Harness = $state.Harness.Name; Profile = $state.Profiles[[Math]::Max(0, $profileBox.SelectedIndex)] } })
         $askRoot = { param($rootName) Read-SyncFolder -Description "Where is the folder '$rootName' on this machine? The chat's working folder is inside it." }
-        $r = Invoke-HarnessDialogAction -Source $src -TargetEntry $entries[[Math]::Max(0, $targetBox.SelectedIndex)] -Item $item -AskRoot $askRoot
+        $onDiverged = { param($row, $chat) Show-SyncDivergedDialog -Row $row -Chat $chat }
+        $r = Invoke-HarnessDialogAction -Source $src -TargetEntry $entries[[Math]::Max(0, $targetBox.SelectedIndex)] -Item $item -AskRoot $askRoot -OnDiverged $onDiverged
         if ($r.Prompt) { [System.Windows.Forms.Clipboard]::SetText($r.Prompt) }
         $level = switch ($r.Kind) { 'error' { 'Error' } 'warning' { 'Warning' } default { 'Information' } }
         Show-Message ((@($r.Text, $r.Where) | Where-Object { $_ }) -join "`r`n`r`n") $(if ($r.Kind -eq 'message') { 'Done' } else { 'Move or hand off a chat' }) 'OK' $level | Out-Null
@@ -290,4 +293,113 @@ function Show-HarnessExportDialog {
     $sourceBox.SelectedIndex = $(if ($Mode -eq 'pull' -and $syncReady) { $sources.Count } else { 0 })
     [void]$dlg.ShowDialog()
     $dlg.Dispose()
+}
+
+# ---- dialogs of lane V3 (phase 5) ---------------------------------------------------------------------------------------
+
+# One sentence under the target list of the move dialog: what will happen to the chat (Resolve-TransferMode's answer).
+function Get-HarnessMoveHint {
+    param([Parameter(Mandatory)][string]$Mode, [Parameter(Mandatory)][string]$TargetName)
+    switch ($Mode) {
+        'native'       { return "Native copy: the chat keeps its history and is copied into $TargetName, where it can be resumed." }
+        'codex-import' { return "Codex's own importer turns the Claude chat into a Codex chat in $TargetName." }
+        'files'        { return 'Writes a bundle and a handoff file under the switcher folder; nothing is imported.' }
+        default        { return "Handoff: a new chat starts in $TargetName from the transcript; the opening prompt is copied to the clipboard." }
+    }
+}
+
+# The window of the "chat differs on both machines" choice. Built apart from Show-SyncDivergedDialog so it can be checked
+# without showing it. Buttons: Handoff (Yes, the default: brings theirs in as a new chat), Push (No), Cancel.
+function New-SyncDivergedForm {
+    param([Parameter(Mandatory)]$Row, $Chat)
+    Add-Type -AssemblyName System.Windows.Forms
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'This chat changed on both machines'; $dlg.Size = New-Object System.Drawing.Size(540, 300)
+    $dlg.StartPosition = 'CenterParent'; $dlg.ShowInTaskbar = $false; $dlg.MinimizeBox = $false; $dlg.MaximizeBox = $false
+    $dlg.FormBorderStyle = 'FixedDialog'
+    if ($bg) { $dlg.BackColor = $bg }
+    if ($fontUI) { $dlg.Font = $fontUI }
+    $title = $(if ($Chat -and $Chat.PSObject.Properties['Title'] -and $Chat.Title) { [string]$Chat.Title } else { [string]$Row.Title })
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = ('"{0}" changed on this machine and on {1} since they last synced.' -f $title, $Row.MachineName)
+    if ($ink) { $label.ForeColor = $ink }
+    $label.Location = New-Object System.Drawing.Point(16, 14); $label.Size = New-Object System.Drawing.Size(490, 50)
+    $dlg.Controls.Add($label)
+    $make = {
+        param($text, $help, $y, $result)
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = $text; $b.DialogResult = $result
+        $b.Location = New-Object System.Drawing.Point(16, $y); $b.Size = New-Object System.Drawing.Size(250, 34)
+        $dlg.Controls.Add($b)
+        $h = New-Object System.Windows.Forms.Label
+        $h.Text = $help; if ($ink) { $h.ForeColor = $ink }
+        $h.Location = New-Object System.Drawing.Point(274, ($y + 2)); $h.Size = New-Object System.Drawing.Size(240, 34)
+        $dlg.Controls.Add($h)
+        return $b
+    }
+    $handoff = & $make 'Bring theirs in as a new chat' 'Your chat stays as it is.' 76 'Yes'
+    $push    = & $make 'Push mine as the latest' 'The other machine will see that it changed on both.' 124 'No'
+    $cancel  = & $make 'Cancel' 'Change nothing.' 172 'Cancel'
+    $dlg.AcceptButton = $handoff; $dlg.CancelButton = $cancel
+    return [pscustomobject]@{ Form = $dlg; Handoff = $handoff; Push = $push; Cancel = $cancel }
+}
+
+# Asks what to do with a chat that changed on both machines: 'handoff' (default), 'push' or 'cancel'. The -OnDiverged
+# callback of Invoke-SyncPull.
+function Show-SyncDivergedDialog {
+    param([Parameter(Mandatory)]$Row, $Chat)
+    $f = New-SyncDivergedForm -Row $Row -Chat $Chat
+    try {
+        $answer = $f.Form.ShowDialog()
+        return (Resolve-SyncDivergedChoice $(switch ([string]$answer) { 'Yes' { 'handoff' } 'No' { 'push' } default { 'cancel' } }))
+    } finally { $f.Form.Dispose() }
+}
+
+# Move one chat to any profile of any installed harness. Returns @{ Result; Target } of the transfer, or $null when the
+# user cancels. A failed transfer is shown here and the window stays open.
+function Show-HarnessMoveDialog {
+    param([Parameter(Mandatory)]$Chat, [Parameter(Mandatory)][string]$SourceHarness)
+    Add-Type -AssemblyName System.Windows.Forms
+    $targets = @(Get-HarnessTransferTargets)
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Move to...'; $dlg.Size = New-Object System.Drawing.Size(520, 400); $dlg.MinimumSize = New-Object System.Drawing.Size(420, 340)
+    $dlg.StartPosition = 'CenterParent'; $dlg.ShowInTaskbar = $false; $dlg.MinimizeBox = $false
+    $dlg.BackColor = $bg; $dlg.Font = $fontUI
+    $list = New-Object System.Windows.Forms.ListBox
+    $list.Location = New-Object System.Drawing.Point(16, 16); $list.Size = New-Object System.Drawing.Size(470, 230); $list.Anchor = 'Top,Left,Right,Bottom'
+    foreach ($t in $targets) { [void]$list.Items.Add(('{0} / {1}' -f (Get-HarnessDisplayName (Get-Harness -Name $t.Harness)), $t.Name)) }
+    $dlg.Controls.Add($list)
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.ForeColor = $ink; $hint.Location = New-Object System.Drawing.Point(16, 256); $hint.Size = New-Object System.Drawing.Size(470, 50); $hint.Anchor = 'Left,Right,Bottom'
+    $dlg.Controls.Add($hint)
+    $go = New-Object System.Windows.Forms.Button
+    $go.Text = 'Move'; $go.Location = New-Object System.Drawing.Point(16, 318); $go.Size = New-Object System.Drawing.Size(108, 34); $go.Anchor = 'Left,Bottom'; $go.Enabled = $false
+    $dlg.Controls.Add($go)
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'; $cancel.DialogResult = 'Cancel'; $dlg.CancelButton = $cancel
+    $cancel.Location = New-Object System.Drawing.Point(132, 318); $cancel.Size = New-Object System.Drawing.Size(108, 34); $cancel.Anchor = 'Left,Bottom'
+    $dlg.Controls.Add($cancel)
+
+    $out = @{ Value = $null }
+    $list.Add_SelectedIndexChanged({
+        $go.Enabled = ($list.SelectedIndex -ge 0)
+        if ($list.SelectedIndex -lt 0) { $hint.Text = ''; return }
+        $t = $targets[$list.SelectedIndex]
+        $hint.Text = Get-HarnessMoveHint -Mode (Resolve-TransferMode -Source $SourceHarness -Target $t.Harness) -TargetName $list.SelectedItem
+    })
+    $go.Add_Click({
+        $t = $targets[$list.SelectedIndex]
+        $dlg.UseWaitCursor = $true; $go.Enabled = $false
+        try {
+            $r = Invoke-HarnessTransfer -Chat $Chat -SourceHarness $SourceHarness -Target $t
+            if ($r.Prompt) { [System.Windows.Forms.Clipboard]::SetText($r.Prompt) }
+            $out.Value = [pscustomobject]@{ Result = $r; Target = $t }
+            $dlg.Close()
+        } catch {
+            Show-Message (Get-SyncErrorMessage -Message $_.Exception.Message) 'Move to...' 'OK' 'Error' | Out-Null
+        } finally { $dlg.UseWaitCursor = $false; $go.Enabled = ($list.SelectedIndex -ge 0) }
+    })
+    [void]$dlg.ShowDialog()
+    $dlg.Dispose()
+    return $out.Value
 }
