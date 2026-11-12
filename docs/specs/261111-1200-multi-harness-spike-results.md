@@ -241,3 +241,26 @@ Chạy 2026-11-11 trong home tạm `%TEMP%\harness-spike\S12\home` (đã xóa), 
 - Hai thread đều **không** hiện trong `thread/list` (bản rollout nguồn chép không có tin nhắn user thích hợp trong phạm vi lọc của list, như S8a đã ghi về preview rỗng). Nên kết quả này chỉ chứng minh đăng ký dòng `threads`, không chứng minh hiển thị. Hai thread cư xử giống nhau, nên không có dấu hiệu cwd thiếu làm khác đi.
 - Không thử được: cửa sổ ChatGPT/Codex có hiện thread có cwd thiếu và mở tiếp (resume) được không. Cần mắt người nếu muốn chắc.
 - Kết luận cho D5/lane C: Codex khác máy có thể chép native nguyên bản (không cần viết lại cwd để đăng ký được). UI chỉ nên cảnh báo khi cwd nguồn không tồn tại trên máy này. Khuyến nghị: hỏi người dùng có muốn dùng handoff khi cwd thiếu, vì resume trong thư mục không có là điều chưa kiểm.
+
+## S9: account token của Google Drive for desktop giữa hai máy — **ĐẠT**
+
+Chạy 2026-11-12 bằng `tools\spikes\S9-DriveAccounts.ps1` trên máy chính và máy thứ hai (chỉ đọc registry `HKCU:\Software\Google\DriveFS`; in hash SHA-256 rút gọn của token, không in token hay email).
+
+- **Cùng account cho ra cùng token ở hai máy:** hai account trên máy chính có hai `tokenHash`; máy thứ hai có đúng hai hash đó. Token dài 21 chữ số ở cả hai. Hợp đồng của lane D (`Sync.DriveAccountToken`) dùng token làm khóa account xuyên máy là đúng.
+- **Ổ gắn (mount) không giống nhau giữa hai máy:** máy chính gắn hai account ở hai chữ ổ riêng; máy thứ hai chỉ gắn account thứ hai, ở một chữ ổ khác hẳn, còn account thứ nhất **có trong registry nhưng `mount_point_path` rỗng** (không có ổ). Vì vậy `Resolve-SyncRoot` phải tìm ổ theo token, không theo chữ ổ, và xử lý được trường hợp token có mặt mà chưa gắn ổ (`Reason = 'token-not-mounted'`).
+- **`CurrentAccountToken` khác nhau giữa các máy** (máy thứ hai: account thứ nhất là account hiện tại; máy chính: không account nào khớp). Không dùng nó để chọn account đồng bộ.
+- **`machine_root_doc_id` khác nhau giữa hai máy và có thể rỗng** (máy thứ hai: rỗng ở cả hai account). Không dùng làm định danh gì.
+- **Cấu trúc thư mục gốc ổ giống nhau:** có `My Drive`, `Other computers`, `.shortcut-targets-by-id` (và `Shared drives` ở account có Drive dùng chung); tên thư mục My Drive hiện là `My Drive` trên cả hai máy.
+- **Hệ quả cho lane D:** (1) khóa theo token; (2) bước `Get-DriveFsAccounts` bỏ qua dòng có mount rỗng hoặc ổ chưa sẵn sàng nhưng vẫn báo được là "token có, chưa gắn"; (3) phương án dự phòng hộp chọn ổ một lần chỉ cần khi token của account đã chọn không có ở máy mới.
+
+## S11: chat Claude nhập với cwd đã ánh xạ sang thư mục khác — **ĐẠT (cả hai cách)**
+
+Chạy 2026-11-12 bằng `tools\spikes\S11-ClaudeCwdRemap.ps1` trên một profile Claude thử đã đăng nhập (profile riêng, không phải profile đang dùng), Claude Desktop 4.29. Chép một chat thật nhỏ (jsonl 169 KB, 40 dòng có trường `cwd`) thành hai chat thử với id mới, mỗi chat có thư mục dự án giả riêng; jsonl đặt dưới slug của cwd mới (`<slug>-S11-test-A`, `<slug>-S11-test-B`); trong local json chỉ viết lại `sessionId`, `cliSessionId`, `cwd`, `originCwd`, `title` (và đổi account/org sang của profile đích). Dọn sạch sau khi xong (script tự xóa chat, thư mục slug và thư mục giả).
+
+- **A: jsonl giữ nguyên cwd cũ** (40 dòng vẫn mang đường dẫn thư mục gốc ở máy nguồn). **B: mọi `"cwd"` trên các dòng jsonl được viết lại** sang thư mục mới.
+- **Chat hiện ra: có, cả A và B.** Trong danh sách Code, mỗi chat nằm dưới đúng tên thư mục mới (`S11-test-A`, `S11-test-B`), tức app lấy thư mục từ `cwd` trong local json, không từ jsonl.
+- **Mở được lịch sử: có, cả A và B** (người dùng xác nhận bằng mắt). Vậy app tìm jsonl theo slug của cwd mới và `cliSessionId`, và không so cwd trong từng dòng với cwd của chat.
+- **Chat tiếp (resume):** người dùng báo cả ba bước đạt, nhưng chỉ có bằng chứng trên đĩa cho **B**: jsonl của B tăng từ 169 KB lên 949 KB, có dòng mới mang `cwd` là `<root>\S11-test-B` (64 dòng, và 1 dòng dạng `<posix root>/S11-test-B`, tức Claude Code ghi cwd mới theo thư mục thật). Jsonl của A không tăng (170 KB, vẫn 40 dòng cwd cũ), nên **chưa có bằng chứng A được chat tiếp**. Chỉ biết A mở và đọc được.
+- **Trả lời câu "có phải viết lại cwd trong từng dòng jsonl không": không bắt buộc** để chat hiện và mở được lịch sử (A). Viết lại cũng không gây hại (B chat tiếp được). Trường liên quan trên mỗi dòng jsonl là `cwd` (khóa cấp cao nhất); dòng mới Claude Code ghi sau khi resume tự mang cwd mới. Khuyến nghị: không viết lại các dòng cũ (giữ nguyên native, ít rủi ro sửa nhầm), nhưng đặt jsonl dưới slug của cwd mới và viết lại `cwd`, `originCwd`, `workingDirectory` ở cấp cao nhất của local json.
+- **Lưu ý cho lane C:** cwd bên trong jsonl có thể khác `cwd` trong local json (chat đã đổi thư mục giữa chừng; mẫu thử là trường hợp này). Vì vậy không dùng cwd trong jsonl để suy ra slug; dùng cwd của local json, như `Find-ClaudeProjectDir` đang làm.
+- **Chưa kiểm:** resume chat A bằng cách gõ tin nhắn; chat có thư mục `<cli>\` (subagents, tool-results) khi đổi slug; cwd đích không tồn tại trên máy.
