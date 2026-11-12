@@ -171,10 +171,22 @@ foreach ($k in Get-MainTabKeys) {
         [void]$legacyList.Handle; $legacyList.Items[0].Selected = $true
     }
     if ($k -in 'codex', 'antigravity') { [void]$st.Profiles[$k].List.Handle }
-    Update-MainTab -Key $k
+    Update-MainTab -Key $k   # draws from the cache only: nothing is read until a button is pressed
+    if ($k -eq 'claude') { Save-PreviewForm -Form $form -Name 'tab-claude-not-loaded' -Page $st.Tabs.TabPages[$k] -Tabs $st.Tabs }
+    # What pressing Load chats / Refresh does.
+    if ($k -eq 'drive') { Invoke-MainRefresh -Tab 'drive' } else { Update-ChatPanel -Ctx $st.Panels[$k] -Load }
     if ($k -in 'claude', 'codex', 'antigravity') { $panelCtx = $st.Panels[$k]; if ($panelCtx.List.Items.Count) { $panelCtx.List.Items[1 % $panelCtx.List.Items.Count].Selected = $true } }
     Update-MainTabBadge
     Save-PreviewForm -Form $form -Name ("tab-$k") -Page $st.Tabs.TabPages[$k] -Tabs $st.Tabs
+    if ($k -eq 'claude') {   # a chosen sort (title, ascending) and filter (needs action)
+        $c = $st.Panels[$k]; $c.View.show = 'NeedsAction'; $c.View.sortColumn = 'Title'; $c.View.descending = $false
+        $c.ShowBox.SelectedItem = (Get-ChatShowChoices)['NeedsAction']; Update-ChatPanel -Ctx $c
+        Save-PreviewForm -Form $form -Name 'tab-claude-filtered' -Page $st.Tabs.TabPages[$k] -Tabs $st.Tabs
+    }
+    if ($k -eq 'drive') {   # the Drive tab with a harness filter and a sort by title
+        $dc = $st.Drive; $dc.HarnessBox.SelectedItem = 'Claude'; $dc.View.sortColumn = 'Title'; $dc.View.descending = $false; Update-SyncDriveTab -Ctx $dc
+        Save-PreviewForm -Form $form -Name 'tab-drive-filtered' -Page $st.Tabs.TabPages[$k] -Tabs $st.Tabs
+    }
 }
 $form.Dispose()
 

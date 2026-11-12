@@ -17,25 +17,28 @@ function Get-MainUiStyle {
     }
 }
 
-# Everything the window keeps between events: the form, the tab control, the panels, the cached picture of Drive.
+# Everything the window keeps between events: the form, the tab control, the panels, the picture of Drive, and the chats
+# already read per '<harness>|<profile id>' (Cache). All of it is in memory only; closing the app loses it.
 function Get-MainState {
     if (-not $script:MainUiState) {
-        $script:MainUiState = @{ Form = $null; Tabs = $null; Panels = @{}; Profiles = @{}; Drive = $null; Sync = $null; LocalChats = $null; Stale = @{}; Timers = @(); Installed = @{} }
+        $script:MainUiState = @{ Form = $null; Tabs = $null; Panels = @{}; Profiles = @{}; Drive = $null; Sync = $null; LocalChats = $null; Stale = @{}; Timers = @(); Installed = @{}
+                                 Cache = @{}; DriveStale = $false; ProfilesLoaded = @{} }
     }
     return $script:MainUiState
 }
 
-# What Drive says, read once and reused until the next refresh: Ready (sync works on this machine), Catalog (rows), State
-# (sync-state of this machine), Error. Never throws; a Drive that cannot be read is an Error and no catalog.
+# What Drive said the last time it was read: Ready (sync works on this machine), Catalog (rows), State (sync-state of this
+# machine), Error, Loaded. It never reads: before the first read there is a Loaded = $false answer with no catalog.
 function Get-MainSync {
     $st = Get-MainState
-    if (-not $st.Sync) { Update-MainCatalog }
-    return $st.Sync
+    if ($st.Sync) { return $st.Sync }
+    return @{ Ready = $false; Catalog = $null; State = @{}; Error = $null; At = $null; Loaded = $false }
 }
 
+# Reads the Drive catalog (small: index files only). Never throws; a Drive that cannot be read is an Error and no catalog.
 function Update-MainCatalog {
     $st = Get-MainState
-    $sync = @{ Ready = $false; Catalog = $null; State = @{}; Error = $null; At = Get-Date }
+    $sync = @{ Ready = $false; Catalog = $null; State = @{}; Error = $null; At = Get-Date; Loaded = $true }
     try {
         if (Test-SyncReady) {
             $sync.Ready = $true
@@ -45,7 +48,6 @@ function Update-MainCatalog {
         }
     } catch { $sync.Catalog = $null; $sync.Error = Get-SyncErrorMessage -Message $_.Exception.Message }
     $st.Sync = $sync
-    $st.LocalChats = $null
 }
 
 # ---- tab bookkeeping (pure) ----------------------------------------------------------------------------------------------
@@ -78,11 +80,13 @@ function Get-DriveTabText {
 function Update-MainTabBadge {
     $st = Get-MainState
     if (-not $st.Tabs) { return }
+    # Needs the catalog and the local chats the Drive tab last read; without them there is nothing to compare, so no dot.
     $statuses = @(Get-MainDriveViews | ForEach-Object { $_.Status })
     $st.Tabs.TabPages['drive'].Text = Get-DriveTabText -Badge (Get-DriveTabBadge -Statuses $statuses)
 }
 
-# Redraws the tab that is open when its data is stale (after a refresh); other tabs wait until they are opened.
+# Draws a tab from what is already in memory: no ListChats, no Drive. The profile list of a harness tab is read once, the
+# first time the tab is drawn, and again when an account is added.
 function Update-MainTab {
     param([string]$Key)
     $st = Get-MainState
@@ -90,18 +94,21 @@ function Update-MainTab {
     if (-not $Key) { $Key = [string]$st.Tabs.SelectedTab.Name }
     if ($Key -eq 'drive') { if ($st.Drive) { Update-SyncDriveTab -Ctx $st.Drive } }
     elseif ($st.Panels.ContainsKey($Key)) {
-        if ($st.Profiles.ContainsKey($Key)) { Update-HarnessProfilePanel -Ctx $st.Profiles[$Key] }
-        Update-ChatPanel -Ctx $st.Panels[$Key] -Reload
+        if ($st.Profiles.ContainsKey($Key) -and -not $st.ProfilesLoaded[$Key]) { Update-HarnessProfilePanel -Ctx $st.Profiles[$Key]; $st.ProfilesLoaded[$Key] = $true }
+        Update-ChatPanel -Ctx $st.Panels[$Key]
     }
-    $st.Stale[$Key] = $false
 }
 
-# Asks Drive again and redraws: the Refresh buttons and the end of a push or a pull.
+# What Refresh does on the tab that is open: on a harness tab the selected profile's chats and the catalog; on the Drive tab
+# the catalog and the chats of every installed profile (the only place that reads them all). Tab defaults to the open one.
 function Invoke-MainRefresh {
+    param([string]$Tab)
     $st = Get-MainState
-    Update-MainCatalog
-    foreach ($k in Get-MainTabKeys) { $st.Stale[$k] = $true }
-    try { Update-MainTab } catch { Write-HarnessLog "Main window: refresh failed: $($_.Exception.Message)" }
+    if (-not $Tab -and $st.Tabs) { $Tab = [string]$st.Tabs.SelectedTab.Name }
+    try {
+        if ($Tab -eq 'drive') { Update-MainCatalog; Read-MainLocalChats; $st.DriveStale = $false; if ($st.Drive) { Update-SyncDriveTab -Ctx $st.Drive } }
+        elseif ($st.Panels.ContainsKey($Tab)) { Update-ChatPanel -Ctx $st.Panels[$Tab] -Load }
+    } catch { Write-HarnessLog "Main window: refresh failed: $($_.Exception.Message)" }
     try { Update-MainTabBadge } catch { Write-HarnessLog "Main window: tab badge failed: $($_.Exception.Message)" }
 }
 
@@ -129,9 +136,10 @@ function New-HarnessProfilePanel {
     $head.Font = $s.Title; $head.ForeColor = $s.Ink; $head.AutoSize = $false
     $head.Location = New-Object System.Drawing.Point(8, 8); $head.Size = New-Object System.Drawing.Size(500, 28)
     $panel.Controls.Add($head)
-    $list.Location = New-Object System.Drawing.Point(8, 44); $list.Size = New-Object System.Drawing.Size(860, 88); $list.Anchor = 'Top,Left,Right,Bottom'
+    $list.Location = New-Object System.Drawing.Point(8, 44); $list.Size = New-Object System.Drawing.Size(860, 88); $list.Anchor = 'Top,Left'
     foreach ($c in @(@('Profile', 260), @('Status', 140), @('Account', 380))) { [void]$list.Columns.Add($c[0], $c[1]) }
     $panel.Controls.Add($list)
+    Set-MainRightEdge -Control $list -Margin 8 -Stretch
     $buttons = @{}
     $x = 8
     foreach ($n in (Get-ProfilePanelButtons -Adapter $Harness.Adapter)) {
@@ -212,7 +220,7 @@ function Add-HarnessTabContent {
     $chats = New-HarnessChatPanel -Harness $h -GetProfile $getProfile
     $Page.Controls.Add($chats.Panel); $Page.Controls.Add($profiles.Panel)
     $st.Panels[$Key] = $chats; $st.Profiles[$Key] = $profiles
-    $reload = New-MainDebounce -Action { if ((& $getProfile) -and [string](& $getProfile).Id -ne [string]$chats.Profile.Id) { Update-ChatPanel -Ctx $chats -Reload } }.GetNewClosure()
+    $reload = New-MainDebounce -Action { if ((& $getProfile) -and [string](& $getProfile).Id -ne [string]$chats.Profile.Id) { Update-ChatPanel -Ctx $chats } }.GetNewClosure()
     $profiles.List.Add_SelectedIndexChanged($reload)
 }
 
@@ -233,7 +241,7 @@ function Add-ClaudeTabContent {
     $Page.Controls.Add($chats.Panel); $Page.Controls.Add($legacy)
     $st.Panels['claude'] = $chats
     if ($lv) {
-        $reload = New-MainDebounce -Action { if ((& $getProfile) -and [string](& $getProfile).Id -ne [string]$chats.Profile.Id) { Update-ChatPanel -Ctx $chats -Reload } }.GetNewClosure()
+        $reload = New-MainDebounce -Action { if ((& $getProfile) -and [string](& $getProfile).Id -ne [string]$chats.Profile.Id) { Update-ChatPanel -Ctx $chats } }.GetNewClosure()
         $lv.Add_SelectedIndexChanged($reload)
     }
 }
@@ -277,15 +285,10 @@ function Convert-SwitcherToTabs {
         $tabs.Add_SelectedIndexChanged({
             Set-MainLastTab -Key $tabs.SelectedTab.Name
             if ($RefreshClaude -and $tabs.SelectedTab.Name -eq 'claude') { & $RefreshClaude }
-            $age = $(if ((Get-MainState).Sync) { ((Get-Date) - (Get-MainState).Sync.At).TotalSeconds } else { 9999 })
-            if ($age -gt 30) { Invoke-MainRefresh } else { Update-MainTab }
+            Update-MainTab
         }.GetNewClosure())
-        $boot = New-Object System.Windows.Forms.Timer
-        $boot.Interval = 300
-        $boot.Add_Tick({ $boot.Stop(); try { Invoke-MainRefresh } catch { Write-HarnessLog "Main window: first load failed: $($_.Exception.Message)" } }.GetNewClosure())
-        $st.Timers += $boot
-        $Form.Add_Shown({ $boot.Start() }.GetNewClosure())
         $Form.ResumeLayout($true)
+        try { Update-MainTab } catch { Write-HarnessLog "Main window: first draw failed: $($_.Exception.Message)" }
     } catch {
         try { Write-HarnessLog "Tabbed main window failed, the old window stays: $($_.Exception.Message)" } catch { }
         try { Restore-SwitcherForm -Form $Form -Snapshot $snap } catch { }
