@@ -3026,7 +3026,7 @@ $null       = Add-MenuItem $menu 'Rename...'              { Invoke-RenameProfile
 $null       = Add-MenuItem $menu 'Add shortcuts'          { Invoke-AddShortcuts }
 $null       = Add-MenuItem $menu 'Transfer Code chats...' { $btnTransfer.PerformClick() }
 # >>> harness-ui-menu
-if (Get-Command Show-HarnessExportDialog -ErrorAction SilentlyContinue) { $null = Add-MenuItem $menu 'Export chat for handoff...' { Show-HarnessExportDialog -Source (Get-SelectedProfile) } }
+if (Get-Command Show-SwitcherTab -ErrorAction SilentlyContinue) { $null = Add-MenuItem $menu 'Chats and Drive...' { Show-SwitcherTab -Harness claude } }
 # <<< harness-ui-menu
 $null       = Add-MenuItem $menu 'Open folder'            { Invoke-OpenFolder }
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
@@ -3108,7 +3108,7 @@ $trayMenu.Add_Opening({
     $trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
     $null = Add-MenuItem $trayMenu 'Add account...' { Invoke-AddAccount }
     # >>> harness-ui-tray
-    if (Get-Command Show-HarnessExportDialog -ErrorAction SilentlyContinue) { $null = Add-MenuItem $trayMenu 'Export chat for handoff...' { Show-HarnessExportDialog } }
+    if (Get-Command Show-SwitcherTab -ErrorAction SilentlyContinue) { $null = Add-MenuItem $trayMenu 'Chats and Drive...' { Show-SwitcherTab } }
     if (Get-Command Add-HarnessTrayItems -ErrorAction SilentlyContinue) { Add-HarnessTrayItems -Menu $trayMenu }
     # <<< harness-ui-tray
     $null = Add-MenuItem $trayMenu 'Open switcher' { Show-Switcher }
@@ -3193,6 +3193,9 @@ if (-not (Test-SignInRoutingOn) -and (Test-Path -LiteralPath (Get-RouterRegistry
     try { if ((Get-LinkHandlerProgId) -ne $script:RouterProgId) { Unregister-SignInRouter | Out-Null } } catch { }
 }
 
+# >>> harness-ui-main
+if (Get-Command Convert-SwitcherToTabs -ErrorAction SilentlyContinue) { Convert-SwitcherToTabs -Form $form -RefreshClaude { Update-List } }
+# <<< harness-ui-main
 $script:ExitRequested = $false
 $notify.Visible = $true
 Update-List -Force

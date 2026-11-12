@@ -218,8 +218,7 @@ function Invoke-SyncTrayAction {
     try {
         switch ($Action) {
             'setup' { [void](Show-SyncSetupWizard) }
-            'push'  { Show-HarnessExportDialog -Mode push }
-            'pull'  { Show-HarnessExportDialog -Mode pull }
+            { $_ -in 'push', 'pull' } { Show-SwitcherTab -Harness drive }
         }
     } catch { Show-Message (Get-SyncErrorMessage -Message $_.Exception.Message) 'Drive sync' 'OK' 'Error' | Out-Null }
 }

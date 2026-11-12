@@ -53,11 +53,11 @@ try {
     $realAst = [Management.Automation.Language.Parser]::ParseFile($real, [ref]$null, [ref]$errors)
     Assert (-not $errors.Count) "real dist does not parse: $($errors | Out-String)"
     $realNames = @($realAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
-    foreach ($n in 'Register-Harnesses', 'Register-ClaudeHarness', 'Show-HarnessExportDialog', 'Copy-CodeSession') { Assert ($realNames -contains $n) "real dist lacks $n" }
+    foreach ($n in 'Register-Harnesses', 'Register-ClaudeHarness', 'Show-HarnessMoveDialog', 'Convert-SwitcherToTabs', 'Copy-CodeSession') { Assert ($realNames -contains $n) "real dist lacks $n" }
     $realText = [IO.File]::ReadAllText($real)
     Assert ($realText -notmatch 'Get-ChildItem -LiteralPath "\$PSScriptRoot\\src"') 'real dist still dot-sources src\'
     $src = [IO.File]::ReadAllText((Join-Path $root 'ClaudeSwitcher.ps1'))
-    foreach ($tag in 'harness-src', 'harness-register', 'harness-install', 'harness-ui-menu', 'harness-ui-tray') {
+    foreach ($tag in 'harness-src', 'harness-register', 'harness-install', 'harness-ui-menu', 'harness-ui-tray', 'harness-ui-main') {
         Assert ($src.Contains("# >>> $tag") -and $src.Contains("# <<< $tag")) "hook block $tag missing in ClaudeSwitcher.ps1"
     }
 

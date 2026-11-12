@@ -1,5 +1,5 @@
-# Ui.Harness.ps1 - handoff files and the "Export chat for handoff" dialog. The functions at the top
-# are plain file work (tested without a window); Show-HarnessExportDialog is the only WinForms code.
+# Ui.Harness.ps1 - handoff files, moving a chat between profiles, and the two small dialogs of the chat list (move, diverged).
+# The functions at the top are plain file work (tested without a window); the dialogs at the end are the only WinForms code.
 # Uses $script:SwitcherHome and the colours/fonts of ClaudeSwitcher.ps1. Needs Harness.Core.ps1.
 # This file stays ASCII-only like the rest of the script, so the opening prompt is in English.
 
@@ -168,133 +168,6 @@ function Get-HarnessTransferMessage {
     }
 }
 
-function Show-HarnessExportDialog {
-    param($Source, [string]$Mode = '')
-    $sources = @(Get-HarnessTransferSources)
-    if (-not $sources.Count) { return }
-    $targets = @(Get-HarnessTransferTargets)
-    # Google Drive is one more source (pull) and one more target (push) once sync works on this machine.
-    $syncReady = [bool]((Get-Command Test-SyncReady -ErrorAction SilentlyContinue) -and (Test-SyncReady))
-    $entries = @(Get-SyncDialogTargets -Targets $targets -SyncReady $syncReady)
-    $state = @{ Harness = $sources[0]; Profiles = @(); Drive = $false }
-
-    $dlg               = New-Object System.Windows.Forms.Form
-    $dlg.Text          = 'Move or hand off a chat'
-    $dlg.Size          = New-Object System.Drawing.Size(620, 520)
-    $dlg.MinimumSize   = New-Object System.Drawing.Size(480, 420)
-    $dlg.StartPosition = 'CenterParent'
-    $dlg.ShowInTaskbar = $false
-    $dlg.MinimizeBox   = $false
-    $dlg.BackColor     = $bg
-    $dlg.Font          = $fontUI
-
-    $sourceBox               = New-Object System.Windows.Forms.ComboBox
-    $sourceBox.DropDownStyle = 'DropDownList'
-    $sourceBox.Location      = New-Object System.Drawing.Point(16, 14)
-    $sourceBox.Size          = New-Object System.Drawing.Size(120, 26)
-    foreach ($s in $sources) { $sourceBox.Items.Add((Get-HarnessDisplayName $s)) | Out-Null }
-    if ($syncReady) { $sourceBox.Items.Add('Google Drive') | Out-Null }
-    $dlg.Controls.Add($sourceBox)
-
-    $profileBox               = New-Object System.Windows.Forms.ComboBox
-    $profileBox.DropDownStyle = 'DropDownList'
-    $profileBox.Location      = New-Object System.Drawing.Point(146, 14)
-    $profileBox.Size          = New-Object System.Drawing.Size(440, 26)
-    $profileBox.Anchor        = 'Top,Left,Right'
-    $dlg.Controls.Add($profileBox)
-
-    $chatList          = New-Object System.Windows.Forms.ListBox
-    $chatList.Location = New-Object System.Drawing.Point(16, 50)
-    $chatList.Size     = New-Object System.Drawing.Size(570, 270)
-    $chatList.Anchor   = 'Top,Left,Right,Bottom'
-    $dlg.Controls.Add($chatList)
-
-    $targetBox               = New-Object System.Windows.Forms.ComboBox
-    $targetBox.DropDownStyle = 'DropDownList'
-    $targetBox.Location      = New-Object System.Drawing.Point(16, 330)
-    $targetBox.Size          = New-Object System.Drawing.Size(570, 26)
-    $targetBox.Anchor        = 'Left,Right,Bottom'
-    foreach ($e in $entries) {
-        $targetBox.Items.Add($(switch ($e.Kind) { 'file' { 'Handoff file only (no target)' } 'drive' { 'Google Drive (push, encrypted)' } default { '{0} / {1}' -f (Get-HarnessDisplayName (Get-Harness -Name $e.Profile.Harness)), $e.Profile.Name } })) | Out-Null
-    }
-    $dlg.Controls.Add($targetBox)
-
-    $note           = New-Object System.Windows.Forms.Label
-    $note.ForeColor = $ink
-    $note.Location  = New-Object System.Drawing.Point(16, 364)
-    $note.Size      = New-Object System.Drawing.Size(570, 40)
-    $note.Anchor    = 'Left,Right,Bottom'
-    $dlg.Controls.Add($note)
-
-    $go          = New-Object System.Windows.Forms.Button
-    $go.Text     = 'Go'
-    $go.Location = New-Object System.Drawing.Point(16, 416)
-    $go.Size     = New-Object System.Drawing.Size(108, 34)
-    $go.Anchor   = 'Left,Bottom'
-    $dlg.Controls.Add($go)
-
-    $refreshNote = {
-        $note.Text = 'Writes a bundle and a handoff file under the switcher folder. A handoff also copies an opening prompt to the clipboard.'
-        $e = $entries[[Math]::Max(0, $targetBox.SelectedIndex)]
-        if ($state.Drive) { $note.Text = 'Pick a chat from Drive and the profile that should receive it. A chat that changed on both machines arrives as a new chat.' }
-        elseif ($e.Kind -eq 'drive') { $note.Text = 'Pushes an encrypted copy of the chat to your Drive sync folder. Pull it on another machine from the same dialog.' }
-        elseif ($e.Kind -eq 'profile') {
-            $kind = switch (Resolve-TransferMode -Source $state.Harness.Name -Target $e.Profile.Harness) {
-                'native'       { 'Native copy: the chat keeps its history and can be resumed in the target.' }
-                'codex-import' { "Codex's own importer: the Claude chat becomes a Codex chat." }
-                default        { 'Handoff: the target starts a new chat from the transcript.' }
-            }
-            $note.Text = "Kind: $kind"
-        }
-    }
-    $loadProfiles = {
-        $state.Drive = [bool]($syncReady -and $sourceBox.SelectedIndex -eq $sources.Count)
-        $profileBox.Enabled = -not $state.Drive
-        if ($state.Drive) {
-            $profileBox.Items.Clear(); $chatList.Items.Clear(); $chatList.Tag = @()
-            $chatList.Tag = @(Get-SyncCatalogForDialog)
-            foreach ($row in $chatList.Tag) { $chatList.Items.Add((Get-SyncCatalogLine -Row $row)) | Out-Null }
-            & $refreshNote; return
-        }
-        $state.Harness = $sources[[Math]::Max(0, $sourceBox.SelectedIndex)]
-        $state.Profiles = @(& $state.Harness.Adapter.GetProfiles)
-        $profileBox.Items.Clear()
-        foreach ($p in $state.Profiles) { $profileBox.Items.Add($p.Name) | Out-Null }
-        if ($state.Profiles.Count) {
-            $pick = 0
-            if ($Source -and $state.Harness.Name -eq 'claude') { for ($i = 0; $i -lt $state.Profiles.Count; $i++) { if ($state.Profiles[$i].Id -eq $Source.Id) { $pick = $i } } }
-            $profileBox.SelectedIndex = $pick
-        } else { $chatList.Items.Clear(); $chatList.Tag = @() }
-        & $refreshNote
-    }
-    $sourceBox.Add_SelectedIndexChanged($loadProfiles)
-    $targetBox.Add_SelectedIndexChanged($refreshNote)
-    $profileBox.Add_SelectedIndexChanged({
-        $chatList.Items.Clear()
-        if ($profileBox.SelectedIndex -lt 0) { return }
-        try { $chatList.Tag = @(& $state.Harness.Adapter.ListChats $state.Profiles[$profileBox.SelectedIndex]) }
-        catch { $chatList.Tag = @(); Show-Message "Could not list chats: $($_.Exception.Message)" 'Move or hand off a chat' 'OK' 'Error' | Out-Null; return }
-        foreach ($c in $chatList.Tag) { $chatList.Items.Add(('{0}   ({1})' -f $c.Title, $(if ($c.PSObject.Properties['HasRollout'] -and -not $c.HasRollout) { 'chat file no longer on disk' } elseif ($c.Cwd) { Split-Path $c.Cwd -Leaf } else { 'no folder' }))) | Out-Null }
-    })
-    $go.Add_Click({
-        if ($chatList.SelectedIndex -lt 0) { return }
-        $item = $chatList.Tag[$chatList.SelectedIndex]
-        if ($item.PSObject.Properties['HasRollout'] -and -not $item.HasRollout) { Show-Message 'The file of this chat is no longer on disk, so it cannot be moved.' 'Move or hand off a chat' 'OK' 'Warning' | Out-Null; return }
-        $src = $(if ($state.Drive) { @{ Kind = 'drive' } } else { @{ Kind = 'harness'; Harness = $state.Harness.Name; Profile = $state.Profiles[[Math]::Max(0, $profileBox.SelectedIndex)] } })
-        $askRoot = { param($rootName) Read-SyncFolder -Description "Where is the folder '$rootName' on this machine? The chat's working folder is inside it." }
-        $onDiverged = { param($row, $chat) Show-SyncDivergedDialog -Row $row -Chat $chat }
-        $r = Invoke-HarnessDialogAction -Source $src -TargetEntry $entries[[Math]::Max(0, $targetBox.SelectedIndex)] -Item $item -AskRoot $askRoot -OnDiverged $onDiverged
-        if ($r.Prompt) { [System.Windows.Forms.Clipboard]::SetText($r.Prompt) }
-        $level = switch ($r.Kind) { 'error' { 'Error' } 'warning' { 'Warning' } default { 'Information' } }
-        Show-Message ((@($r.Text, $r.Where) | Where-Object { $_ }) -join "`r`n`r`n") $(if ($r.Kind -eq 'message') { 'Done' } else { 'Move or hand off a chat' }) 'OK' $level | Out-Null
-    })
-
-    if ($Mode -eq 'push') { for ($i = 0; $i -lt $entries.Count; $i++) { if ($entries[$i].Kind -eq 'drive') { $targetBox.SelectedIndex = $i } } } else { $targetBox.SelectedIndex = 0 }
-    $sourceBox.SelectedIndex = $(if ($Mode -eq 'pull' -and $syncReady) { $sources.Count } else { 0 })
-    [void]$dlg.ShowDialog()
-    $dlg.Dispose()
-}
-
 # ---- dialogs of lane V3 (phase 5) ---------------------------------------------------------------------------------------
 
 # One sentence under the target list of the move dialog: what will happen to the chat (Resolve-TransferMode's answer).
@@ -357,13 +230,20 @@ function Show-SyncDivergedDialog {
 
 # Move one chat to any profile of any installed harness. Returns @{ Result; Target } of the transfer, or $null when the
 # user cancels. A failed transfer is shown here and the window stays open.
+# The profiles a chat can move to: every profile except the one it is in.
+function Get-HarnessMoveTargets {
+    param([Parameter(Mandatory)]$Chat, [Parameter(Mandatory)][string]$SourceHarness, [array]$Targets = @())
+    $own = $(if ($Chat.PSObject.Properties['Profile'] -and $Chat.Profile) { [string]$Chat.Profile.Id } else { '' })
+    return @($Targets | Where-Object { -not ($own -and [string]$_.Harness -eq $SourceHarness -and [string]$_.Id -eq $own) })
+}
+
 function Show-HarnessMoveDialog {
     param([Parameter(Mandatory)]$Chat, [Parameter(Mandatory)][string]$SourceHarness)
     Add-Type -AssemblyName System.Windows.Forms
-    $targets = @(Get-HarnessTransferTargets)
+    $targets = @(Get-HarnessMoveTargets -Chat $Chat -SourceHarness $SourceHarness -Targets @(Get-HarnessTransferTargets))
     $dlg = New-Object System.Windows.Forms.Form
-    $dlg.Text = 'Move to...'; $dlg.Size = New-Object System.Drawing.Size(520, 400); $dlg.MinimumSize = New-Object System.Drawing.Size(420, 340)
-    $dlg.StartPosition = 'CenterParent'; $dlg.ShowInTaskbar = $false; $dlg.MinimizeBox = $false
+    $dlg.Text = 'Move to...'; $dlg.Size = New-Object System.Drawing.Size(520, 400); $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.StartPosition = 'CenterParent'; $dlg.ShowInTaskbar = $false; $dlg.MinimizeBox = $false; $dlg.MaximizeBox = $false
     $dlg.BackColor = $bg; $dlg.Font = $fontUI
     $list = New-Object System.Windows.Forms.ListBox
     $list.Location = New-Object System.Drawing.Point(16, 16); $list.Size = New-Object System.Drawing.Size(470, 230); $list.Anchor = 'Top,Left,Right,Bottom'
