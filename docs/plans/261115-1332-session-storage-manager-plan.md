@@ -179,9 +179,9 @@ Q1–Q11 nằm trong spec §9. Thêm các câu sau:
 |---|---|---|
 | US1 | Sau SP-7 | Mở profile `spike*`. Xác nhận phiên đã cắt hiện, mở được và gửi tiếp được một tin (S14) |
 | US2 | Sau SP-3 | Theo các bước trong file kết quả spike: mở Antigravity với conversation thử đã bị gỡ và được khôi phục, rồi báo app hiện gì (S17) |
-| US3 | Sau U1 land và cài | Mở tab Storage, bấm Scan. Kiểm tra số liệu hợp lý so với Explorer và thời gian quét |
+| US3 | Sau U1 land và cài | Mở tab Storage, bấm Scan. Kiểm tra số liệu hợp lý so với Explorer và thời gian quét. Lưu ý: một terminal Claude Code mở ở thư mục chung (thư mục home, gốc ổ đĩa) làm mọi phiên Claude bên dưới thư mục đó hiện là bị chặn ("A Claude CLI is running in the folder of this session."); đóng terminal đó rồi Scan lại |
 | US4 | Sau U1 | Chọn thư mục archive (local hoặc Drive) |
-| US5 | Sau U1 | Archive 1–2 phiên cũ của mỗi app, kiểm tra chúng biến khỏi app. Restore lại, kiểm tra chúng hiện lại trong Claude Desktop, Codex và Antigravity |
+| US5 | Sau U1 | Archive 1–2 phiên cũ của mỗi app, kiểm tra chúng biến khỏi app. Restore lại, kiểm tra chúng hiện lại trong Claude Desktop, Codex và Antigravity. Trước khi làm, đóng các terminal Claude Code đang mở ở thư mục chung (home, gốc ổ đĩa), nếu không mọi phiên Claude bên dưới sẽ bị bỏ qua kèm lý do "A Claude CLI is running in the folder of this session." Antigravity: sau khi archive, conversation vẫn còn trong danh sách của app ở trạng thái "Conversation unavailable" cho tới khi restore |
 | US6 | Sau U1 | Delete một phiên rác, kiểm tra phiên đó nằm trong Recycle Bin |
 | US7 | Sau U1 | Summarize một phiên: đọc hộp xác nhận chi phí, đồng ý, mở `summary.md`, thử "Start a new chat from this summary" |
 | US8 | Sau U1, nếu trim tại chỗ được bật | Trim một phiên lớn, mở lại và chat tiếp |
