@@ -201,5 +201,46 @@ try {
     $dr = @(Invoke-StorageTrim -Sessions @((New-ClaudeFiles 'c9')) -Target @{ Kind = 'drive'; SyncRoot = $tmp; MachineId = $machine; Key = [byte[]](1..32); PathMap = @{} } -Mode ReadOnlyCopy -MachineId $machine)
     Assert (-not $dr[0].Ok -and $dr[0].Reason -like 'store-unsupported*') 'a Drive store is refused for the read-only copy, with a reason'
 
+    # ---- R2-1: only a UTF-8 .txt/.log file of tool-results is cut as text ------------------------------------------------------------
+    $bigBin = New-Object byte[] 30000; for ($i = 0; $i -lt $bigBin.Length; $i++) { $bigBin[$i] = [byte](($i * 7 + 3) % 251 + 1) }   # no NUL, but not a text file
+    $latin = New-Object byte[] 30000; for ($i = 0; $i -lt $latin.Length; $i++) { $latin[$i] = 0x41 }; $latin[100] = 0xE9; $latin[101] = 0xFF   # invalid UTF-8
+    $withNul = New-Object byte[] 30000; for ($i = 0; $i -lt $withNul.Length; $i++) { $withNul[$i] = 0x41 }; $withNul[5000] = 0
+    $jsonBig = $utf8.GetBytes('{"a":"' + ('J' * 30000) + '"}')
+    $rdir = Join-Path $tmp 'w-r21\projects\C--work-alpha\r21\tool-results'
+    Write-Bytes (Join-Path $rdir 'shot.png') $bigBin; Write-Bytes (Join-Path $rdir 'data.json') $jsonBig; Write-Bytes (Join-Path $rdir 'latin.txt') $latin
+    Write-Bytes (Join-Path $rdir 'zero.txt') $withNul; Write-Bytes (Join-Path $rdir 'doc.pdf') $bigBin; Write-Bytes (Join-Path $rdir 'good.txt') ($utf8.GetBytes('G' * 30000)); Write-Bytes (Join-Path $rdir 'run.log') ($utf8.GetBytes('H' * 30000))
+    $r21 = [pscustomobject]@{ Harness = 'claude'; Parts = @(@{ Role = 'cli-dir'; Path = (Split-Path $rdir); Kind = 'dir'; Bytes = 1; MTimeTicks = 1; ProfileId = ''; Files = 7 }) }
+    $names = @(Get-StorageTrimTargets -Session $r21 | ForEach-Object { Split-Path -Leaf $_.Path } | Sort-Object)
+    Assert (($names -join ',') -eq 'good.txt,latin.txt,run.log,zero.txt') "only .txt and .log files are candidates, not images, pdf or json: $($names -join ',')"
+    foreach ($nm in 'latin.txt', 'zero.txt') {
+        $o = Join-Path $tmp "r21-$nm"; $st = ConvertTo-TrimmedTextFile -Path (Join-Path $rdir $nm) -OutPath $o -Key 'claude:r21'
+        Assert ($st.Items -eq 0 -and (Get-Sha (Join-Path $rdir $nm)) -eq (Get-Sha $o)) "$nm (not UTF-8, or has a NUL) is not cut and comes out byte for byte"
+    }
+    foreach ($nm in 'shot.png') {   # a binary file does not decode as UTF-8 text, so it is not cut even if handed over (json is kept out by the extension filter above)
+        $o = Join-Path $tmp "r21-$nm"; $st = ConvertTo-TrimmedTextFile -Path (Join-Path $rdir $nm) -OutPath $o -Key 'claude:r21'
+        Assert ($st.Items -eq 0 -and (Get-Sha (Join-Path $rdir $nm)) -eq (Get-Sha $o)) "$nm keeps every byte"
+    }
+    $g = ConvertTo-TrimmedTextFile -Path (Join-Path $rdir 'good.txt') -OutPath (Join-Path $tmp 'r21-good.txt') -Key 'claude:r21'
+    Assert ($g.Items -eq 1 -and (Get-Item (Join-Path $tmp 'r21-good.txt')).Length -lt 3300) 'a big UTF-8 .txt file is cut'
+
+    # ---- R2-2: nothing to cut means no archive, no trim.json, no index row, an untouched file ------------------------------------------
+    $smallLines = $n1 + $n2 + $n5
+    $ns = New-ClaudeFiles 'ns1'; Write-Bytes $ns.Parts[0].Path ($utf8.GetBytes($smallLines)); (Get-Item $ns.Parts[0].Path).LastWriteTimeUtc = $old; $nsBefore = Get-Sha $ns.Parts[0].Path
+    $res = @(Invoke-StorageTrim -Sessions @($ns) -Target $target -Mode InPlace -MachineId $machine)
+    Assert ($res[0].Ok -and $res[0].Mode -eq 'InPlace' -and $res[0].Items -eq 0 -and $res[0].Reason -like '*nothing to trim*') "no big output: Ok, with 'nothing to trim': $($res[0].Reason)"
+    $zdir = Join-Path $store ('claude\' + (Get-Date -Format 'yyyy-MM'))
+    Assert (-not (Test-Path (Join-Path $zdir 'claude_ns1.harchive.zip')) -and -not (Test-Path (Join-Path $zdir 'claude_ns1.trim.json'))) 'no zip and no trim.json were made'
+    Assert (@(Get-StorageArchiveIndex -Target $target | Where-Object { $_.key -eq 'claude:ns1' }).Count -eq 0) 'and no index row'
+    Assert ((Get-Sha $ns.Parts[0].Path) -eq $nsBefore -and (Get-Item $ns.Parts[0].Path).LastWriteTimeUtc -eq $old -and @(Get-ChildItem (Split-Path $ns.Parts[0].Path) -Filter '*.trim-*').Count -eq 0) 'the file is the same bytes with the same time, and no tmp is left'
+    # a real archive of the session already in the store is not overwritten by a nothing-to-trim run
+    $cdone = New-ClaudeFiles 'ns2'; $res = @(Invoke-StorageTrim -Sessions @($cdone) -Target $target -Mode InPlace -MachineId $machine)
+    $zip2 = Join-Path $zdir 'claude_ns2.harchive.zip'; $zipBefore = Get-Sha $zip2
+    $res = @(Invoke-StorageTrim -Sessions @($cdone) -Target $target -Mode InPlace -MachineId $machine)
+    Assert ($res[0].Ok -and $res[0].Items -eq 0 -and (Get-Sha $zip2) -eq $zipBefore) 'a second trim of an already cut session leaves the first archive as it is'
+    # the file changes between the cut and the swap: it is left alone and the archive still exists
+    $cx4 = New-ClaudeFiles 'ns3'; $path4 = $cx4.Parts[0].Path
+    $res = @(& { function Save-StorageSafetyArchive { [IO.File]::AppendAllText($path4, "`n"); return @{ ZipPath = 'x'; Dir = $null } }; Invoke-StorageTrim -Sessions @($cx4) -Target $target -Mode InPlace -MachineId $machine })
+    Assert (-not $res[0].Ok -and $res[0].Reason -like '*changed-while-trimming*' -and @(Get-ChildItem (Split-Path $path4) -Filter '*.trim-*').Count -eq 0) 'a file written to after the cut is not replaced, and no tmp is left'
+
     Write-Output 'PASS: Storage.Compact - limits, Claude jsonl, text files, Codex rollout, Invoke-StorageTrim.'
 } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }

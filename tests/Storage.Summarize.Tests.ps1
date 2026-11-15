@@ -124,5 +124,24 @@ try {
     $c2 = @(Invoke-StorageSummarize -Sessions @((New-Chat 'd1'), (New-Chat 'd2')) -Target $target -MachineId $machine -Confirmed -Runner $stopper -Available @('claude') -CancelToken $cancel)
     Assert ($c2.Count -eq 1 -and $script:M -eq 1) 'Cancel stops before the next session, not in the middle of one'
 
+    # ---- R2-3: the PID of the CLI child goes to Progress.ChildPids, so Stop can kill it ------------------------------------------------
+    $seenProg = @(); $spy = { param($Tool, $Prompt, $WorkDir, $TimeoutSec, $Progress) $script:SeenProg = $Progress; '## ok' }
+    $progR = [hashtable]::Synchronized(@{ Done = 0; Total = 1 })
+    $rr = @(Invoke-StorageSummarize -Sessions @((New-Chat 'p1')) -Target $target -MachineId $machine -Confirmed -Runner $spy -Available @('claude') -Progress $progR)
+    Assert ($rr[0].Ok -and [object]::ReferenceEquals($script:SeenProg, $progR)) 'the runner is given the same Progress'
+    $prog2 = [hashtable]::Synchronized(@{ Done = 0 })
+    $helperText = ${function:Invoke-StorageProcessWithTimeout}.ToString()
+    $rsp = [powershell]::Create(); $rsp.Runspace.SessionStateProxy.SetVariable('prog', $prog2); $rsp.Runspace.SessionStateProxy.SetVariable('ps', $ps); $rsp.Runspace.SessionStateProxy.SetVariable('wd', $tmp)
+    [void]$rsp.AddScript("function Invoke-StorageProcessWithTimeout { $helperText }; Invoke-StorageProcessWithTimeout -FilePath `$ps -Arguments '-NoProfile -Command ""Start-Sleep 60""' -StdIn '' -WorkDir `$wd -TimeoutSec 120 -Progress `$prog")
+    $async = $rsp.BeginInvoke()
+    $pidSeen = $null; $until = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $until -and -not $pidSeen) { $l = $prog2['ChildPids']; if ($l -and @($l).Count) { $pidSeen = [int]@($l)[0] } else { Start-Sleep -Milliseconds 100 } }
+    Assert ($pidSeen -and (Get-Process -Id $pidSeen -ErrorAction SilentlyContinue)) 'while the tool runs its PID is in Progress.ChildPids and the process is alive'
+    & taskkill.exe /PID $pidSeen /T /F 2>&1 | Out-Null    # what the Stop button of the UI lane does
+    [void]$async.AsyncWaitHandle.WaitOne(30000)
+    Assert (-not (Get-Process -Id $pidSeen -ErrorAction SilentlyContinue) -and $async.IsCompleted) 'taskkill /T /F on that PID stops the tool and the call returns'
+    Assert (@($prog2['ChildPids']).Count -eq 0) 'and the PID is taken out of the list once the call is over'
+    $rsp.Dispose()
+
     Write-Output 'PASS: Storage.Summarize - gate, plan, commands, process helper, confirmation, redaction, batch.'
 } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }

@@ -122,12 +122,17 @@ function ConvertTo-TrimmedCodexRollout {
     return (Convert-StorageJsonlFile -Path $Path -OutPath $OutPath -Transform { param($l) ConvertTo-StorageTrimmedCodexLine -Line $l -Key $Key }.GetNewClosure())
 }
 
-# A plain text file of <cli>\tool-results\ : the same rule on the whole text.
+# A plain text file of <cli>\tool-results\ : the same rule on the whole text. Only a strict UTF-8 text file is cut: one with a NUL
+# byte or bytes that do not decode (an image, a pdf, another encoding) is copied as it is.
 function ConvertTo-TrimmedTextFile {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$OutPath, [Parameter(Mandatory)][string]$Key)
     $utf8 = New-Object Text.UTF8Encoding($false)
+    $strict = New-Object Text.UTF8Encoding($false, $true)
     $before = [long](New-Object IO.FileInfo $Path).Length
-    $r = Get-StorageTrimmedText -Text ([IO.File]::ReadAllText($Path, $utf8)) -Key $Key
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $text = $null
+    if ([Array]::IndexOf($bytes, [byte]0) -lt 0) { try { $text = $strict.GetString($bytes) } catch { $text = $null } }
+    $r = $(if ($null -ne $text) { Get-StorageTrimmedText -Text $text -Key $Key } else { @{ Cut = $false } })
     if ($r.Cut) { [IO.File]::WriteAllText($OutPath, $r.Text, $utf8) } else { [IO.File]::Copy($Path, $OutPath, $true) }
     return @{ Lines = 1; Changed = [int]$r.Cut; Items = [int]$r.Cut; BytesBefore = $before; BytesAfter = [long](New-Object IO.FileInfo $OutPath).Length }
 }
@@ -143,7 +148,7 @@ function Get-StorageTrimTargets {
         if ($Session.Harness -eq 'claude' -and $p.Role -eq 'transcript') { $list.Add(@{ Path = $path; Kind = 'claude-jsonl' }) }
         elseif ($Session.Harness -eq 'codex' -and $p.Role -eq 'rollout') { $list.Add(@{ Path = $path; Kind = 'codex-rollout' }) }
         elseif ($Session.Harness -eq 'claude' -and $p.Role -eq 'cli-dir' -and [IO.Directory]::Exists((Join-Path $path 'tool-results'))) {
-            foreach ($f in @(Get-StorageFilesRecursive -Path (Join-Path $path 'tool-results'))) { if ($f.Length -gt (Get-StorageTrimLimits).Threshold) { $list.Add(@{ Path = $f.FullName; Kind = 'text' }) } }
+            foreach ($f in @(Get-StorageFilesRecursive -Path (Join-Path $path 'tool-results'))) { if ($f.Length -gt (Get-StorageTrimLimits).Threshold -and $f.Extension -in '.txt', '.log') { $list.Add(@{ Path = $f.FullName; Kind = 'text' }) } }
         }
     }
     return $list.ToArray()
@@ -215,9 +220,9 @@ function Write-StorageSidecar {
 
 # ---- trim ---------------------------------------------------------------------------------------------------------------------------------
 
-# Cuts one file into a tmp file next to it and swaps it in (File.Replace), keeping its modified time. A file that changed
-# while it was cut is left alone. Returns the stats, with Items = 0 when nothing was swapped.
-function Convert-StorageFileInPlace {
+# Step 1 of cutting one file: the cut goes into a tmp file next to it. Returns @{ Path; Tmp; Mtime; Len; Stats; Worth }, Worth is
+# true only when something was cut and the result is smaller. The original is not touched.
+function New-StorageTrimTmp {
     param([Parameter(Mandatory)]$Target, [Parameter(Mandatory)][string]$Key)
     $path = [string]$Target.Path
     $info = New-Object IO.FileInfo $path; $mtime = $info.LastWriteTimeUtc; $len = $info.Length
@@ -228,26 +233,46 @@ function Convert-StorageFileInPlace {
             'codex-rollout' { ConvertTo-TrimmedCodexRollout -Path $path -OutPath $tmp -Key $Key }
             default { ConvertTo-TrimmedTextFile -Path $path -OutPath $tmp -Key $Key }
         }
-        if (-not $st.Items -or $st.BytesAfter -ge $st.BytesBefore) { $st.Items = 0; return $st }
-        $now = New-Object IO.FileInfo $path
-        if ($now.Length -ne $len -or $now.LastWriteTimeUtc -ne $mtime) { throw 'changed-while-trimming: the file was written to while it was being cut, so it was left alone.' }
-        (New-Object IO.FileInfo $tmp).LastWriteTimeUtc = $mtime
-        [IO.File]::Replace($tmp, $path, [NullString]::Value)
-        return $st
-    } finally { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } }
+    } catch { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }; throw }
+    $worth = [bool]($st.Items -and $st.BytesAfter -lt $st.BytesBefore)
+    if (-not $worth) { [IO.File]::Delete($tmp); $tmp = $null; $st.Items = 0 }
+    return @{ Path = $path; Tmp = $tmp; Mtime = $mtime; Len = $len; Stats = $st; Worth = $worth }
 }
 
+# Step 2: swaps the tmp file in (File.Replace), keeping the modified time. A file that changed since step 1 is left alone.
+function Complete-StorageTrimTmp {
+    param([Parameter(Mandatory)]$Cut)
+    $now = New-Object IO.FileInfo $Cut.Path
+    if ($now.Length -ne $Cut.Len -or $now.LastWriteTimeUtc -ne $Cut.Mtime) { throw 'changed-while-trimming: the file was written to while it was being cut, so it was left alone.' }
+    (New-Object IO.FileInfo $Cut.Tmp).LastWriteTimeUtc = $Cut.Mtime
+    [IO.File]::Replace($Cut.Tmp, $Cut.Path, [NullString]::Value)
+}
+
+# The cuts come first, into tmp files. Nothing to cut: no archive, no trim.json, the files stay as they are. Otherwise the archive is
+# made and verified, and only then are the files swapped.
 function Invoke-StorageTrimInPlace {
     param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)]$Target, [string]$MachineId, [Parameter(Mandatory)][string]$WorkDir, [Parameter(Mandatory)]$Res)
-    $arch = Save-StorageSafetyArchive -Session $Session -Target $Target -MachineId $MachineId -WorkDir $WorkDir   # throws: the original is untouched
-    $done = 0; $failed = New-Object Collections.Generic.List[string]
-    foreach ($t in @(Get-StorageTrimTargets -Session $Session)) {
-        try {
-            $st = Convert-StorageFileInPlace -Target $t -Key ([string]$Session.Key)
-            $Res.BytesBefore += $st.BytesBefore; $Res.BytesAfter += $st.BytesAfter; $Res.Items += $st.Items; if ($st.Items) { $done++ }
-        } catch { $failed.Add("$($t.Path): $($_.Exception.Message)") }
-    }
-    if ($failed.Count -and -not $done) { throw ('trim-failed: ' + $failed[0]) }
+    $cuts = New-Object Collections.Generic.List[object]; $failed = New-Object Collections.Generic.List[string]
+    try {
+        foreach ($t in @(Get-StorageTrimTargets -Session $Session)) {
+            try { $c = New-StorageTrimTmp -Target $t -Key ([string]$Session.Key); if ($c.Worth) { $cuts.Add($c) } }
+            catch { $failed.Add("$($t.Path): $($_.Exception.Message)") }
+        }
+        if (-not $cuts.Count) {
+            if ($failed.Count) { throw ('trim-failed: ' + $failed[0]) }
+            $Res.Reason = 'nothing to trim: no tool output over 16 KB was found.'
+            return
+        }
+        $arch = Save-StorageSafetyArchive -Session $Session -Target $Target -MachineId $MachineId -WorkDir $WorkDir   # throws: the original is untouched
+        $done = 0
+        foreach ($c in $cuts) {
+            try {
+                Complete-StorageTrimTmp -Cut $c
+                $Res.BytesBefore += $c.Stats.BytesBefore; $Res.BytesAfter += $c.Stats.BytesAfter; $Res.Items += $c.Stats.Items; $done++
+            } catch { $failed.Add("$($c.Path): $($_.Exception.Message)") }
+        }
+        if ($failed.Count -and -not $done) { throw ('trim-failed: ' + $failed[0]) }
+    } finally { foreach ($c in $cuts) { if ($c.Tmp -and [IO.File]::Exists($c.Tmp)) { [IO.File]::Delete($c.Tmp) } } }
     foreach ($f in $failed) { $Res.Warnings += "Not trimmed: $f" }
     if ($arch.Dir) {
         $info = [ordered]@{ key = [string]$Session.Key; mode = 'InPlace'; trimmedAt = (Get-Date).ToUniversalTime().ToString('o'); bytesBefore = $Res.BytesBefore; bytesAfter = $Res.BytesAfter; items = $Res.Items }

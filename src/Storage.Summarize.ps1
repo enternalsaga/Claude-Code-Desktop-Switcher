@@ -56,7 +56,7 @@ function Get-StorageSummaryCommand {
 # Runs a program with text on stdin and waits for it for at most -TimeoutSec. When the time is up the whole process tree is
 # killed and this throws summarize-timeout. Returns @{ ExitCode; StdOut; StdErr }.
 function Invoke-StorageProcessWithTimeout {
-    param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string]$Arguments, [AllowEmptyString()][string]$StdIn = '', [Parameter(Mandatory)][string]$WorkDir, [int]$TimeoutSec = 300)
+    param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string]$Arguments, [AllowEmptyString()][string]$StdIn = '', [Parameter(Mandatory)][string]$WorkDir, [int]$TimeoutSec = 300, $Progress)
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = $FilePath; $psi.Arguments = $Arguments; $psi.WorkingDirectory = $WorkDir; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
@@ -64,6 +64,12 @@ function Invoke-StorageProcessWithTimeout {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
     $left = { [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds) }
     $p = [Diagnostics.Process]::Start($psi)
+    # The PID is listed in Progress['ChildPids'] while the tool runs, so the Stop button can kill the tree (taskkill /T /F) at once.
+    $pids = $null
+    if ($Progress) {
+        if (-not $Progress.ContainsKey('ChildPids')) { $Progress['ChildPids'] = [Collections.ArrayList]::Synchronized((New-Object Collections.ArrayList)) }
+        $pids = $Progress['ChildPids']; [void]$pids.Add([int]$p.Id)
+    }
     try {
         $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
         $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($StdIn)
@@ -75,16 +81,16 @@ function Invoke-StorageProcessWithTimeout {
         }
         [void]$outTask.Wait(10000); [void]$errTask.Wait(10000)
         return @{ ExitCode = $p.ExitCode; StdOut = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); StdErr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
-    } finally { $p.Dispose() }
+    } finally { if ($pids) { $pids.Remove([int]$p.Id) }; $p.Dispose() }   # a finished PID can be reused, so it must not stay in the list
 }
 
-# The real runner: { param($Tool, $Prompt, $WorkDir, $TimeoutSec) } returns the text of the answer. Tests give their own.
+# The real runner: { param($Tool, $Prompt, $WorkDir, $TimeoutSec, $Progress) } returns the text of the answer. Tests give their own.
 function Invoke-StorageSummaryCli {
-    param([Parameter(Mandatory)][string]$Tool, [Parameter(Mandatory)][string]$Prompt, [Parameter(Mandatory)][string]$WorkDir, [int]$TimeoutSec = 300)
+    param([Parameter(Mandatory)][string]$Tool, [Parameter(Mandatory)][string]$Prompt, [Parameter(Mandatory)][string]$WorkDir, [int]$TimeoutSec = 300, $Progress)
     $cmd = Get-StorageSummaryCommand -Tool $Tool -WorkDir $WorkDir
     $exe = @(Get-Command $cmd.Exe -CommandType Application -ErrorAction SilentlyContinue)[0]
     if (-not $exe) { throw "summarize-failed: the $Tool command line tool was not found." }
-    $r = Invoke-StorageProcessWithTimeout -FilePath $exe.Source -Arguments $cmd.Arguments -StdIn $Prompt -WorkDir $WorkDir -TimeoutSec $TimeoutSec
+    $r = Invoke-StorageProcessWithTimeout -FilePath $exe.Source -Arguments $cmd.Arguments -StdIn $Prompt -WorkDir $WorkDir -TimeoutSec $TimeoutSec -Progress $Progress
     if ($r.ExitCode -ne 0) {
         $why = (Protect-TranscriptText ([string]$r.StdErr)).Trim(); if ($why.Length -gt 300) { $why = $why.Substring(0, 300) }
         throw "summarize-failed: $Tool exited with code $($r.ExitCode). $why"
@@ -109,7 +115,7 @@ function Get-StorageSummaryPrompt {
 }
 
 function Invoke-StorageSummarizeOne {
-    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)]$Target, [string]$Tool, [string]$MachineId, [Parameter(Mandatory)][string]$WorkDir, $Guard, [Parameter(Mandatory)][scriptblock]$Runner, [int]$TimeoutSec)
+    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)]$Target, [string]$Tool, [string]$MachineId, [Parameter(Mandatory)][string]$WorkDir, $Guard, [Parameter(Mandatory)][scriptblock]$Runner, [int]$TimeoutSec, $Progress)
     $res = @{ Key = [string]$Session.Key; Ok = $false; Skipped = $false; Reason = ''; Warnings = @(); Path = $null; Tool = $Tool }
     $safe = Test-StorageSessionSafe -Session $Session @Guard
     if (-not $safe.Safe) { $res.Skipped = $true; $res.Reason = $safe.Reason; return $res }
@@ -120,7 +126,7 @@ function Invoke-StorageSummarizeOne {
         $arch = Save-StorageSafetyArchive -Session $Session -Target $Target -MachineId $MachineId -WorkDir $WorkDir
         $prompt = Get-StorageSummaryPrompt -Markdown (ConvertTo-StorageSummaryInput -Entries @(Get-StorageSessionEntries -Session $Session) -Session $Session)
         New-Item -ItemType Directory -Path $run -Force | Out-Null
-        $text = ([string](& $Runner $Tool $prompt $run $TimeoutSec)).Trim()
+        $text = ([string](& $Runner $Tool $prompt $run $TimeoutSec $Progress)).Trim()
         if (-not $text) { throw 'summary-empty: the tool returned no text.' }
         $head = "# $($Session.Title)`n`n- Session: $($Session.Key)`n" + $(if ($Session.Cwd) { "- Working directory: $($Session.Cwd)`n" } else { '' }) + "- Summarized with: $Tool`n`n"
         Write-StorageSidecar -Dir $arch.Dir -Key $Session.Key -Suffix '.summary.md' -Text (Protect-TranscriptText ($head + $text + "`n"))
@@ -134,7 +140,7 @@ function Invoke-StorageSummarizeOne {
 # not stop the rest; Cancel stops before the next session. Returns @{ Key; Ok; Skipped; Reason; Warnings; Path; Tool } per session.
 function Invoke-StorageSummarize {
     param([Parameter(Mandatory)][array]$Sessions, [Parameter(Mandatory)]$Target, [switch]$Confirmed, [string]$MachineId = '', [string[]]$Available = (Get-StorageAvailableSummaryTools),
-          [scriptblock]$Runner = { param($Tool, $Prompt, $WorkDir, $TimeoutSec) Invoke-StorageSummaryCli -Tool $Tool -Prompt $Prompt -WorkDir $WorkDir -TimeoutSec $TimeoutSec },
+          [scriptblock]$Runner = { param($Tool, $Prompt, $WorkDir, $TimeoutSec, $Progress) Invoke-StorageSummaryCli -Tool $Tool -Prompt $Prompt -WorkDir $WorkDir -TimeoutSec $TimeoutSec -Progress $Progress },
           [int]$TimeoutSec = (Get-StorageSummaryLimits).TimeoutSec, [string]$WorkDir = (Join-Path ([IO.Path]::GetTempPath()) 'harness-archive-work'),
           $Running = @{}, [string[]]$CliCwds = @(), [int]$RecentMinutes = 30, [string[]]$IncludeRecent = @(), [scriptblock]$LockProbe, $Progress, $CancelToken)
     if (-not $Confirmed) { throw 'confirmation-required: summarizing sends the redacted transcript to a provider and uses tokens; it needs -Confirmed.' }
@@ -145,7 +151,7 @@ function Invoke-StorageSummarize {
         if ($LockProbe) { $guard['LockProbe'] = $LockProbe }
         if ($IncludeRecent -contains [string]$s.Key) { $guard['IncludeRecent'] = $true }
         $tool = Get-StorageSummaryTool -Harness ([string]$s.Harness) -Available $Available
-        $results.Add((Invoke-StorageSummarizeOne -Session $s -Target $Target -Tool $tool -MachineId $MachineId -WorkDir $WorkDir -Guard $guard -Runner $Runner -TimeoutSec $TimeoutSec))
+        $results.Add((Invoke-StorageSummarizeOne -Session $s -Target $Target -Tool $tool -MachineId $MachineId -WorkDir $WorkDir -Guard $guard -Runner $Runner -TimeoutSec $TimeoutSec -Progress $Progress))
         if ($Progress) { $Progress['Done'] = [int]$Progress['Done'] + 1 }
     }
     if ([IO.Directory]::Exists($WorkDir) -and -not @(Get-ChildItem -LiteralPath $WorkDir -Force).Count) { Remove-Item -LiteralPath $WorkDir -Force -ErrorAction SilentlyContinue }
