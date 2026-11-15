@@ -27,8 +27,13 @@ function Get-Sha($p) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToL
 $secret = 'sk-' + ('abcdefghij' * 3)
 try {
     # ---- the gate -----------------------------------------------------------------------------------------------------------------------------
-    Assert ($script:StorageSummarizeReady -eq $false -and (Test-StorageSummarizeReady) -eq $false) 'Summarize is closed until S19 passes'
-    $script:StorageSummarizeReady = $true; Assert ((Test-StorageSummarizeReady) -eq $true) 'the gate follows $script:StorageSummarizeReady'; $script:StorageSummarizeReady = $false
+    Assert ($script:StorageSummarizeReady.claude -eq $true -and $script:StorageSummarizeReady.codex -eq $false) 'S19: claude is ready, codex is still blocked'
+    Assert ((Test-StorageSummarizeReady -Installed @('claude', 'codex')) -eq $true -and (Test-StorageSummarizeReady -Installed @('claude')) -eq $true) 'the gate is open when claude is on the machine'
+    Assert ((Test-StorageSummarizeReady -Installed @('codex')) -eq $false -and (Test-StorageSummarizeReady -Installed @()) -eq $false) 'a codex-only machine, or no CLI at all: closed'
+    Assert ((@(Get-StorageAvailableSummaryTools -Installed @('claude', 'codex')) -join ',') -eq 'claude' -and @(Get-StorageAvailableSummaryTools -Installed @('codex')).Count -eq 0) 'only tools that are ready and installed are available'
+    $saved = $script:StorageSummarizeReady; $script:StorageSummarizeReady = @{ claude = $false; codex = $false }
+    Assert ((Test-StorageSummarizeReady -Installed @('claude', 'codex')) -eq $false) 'no tool ready: closed even with both installed'
+    $script:StorageSummarizeReady = $saved
 
     # ---- C1-4: the plan -----------------------------------------------------------------------------------------------------------------------
     function New-Bare($harness, $key, $bytes, $role, $roleExt = '.jsonl') {
@@ -37,10 +42,10 @@ try {
     }
     $sc = New-Bare 'claude' 'claude:c1' 40000 'transcript'; $sx = New-Bare 'codex' 'codex:x1.11223344' 8000 'rollout'; $sa = New-Bare 'antigravity' 'antigravity:g1.aabbccdd' 4000 'conversation-db' '.db'
     $plan = @(Get-StorageSummaryPlan -Sessions @($sc, $sx, $sa) -Available @('claude', 'codex'))
-    Assert ($plan.Count -eq 3 -and $plan[0].Key -eq 'claude:c1' -and $plan[0].Tool -eq 'claude' -and $plan[1].Tool -eq 'codex' -and $plan[2].Tool -eq 'claude') 'the tool follows the harness; Antigravity takes claude first'
+    Assert ($plan.Count -eq 3 -and $plan[0].Key -eq 'claude:c1' -and $plan[0].Tool -eq 'claude' -and $plan[1].Tool -eq 'claude' -and $plan[2].Tool -eq 'claude') 'while codex is not ready a Codex session is summarized with claude too; Antigravity takes claude'
     Assert ($plan[0].InputChars -eq 40000 -and $plan[0].EstTokens -eq 10000 -and $plan[1].EstTokens -eq 2000) 'tokens are characters divided by 4'
     $plan = @(Get-StorageSummaryPlan -Sessions @($sc, $sx, $sa) -Available @('codex'))
-    Assert ($plan[0].Tool -eq 'codex' -and $plan[1].Tool -eq 'codex' -and $plan[2].Tool -eq 'codex') 'when the CLI of the harness is not on the machine, the other one is used'
+    Assert ($null -eq $plan[0].Tool -and $null -eq $plan[1].Tool -and $null -eq $plan[2].Tool) 'codex is never chosen while it is not ready, even when it is the only CLI on the machine'
     $plan = @(Get-StorageSummaryPlan -Sessions @($sc) -Available @())
     Assert ($null -eq $plan[0].Tool) 'no CLI: no tool'
     $plan = @(Get-StorageSummaryPlan -Sessions @((New-Bare 'claude' 'claude:big' 3MB 'transcript')) -Available @('claude'))

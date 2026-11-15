@@ -5,25 +5,32 @@
 # archives. Needs Storage.Compact.ps1 (the archive first, the transcript readers, the sidecar files), Storage.Guard.ps1,
 # Storage.Scan.ps1 and Harness.Core.ps1 (Protect-TranscriptEntries, ConvertTo-HandoffMarkdown). ASCII only.
 
-# The gate of the UI button. Closed until spike S19 has measured a real headless call; then one commit sets it to $true.
-$script:StorageSummarizeReady = $false
+# The gate of the UI button, per tool. A tool is ready once spike S19 has measured a real headless call with it: claude did (2026-11-15),
+# codex is still blocked. A blocked tool is never chosen, so a Codex session is summarized with claude until codex is ready.
+$script:StorageSummarizeReady = @{ claude = $true; codex = $false }
 
-function Test-StorageSummarizeReady { return [bool]$script:StorageSummarizeReady }
+# The tools that are both ready and on the machine. -Installed is for tests; by default it looks for the CLIs on the PATH.
+function Get-StorageAvailableSummaryTools {
+    param([string[]]$Installed = @(foreach ($t in 'claude', 'codex') { if (Get-Command $t -CommandType Application -ErrorAction SilentlyContinue) { $t } }))
+    return @($Installed | Where-Object { $script:StorageSummarizeReady[[string]$_] -eq $true })
+}
+
+# True when at least one tool is ready and on the machine.
+function Test-StorageSummarizeReady {
+    param([string[]]$Installed = @(foreach ($t in 'claude', 'codex') { if (Get-Command $t -CommandType Application -ErrorAction SilentlyContinue) { $t } }))
+    return (@(Get-StorageAvailableSummaryTools -Installed $Installed).Count -gt 0)
+}
 
 function Get-StorageSummaryLimits { return @{ MaxChars = 400000; TimeoutSec = 300 } }
 
-function Get-StorageAvailableSummaryTools {
-    return @(foreach ($t in 'claude', 'codex') { if (Get-Command $t -CommandType Application -ErrorAction SilentlyContinue) { $t } })
-}
-
-# The CLI of the session's own harness first; Antigravity takes claude first. $null when none of the two is on the machine.
+# The CLI of the session's own harness first; Antigravity takes claude first. Only ready tools count, even if -Available lists more.
+# $null when no ready tool is on the machine.
 function Get-StorageSummaryTool {
     param([string]$Harness, [string[]]$Available)
     $order = $(if ($Harness -eq 'codex') { @('codex', 'claude') } else { @('claude', 'codex') })
-    foreach ($t in $order) { if ($Available -contains $t) { return $t } }
+    foreach ($t in $order) { if ($Available -contains $t -and $script:StorageSummarizeReady[$t] -eq $true) { return $t } }
     return $null
 }
-
 # One row per session: @{ Key; Tool; InputChars; EstTokens } with tokens = characters / 4. The characters are an estimate (the
 # size of the transcript files, at most 400000), so that building the plan reads nothing.
 function Get-StorageSummaryPlan {
