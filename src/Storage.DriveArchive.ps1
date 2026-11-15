@@ -9,9 +9,25 @@
 $script:StorageDriveKeyPattern = '\A[a-z][a-z0-9]{0,31}:[A-Za-z0-9_.-]{1,128}\z'
 $script:StorageDriveGuid = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
 
+# Every archive has its own file: <keySafe>.<archiveId>.harchive.zip.enc (R1-1, so an older archive of a session is never
+# overwritten). Rows made before archiveId existed have none and the file name is <keySafe>.harchive.zip.enc.
 function Get-StorageDriveRelPath {
-    param([Parameter(Mandatory)][string]$MachineId, [Parameter(Mandatory)][string]$Harness, [Parameter(Mandatory)][string]$Key)
-    return ('archives/{0}/{1}/{2}.harchive.zip.enc' -f $MachineId, $Harness, ($Key -replace ':', '_'))
+    param([Parameter(Mandatory)][string]$MachineId, [Parameter(Mandatory)][string]$Harness, [Parameter(Mandatory)][string]$Key, [string]$ArchiveId = '')
+    return ('archives/{0}/{1}/{2}{3}.harchive.zip.enc' -f $MachineId, $Harness, ($Key -replace ':', '_'), $(if ($ArchiveId) { '.' + $ArchiveId } else { '' }))
+}
+
+function New-StorageArchiveId { return (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfff') }
+
+# The archiveId of a row or entry: '' when it has none, $null when it has one of the wrong shape.
+function Get-StorageDriveArchiveIdOf {
+    param($Row)
+    $v = $null
+    if ($Row -is [Collections.IDictionary]) { $v = $Row['ArchiveId']; if ($null -eq $v) { $v = $Row['archiveId'] } }
+    elseif ($null -ne $Row -and $Row.PSObject.Properties['archiveId']) { $v = $Row.archiveId }
+    elseif ($null -ne $Row -and $Row.PSObject.Properties['ArchiveId']) { $v = $Row.ArchiveId }
+    if ($null -eq $v -or [string]$v -eq '') { return '' }
+    if ([string]$v -cmatch '\A\d{8}T\d{9}\z') { return [string]$v }
+    return $null
 }
 
 # Root\<relative path>, only for a path of exactly this shape that stays under Root\archives\.
@@ -36,7 +52,30 @@ function Test-StorageDriveRow {
     if ([string]$Row.sha256 -notmatch '\A[0-9a-f]{64}\z' -or [string]$Row.zipSha256 -notmatch '\A[0-9a-f]{64}\z') { return $false }
     foreach ($n in 'bytes', 'zipBytes', 'lastActivity') { if (-not (Test-SyncNumber $Row.$n) -or $Row.$n -lt 0) { return $false } }
     if ($Row.titleEnc -isnot [string] -or $Row.archivedAt -isnot [string]) { return $false }
-    return ([string]$Row.path -ceq (Get-StorageDriveRelPath -MachineId $MachineId -Harness ([string]$Row.harness) -Key $key))
+    $aid = Get-StorageDriveArchiveIdOf $Row
+    if ($null -eq $aid) { return $false }
+    return ([string]$Row.path -ceq (Get-StorageDriveRelPath -MachineId $MachineId -Harness ([string]$Row.harness) -Key $key -ArchiveId $aid))
+}
+
+# Every non-empty line of an index as @{ Raw; Row } (Row is $null for a line that is not valid). Used to rewrite the file
+# without losing lines this code does not understand (R1-8): a torn line, or a row written by a newer app.
+function Read-StorageDriveIndexLines {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$MachineId)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
+    $out = New-Object Collections.Generic.List[object]
+    foreach ($line in @((Read-SyncAllText -Path $Path) -split "`r?`n")) {
+        if (-not $line.Trim()) { continue }
+        $r = $null; try { $r = $line | ConvertFrom-Json } catch { }
+        $out.Add(@{ Raw = $line; Row = $(if (Test-StorageDriveRow -Row $r -MachineId $MachineId) { $r } else { $null }) })
+    }
+    return $out.ToArray()
+}
+
+# Rewrites an index from the lines kept and the rows added. Only the lines that are dropped or replaced are lost.
+function Write-StorageDriveIndexLines {
+    param([Parameter(Mandatory)][string]$Path, [array]$Keep = @(), [array]$Add = @())
+    $lines = @($Keep | ForEach-Object { [string]$_.Raw }) + @($Add | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 5 })
+    Write-SyncFileAtomic -Path $Path -Text $(if ($lines.Count) { ($lines -join "`n") + "`n" } else { '' })
 }
 
 # The valid rows of one machine's index; bad lines are counted in one warning. Callers wrap the call in @(...).
@@ -63,8 +102,8 @@ function Assert-StorageDriveOwnMachine {
     if ($MachineId -ne [string](Get-SyncMachine).Id) { throw 'not-own-machine: archives on Drive are written only by the machine that owns them.' }
 }
 
-# Encrypts the zip, writes it under archives\<machine>\, then rewrites this machine's index (one row per key: a newer
-# archive of the same session replaces the older row). Entry: Key, Harness, Title, Bytes, ZipBytes, LastActivity.
+# Encrypts the zip, writes it under archives\<machine>\, then rewrites this machine's index (lines it does not understand are kept; a newer
+# archive of the same session is a new row and a new file; nothing is overwritten). Entry: Key, Harness, Title, Bytes, ZipBytes, LastActivity, ArchiveId (optional).
 # Returns the new index row.
 function Save-StorageArchiveToDrive {
     param([Parameter(Mandatory)][string]$ZipPath, [Parameter(Mandatory)]$Entry, [Parameter(Mandatory)][string]$SyncRoot,
@@ -74,8 +113,12 @@ function Save-StorageArchiveToDrive {
     $skey = [string]$Entry.Key; $harness = [string]$Entry.Harness
     if ($skey -notmatch $script:StorageDriveKeyPattern -or $skey.Contains('..') -or $skey.Split(':')[0] -ne $harness) { throw "archive-key-invalid: unsafe session key '$skey'" }
     if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw "archive-missing: $ZipPath" }
-    $rel = Get-StorageDriveRelPath -MachineId $MachineId -Harness $harness -Key $skey
+    $aid = Get-StorageDriveArchiveIdOf $Entry
+    if ($null -eq $aid) { throw 'archive-path-invalid' }
+    if (-not $aid) { $aid = New-StorageArchiveId }
+    $rel = Get-StorageDriveRelPath -MachineId $MachineId -Harness $harness -Key $skey -ArchiveId $aid
     $dest = Resolve-StorageDrivePath -SyncRoot $SyncRoot -RelPath $rel
+    if (Test-Path -LiteralPath $dest) { throw 'archive-exists: an archive with this id is already on Drive.' }
     $work = Join-Path ([IO.Path]::GetTempPath()) ('harness-sync-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $work -Force | Out-Null
     try {
@@ -85,14 +128,13 @@ function Save-StorageArchiveToDrive {
     } finally { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
     $num = { param($v) $(if (Test-SyncNumber $v) { $v } else { 0 }) }
     $row = [pscustomobject][ordered]@{
-        key = $skey; harness = $harness; titleEnc = (Protect-SyncString -Text ([string]$Entry.Title) -Key $Key)
+        key = $skey; harness = $harness; archiveId = $aid; titleEnc = (Protect-SyncString -Text ([string]$Entry.Title) -Key $Key)
         bytes = (& $num $Entry.Bytes); zipBytes = (& $num $Entry.ZipBytes); lastActivity = (& $num $Entry.LastActivity)
         archivedAt = $(if ($Entry.ArchivedAt) { [string]$Entry.ArchivedAt } else { (Get-Date).ToUniversalTime().ToString('o') })
         machineId = $MachineId; path = $rel; sha256 = (Get-SyncFileSha256 $dest); zipSha256 = (Get-SyncFileSha256 $ZipPath)
     }
     $indexPath = Join-Path $SyncRoot "archives\$MachineId.jsonl"
-    $rows = @(@(Read-StorageDriveIndexRows -Path $indexPath -MachineId $MachineId) | Where-Object { [string]$_.key -ne $skey }) + @($row)
-    Write-SyncFileAtomic -Path $indexPath -Text (ConvertTo-SyncIndexText -Rows $rows)
+    Write-StorageDriveIndexLines -Path $indexPath -Keep @(Read-StorageDriveIndexLines -Path $indexPath -MachineId $MachineId) -Add @($row)
     return $row
 }
 
@@ -130,17 +172,21 @@ function Get-StorageDriveArchiveIndex {
 }
 
 # Downloads the archive into a work folder in %TEMP%, checks the sha256 against the row, checks the MAC and decrypts
-# into OutDir\<keySafe>.harchive.zip, then checks the plain zip's sha256. Returns the zip path. Whatever goes wrong,
+# into OutDir\<keySafe>[.<archiveId>].harchive.zip, then checks the plain zip's sha256. Returns the zip path. Whatever goes wrong,
 # nothing is left in OutDir.
 function Receive-StorageDriveArchive {
     param([Parameter(Mandatory)]$Entry, [Parameter(Mandatory)][string]$SyncRoot, [Parameter(Mandatory)][byte[]]$Key, [Parameter(Mandatory)][string]$OutDir)
     Assert-SyncKey $Key
     $full = Resolve-StorageDrivePath -SyncRoot $SyncRoot -RelPath ([string]$Entry.path)
+    $ekey = [string]$Entry.key; $eaid = Get-StorageDriveArchiveIdOf $Entry
+    # R1-9: the zip name is built from the key, so the key must be one this path could belong to
+    if ($ekey -notmatch $script:StorageDriveKeyPattern -or $ekey.Contains('..') -or $null -eq $eaid -or
+        [string]$Entry.path -cne (Get-StorageDriveRelPath -MachineId ([string]$Entry.path).Split('/')[1] -Harness $ekey.Split(':')[0] -Key $ekey -ArchiveId $eaid)) { throw 'archive-path-invalid' }
     if ([string]$Entry.sha256 -notmatch '\A[0-9a-f]{64}\z') { throw 'archive-path-invalid' }
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw 'archive-missing' }
     $work = Join-Path ([IO.Path]::GetTempPath()) ('harness-sync-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $work -Force | Out-Null
-    $zip = Join-Path $OutDir (([string]$Entry.key -replace ':', '_') + '.harchive.zip')
+    $zip = Join-Path $OutDir (($ekey -replace ':', '_') + $(if ($eaid) { '.' + $eaid } else { '' }) + '.harchive.zip')
     try {
         $enc = Join-Path $work 'in.enc'
         $ok = $false
@@ -169,10 +215,11 @@ function Remove-StorageDriveArchive {
     if (([string]$Entry.path).Split('/')[1] -ne $MachineId) { throw 'not-own-machine: archives on Drive are deleted only by the machine that owns them.' }
     # The path must be the one this entry's own harness and key give, so an entry cannot delete another archive.
     if ([string]$Entry.key -notmatch $script:StorageDriveKeyPattern -or [string]$Entry.harness -notmatch '\A[a-z][a-z0-9]{0,31}\z' -or
-        [string]$Entry.path -cne (Get-StorageDriveRelPath -MachineId $MachineId -Harness ([string]$Entry.harness) -Key ([string]$Entry.key))) { throw 'archive-path-invalid' }
+        $null -eq (Get-StorageDriveArchiveIdOf $Entry) -or
+        [string]$Entry.path -cne (Get-StorageDriveRelPath -MachineId $MachineId -Harness ([string]$Entry.harness) -Key ([string]$Entry.key) -ArchiveId (Get-StorageDriveArchiveIdOf $Entry))) { throw 'archive-path-invalid' }
     $indexPath = Join-Path $SyncRoot "archives\$MachineId.jsonl"
-    $kept = @(@(Read-StorageDriveIndexRows -Path $indexPath -MachineId $MachineId) | Where-Object { [string]$_.key -ne [string]$Entry.key })
-    Write-SyncFileAtomic -Path $indexPath -Text (ConvertTo-SyncIndexText -Rows $kept)
+    $kept = @(@(Read-StorageDriveIndexLines -Path $indexPath -MachineId $MachineId) | Where-Object { -not $_.Row -or [string]$_.Row.path -cne [string]$Entry.path })
+    Write-StorageDriveIndexLines -Path $indexPath -Keep $kept
     if (Test-Path -LiteralPath $file -PathType Leaf) { Remove-Item -LiteralPath $file -Force }
     $d = Split-Path -Parent $file
     if ((Test-Path -LiteralPath $d) -and -not @(Get-ChildItem -LiteralPath $d -Force).Count) { Remove-Item -LiteralPath $d -Force }

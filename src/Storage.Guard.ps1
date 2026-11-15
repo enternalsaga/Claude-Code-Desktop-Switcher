@@ -13,6 +13,37 @@ function Test-StorageFileLocked {
     catch { return $true }
 }
 
+# Does a running Claude CLI stand in the way of a session whose folder is Cwd? CliCwds are the folders of the running CLIs; '*' means a CLI
+# whose folder could not be read. A folder matches when it is the same, or one is inside the other (whole folder names only).
+# Returns the reason, or '' when nothing blocks. Used by the guard and by restore (R1-5).
+function Get-StorageCliBlockReason {
+    param([string]$Cwd, [string[]]$CliCwds = @())
+    if ($CliCwds -contains '*') { return 'A Claude CLI is running and its folder could not be read; close Claude Code terminals first.' }
+    $cwd = $Cwd.TrimEnd('\')
+    if ($cwd -and @($CliCwds | Where-Object { $c = $_.TrimEnd('\'); $c -and ($c -ieq $cwd -or $c.StartsWith($cwd + '\', 'OrdinalIgnoreCase') -or $cwd.StartsWith($c + '\', 'OrdinalIgnoreCase')) }).Count) { return 'A Claude CLI is running in the folder of this session.' }
+    return ''
+}
+
+# R1-3: the newest write time of a part as it is on disk now (the scan may be hours old). A file: its own time. A folder: the newest
+# file below it, junctions and symlinks left out, at most 2000 entries looked at. 0 when the path is not there or cannot be read.
+function Get-StoragePartNewestTicks {
+    param([Parameter(Mandatory)]$Part, [int]$Limit = 2000)
+    $path = [string]$Part.Path
+    try {
+        if ($Part.Kind -eq 'file') { return $(if ([IO.File]::Exists($path)) { (New-Object IO.FileInfo $path).LastWriteTimeUtc.Ticks } else { [long]0 }) }
+        if ($Part.Kind -ne 'dir' -or -not [IO.Directory]::Exists($path)) { return [long]0 }
+        $newest = [long]0; $seen = 0; $todo = New-Object Collections.Generic.Stack[string]; $todo.Push($path)
+        while ($todo.Count -and $seen -lt $Limit) {
+            foreach ($e in (New-Object IO.DirectoryInfo $todo.Pop()).EnumerateFileSystemInfos()) {
+                if ($seen++ -ge $Limit) { break }
+                if ($e.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                if ($e -is [IO.DirectoryInfo]) { $todo.Push($e.FullName) } elseif ($e.LastWriteTimeUtc.Ticks -gt $newest) { $newest = $e.LastWriteTimeUtc.Ticks }
+            }
+        }
+        return $newest
+    } catch { return [long]0 }
+}
+
 # Decides whether a session may be changed now. State is live (a file is locked, or a Claude CLI runs in the session's
 # folder), protected (the app of a profile that refers to it is running: Claude and Antigravity; Codex is changed through
 # its app-server, so it is never protected), recent (activity or any file newer than -RecentMinutes) or idle. Only idle
@@ -29,18 +60,17 @@ function Test-StorageSessionSafe {
         if (& $LockProbe ([string]$p.Path)) { return (& $out $false 'live' 'A file of this session is open in another program.') }
     }
     $CliCwds = @($CliCwds) + @($Running['cli'] | Where-Object { $_ })   # the UI hands one table (-Running) to every action; cli = the folders of running Claude CLIs
-    if ($Session.Harness -eq 'claude' -and $CliCwds -contains '*') { return (& $out $false 'live' 'A Claude CLI is running and its folder could not be read; close Claude Code terminals first.') }
-    $cwd = ([string]$Session.Cwd).TrimEnd('\')
-    if ($Session.Harness -eq 'claude' -and $cwd -and @($CliCwds | Where-Object { $c = $_.TrimEnd('\'); $c -and ($c -ieq $cwd -or $c.StartsWith($cwd + '\', 'OrdinalIgnoreCase') -or $cwd.StartsWith($c + '\', 'OrdinalIgnoreCase')) }).Count) {   # same folder, or one inside the other (whole folder names only)
-        return (& $out $false 'live' 'A Claude CLI is running in the folder of this session.')
-    }
+    if ($Session.Harness -eq 'claude') { $why = Get-StorageCliBlockReason -Cwd ([string]$Session.Cwd) -CliCwds $CliCwds; if ($why) { return (& $out $false 'live' $why) } }
     $running = @($Running[[string]$Session.Harness])
     if ($Session.Harness -ne 'codex') {
         $hit = @($Session.Profiles | Where-Object { $running -contains $_.Id } | ForEach-Object { $_.Name })
         if ($hit.Count) { return (& $out $false 'protected' ('Close ' + ($hit -join ', ') + ' first: its app is running.')) }
     }
     $newest = [long]0
-    foreach ($p in $Session.Parts) { if ($p.MTimeTicks -gt $newest) { $newest = $p.MTimeTicks } }
+    foreach ($p in $Session.Parts) {
+        if ($p.MTimeTicks -gt $newest) { $newest = $p.MTimeTicks }
+        $now2 = Get-StoragePartNewestTicks -Part $p; if ($now2 -gt $newest) { $newest = $now2 }   # R1-3: look again now, not only at the scan
+    }
     $window = [long]$RecentMinutes * [TimeSpan]::TicksPerMinute
     $recent = ($newest -gt 0 -and ($Now.Ticks - $newest) -lt $window)
     if (-not $recent -and $Session.LastActivity) { $ms = ([DateTimeOffset]$Now).ToUnixTimeMilliseconds(); $recent = (($ms - [long]$Session.LastActivity) -lt ([long]$RecentMinutes * 60000) -and [long]$Session.LastActivity -le $ms + 60000) }
@@ -99,6 +129,25 @@ function Get-StorageVolumeInfo {
     return $info
 }
 
+# R1-6: the longest full path among the files of a part (a folder: up to 2000 entries below it, no junctions).
+function Get-StoragePartMaxPathLength {
+    param([Parameter(Mandatory)]$Part, [int]$Limit = 2000)
+    $max = ([string]$Part.Path).Length
+    if ($Part.Kind -ne 'dir' -or -not [IO.Directory]::Exists([string]$Part.Path)) { return $max }
+    try {
+        $seen = 0; $todo = New-Object Collections.Generic.Stack[string]; $todo.Push([string]$Part.Path)
+        while ($todo.Count -and $seen -lt $Limit) {
+            foreach ($e in (New-Object IO.DirectoryInfo $todo.Pop()).EnumerateFileSystemInfos()) {
+                if ($seen++ -ge $Limit) { break }
+                if ($e.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                if ($e.FullName.Length -gt $max) { $max = $e.FullName.Length }
+                if ($e -is [IO.DirectoryInfo]) { $todo.Push($e.FullName) }
+            }
+        }
+    } catch { }
+    return $max
+}
+
 # Will every file of the session go to the Recycle Bin, or would Windows delete some for good (spike S18)? Ok only when, for
 # every volume the session's files are on: the drive is Fixed, is not a Google Drive drive, the bin has NukeOnDelete = 0
 # and a MaxCapacity, and the session's files on that volume add up to less than MaxCapacity (Windows judges one deletion at
@@ -108,6 +157,7 @@ function Test-StorageRecyclable {
     $no = { param($why) @{ Ok = $false; Reason = "cannot go to the Recycle Bin, archive it instead ($why)." } }
     $by = @{}
     foreach ($p in @($Session.Parts | Where-Object { $_.Kind -ne 'row' })) {
+        if ((Get-StoragePartMaxPathLength -Part $p) -ge 250) { return (& $no 'a path is too long for the Recycle Bin, Windows could delete it for good') }
         $v = ([IO.Path]::GetPathRoot([string]$p.Path)).ToUpperInvariant()
         if (-not $by.ContainsKey($v)) { $by[$v] = @{ Bytes = [long]0; Sample = [string]$p.Path } }
         $by[$v].Bytes += [long]$p.Bytes

@@ -126,7 +126,7 @@ try {
     $res = @(Invoke-StorageTrim -Sessions @($cx) -Target $target -Mode InPlace -MachineId $machine)
     Assert ($res.Count -eq 1 -and $res[0].Ok -and $res[0].Mode -eq 'InPlace') "Codex InPlace works: $($res[0].Reason)"
     Assert ((Get-Item $cpath).Length -lt $cLen / 2 -and (Get-Item $cpath).LastWriteTimeUtc -eq $old) 'the rollout is smaller and keeps its modified time'
-    $zip = Join-Path $store ('codex\' + (Get-Date -Format 'yyyy-MM') + '\codex_x1.11223344.harchive.zip')
+    $zip = @(Get-ChildItem (Join-Path $store 'codex') -Recurse -Filter 'codex_x1.11223344.*.harchive.zip')[0].FullName   # R1-1: the file name has an archiveId
     $chk = Read-StorageArchive -ZipPath $zip
     Assert ($chk.Verified -and $chk.Manifest.parts[0].sha256 -eq $cBefore) 'the archive in the store holds the file as it was before the cut'
     Assert (@(Get-StorageArchiveIndex -Target $target | Where-Object { $_.key -eq 'codex:x1.11223344' }).Count -eq 1) 'the archive is in the index'
@@ -162,7 +162,8 @@ try {
     $res = @(Invoke-StorageTrim -Sessions @($cl2) -Target $target -Mode InPlace -MachineId $machine)
     Assert ($res[0].Ok -and $res[0].Mode -eq 'InPlace') "Claude InPlace: $($res[0].Reason)"
     Assert ((Get-Item (Join-Path $cliDir 'tool-results\out.txt')).Length -lt 4000 -and (Get-Item $cl2.Parts[0].Path).Length -lt 12000 -and (Get-Sha (Join-Path $cliDir 'subagents\agent-1.jsonl')) -eq $subBefore) 'the transcript and the tool-results file are cut; other files of the folder are not'
-    Assert ((Read-StorageArchive -ZipPath (Join-Path $store ('claude\' + (Get-Date -Format 'yyyy-MM') + '\claude_c2.harchive.zip'))).Verified) 'with an archive made first'
+    Assert ((Read-StorageArchive -ZipPath @(Get-ChildItem (Join-Path $store 'claude') -Recurse -Filter 'claude_c2.*.harchive.zip')[0].FullName).Verified) 'with an archive made first'
+    Assert (@(Get-StorageArchiveIndex -Target $target | Where-Object { $_.key -eq 'claude:c2' })[0].archiveId -match '\A\d{8}T\d{9}\z') 'R1-1: the safety archive row has its archiveId'
     # the guard for a Claude session: recent, open file, running app, running CLI in its folder
     $cg = New-ClaudeFiles 'g1'; $bg = Get-Sha $cg.Parts[0].Path
     $r1 = @(Invoke-StorageTrim -Sessions @($cg) -Target $target -Mode InPlace -MachineId $machine -LockProbe { param($p) $true })
@@ -229,12 +230,12 @@ try {
     $res = @(Invoke-StorageTrim -Sessions @($ns) -Target $target -Mode InPlace -MachineId $machine)
     Assert ($res[0].Ok -and $res[0].Mode -eq 'InPlace' -and $res[0].Items -eq 0 -and $res[0].Reason -like '*nothing to trim*') "no big output: Ok, with 'nothing to trim': $($res[0].Reason)"
     $zdir = Join-Path $store ('claude\' + (Get-Date -Format 'yyyy-MM'))
-    Assert (-not (Test-Path (Join-Path $zdir 'claude_ns1.harchive.zip')) -and -not (Test-Path (Join-Path $zdir 'claude_ns1.trim.json'))) 'no zip and no trim.json were made'
+    Assert (-not (Test-Path (Join-Path $zdir 'claude_ns1.*.harchive.zip')) -and -not (Test-Path (Join-Path $zdir 'claude_ns1.trim.json'))) 'no zip and no trim.json were made'
     Assert (@(Get-StorageArchiveIndex -Target $target | Where-Object { $_.key -eq 'claude:ns1' }).Count -eq 0) 'and no index row'
     Assert ((Get-Sha $ns.Parts[0].Path) -eq $nsBefore -and (Get-Item $ns.Parts[0].Path).LastWriteTimeUtc -eq $old -and @(Get-ChildItem (Split-Path $ns.Parts[0].Path) -Filter '*.trim-*').Count -eq 0) 'the file is the same bytes with the same time, and no tmp is left'
     # a real archive of the session already in the store is not overwritten by a nothing-to-trim run
     $cdone = New-ClaudeFiles 'ns2'; $res = @(Invoke-StorageTrim -Sessions @($cdone) -Target $target -Mode InPlace -MachineId $machine)
-    $zip2 = Join-Path $zdir 'claude_ns2.harchive.zip'; $zipBefore = Get-Sha $zip2
+    $zip2 = @(Get-ChildItem $zdir -Filter 'claude_ns2.*.harchive.zip')[0].FullName; $zipBefore = Get-Sha $zip2
     $res = @(Invoke-StorageTrim -Sessions @($cdone) -Target $target -Mode InPlace -MachineId $machine)
     Assert ($res[0].Ok -and $res[0].Items -eq 0 -and (Get-Sha $zip2) -eq $zipBefore) 'a second trim of an already cut session leaves the first archive as it is'
     # the file changes between the cut and the swap: it is left alone and the archive still exists

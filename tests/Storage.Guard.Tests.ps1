@@ -14,7 +14,7 @@ function New-Sess($harness, [string[]]$profileIds, $parts, $flags = @{}, [double
 }
 function New-FilePart($path, $ageDays = 10) { [pscustomobject]@{ Role = 'transcript'; Path = $path; Bytes = 100; Kind = 'file'; Files = 1; MTimeTicks = $now.AddDays(-$ageDays).Ticks; ProfileId = '' } }
 try {
-    $f1 = Join-Path $tmp 'a.jsonl'; [IO.File]::WriteAllText($f1, 'x')
+    $f1 = Join-Path $tmp 'a.jsonl'; [IO.File]::WriteAllText($f1, 'x'); (Get-Item -LiteralPath $f1).LastWriteTimeUtc = $now.AddDays(-10)   # old on disk: the guard looks at the real file (R1-3)
     $idle = New-Sess 'claude' @('Default') @((New-FilePart $f1))
     $r = Test-StorageSessionSafe -Session $idle -Now $now
     Assert ($r.Safe -eq $true -and $r.State -eq 'idle') "an old, closed session is safe: $($r | ConvertTo-Json -Compress)"
@@ -29,6 +29,21 @@ try {
     Assert ($r.Safe) 'probe says not locked'
     $gone = New-Sess 'claude' @('Default') @((New-FilePart (Join-Path $tmp 'missing.jsonl')))
     Assert ((Test-StorageSessionSafe -Session $gone -Now $now).Safe) 'a part that is already gone is not a lock'
+
+    # R1-3: the mtime from the scan may be hours old; the guard looks at the files at the moment of the action
+    $fresh = Join-Path $tmp 'fresh.jsonl'; [IO.File]::WriteAllText($fresh, 'x'); (Get-Item -LiteralPath $fresh).LastWriteTimeUtc = $now.AddDays(-10)
+    $stale = New-Sess 'claude' @('Default') @((New-FilePart $fresh 10))
+    Assert ((Test-StorageSessionSafe -Session $stale -Now $now).Safe) 'a file that is old on disk and in the scan is safe'
+    (Get-Item -LiteralPath $fresh).LastWriteTimeUtc = $now.AddMinutes(-2)   # the user resumed the chat after the scan
+    $r = Test-StorageSessionSafe -Session $stale -Now $now
+    Assert ($r.Safe -eq $false -and $r.State -eq 'recent') "R1-3: the scan says 10 days but the file was written 2 minutes ago: recent ($($r | ConvertTo-Json -Compress))"
+    $dirP = Join-Path $tmp 'dirpart'; New-Item -ItemType Directory -Path "$dirP\sub" -Force | Out-Null
+    [IO.File]::WriteAllText("$dirP\sub\old.txt", 'x'); (Get-Item -LiteralPath "$dirP\sub\old.txt").LastWriteTimeUtc = $now.AddDays(-30)
+    $dpart = [pscustomobject]@{ Role = 'cli-dir'; Path = $dirP; Bytes = 1; Kind = 'dir'; Files = 1; MTimeTicks = $now.AddDays(-30).Ticks; ProfileId = '' }
+    $dsess = New-Sess 'claude' @('Default') @($dpart)
+    Assert ((Test-StorageSessionSafe -Session $dsess -Now $now).Safe) 'an old folder part is safe'
+    [IO.File]::WriteAllText("$dirP\sub\new.txt", 'x')
+    Assert ((Test-StorageSessionSafe -Session $dsess -Now $now).State -eq 'recent') 'R1-3: a file written in a folder part after the scan makes it recent'
 
     # CLI running in the same folder
     $r = Test-StorageSessionSafe -Session $idle -Now $now -CliCwds @('c:\WORK\')
@@ -129,6 +144,14 @@ try {
         [pscustomobject]@{ Role = 'transcript'; Path = 'C:\a\1.jsonl'; Bytes = 600MB; Kind = 'file'; Files = 1; MTimeTicks = 0; ProfileId = '' },
         [pscustomobject]@{ Role = 'profile-meta'; Path = 'D:\p\local_a.json'; Bytes = 1KB; Kind = 'file'; Files = 1; MTimeTicks = 0; ProfileId = 'Default' })
     $mixed = { param($p) if ($p -like 'D:*') { @{ DriveType = 'Fixed'; IsDriveFs = $false; NukeOnDelete = 0; MaxCapacityMB = 1000 } } else { @{ DriveType = 'Fixed'; IsDriveFs = $false; NukeOnDelete = 0; MaxCapacityMB = 100 } } }
+    # R1-6: a path of 250 characters or more can be deleted for good by Windows without a word
+    $longName = 'C:\' + ('d' * 120) + '\' + ('e' * 120) + '\file.jsonl'
+    $longSess = [pscustomobject]@{ Parts = @([pscustomobject]@{ Role = 'transcript'; Path = $longName; Bytes = 10; Kind = 'file'; Files = 1 }); Bytes = 10; Flags = @{} }
+    $r = Test-StorageRecyclable -Session $longSess -VolumeInfo $vol
+    Assert ($r.Ok -eq $false -and $r.Reason -like '*too long*') "R1-6: a path of $($longName.Length) characters is refused ($($r.Reason))"
+    $deep = Join-Path $tmp ('x' * 60); $deep2 = Join-Path $deep ('y' * (252 - ($deep.Length + 1) - 1 - 12)); New-Item -ItemType Directory -Path $deep2 -Force | Out-Null; [IO.File]::WriteAllText((Join-Path $deep2 ('f' * 8 + '.txt')), 'x')   # a file path of 252 characters: long, but still under MAX_PATH
+    $dirSess = [pscustomobject]@{ Parts = @([pscustomobject]@{ Role = 'cli-dir'; Path = $deep; Bytes = 1; Kind = 'dir'; Files = 1 }); Bytes = 1; Flags = @{} }
+    Assert ((Test-StorageRecyclable -Session $dirSess -VolumeInfo $vol).Ok -eq $false) 'R1-6: a folder part holding a file with a path of 250 or more characters is refused'
     $r = Test-StorageRecyclable -Session $split -VolumeInfo $mixed
     Assert ($r.Ok -eq $false) 'one volume too small is enough to refuse'
     $rows = Test-StorageRecyclable -Session ([pscustomobject]@{ Parts = @([pscustomobject]@{ Role = 'row'; Path = 'C:\state.sqlite'; Bytes = 0; Kind = 'row'; Files = 0 }); Bytes = 0 }) -VolumeInfo $vol

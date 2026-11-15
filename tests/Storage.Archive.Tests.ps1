@@ -74,7 +74,8 @@ try {
     Assert ($v.Verified -eq $true -and $v.Manifest.key -eq "claude:$cli") 'Read-StorageArchive verifies a good archive'
     # one byte of a stored file changed inside the compressed stream
     $bytes = [IO.File]::ReadAllBytes($a.ZipPath); $bad = Join-Path $tmp 'flip.zip'
-    $bytes[[int]($bytes.Length / 3)] = $bytes[[int]($bytes.Length / 3)] -bxor 0xFF; [IO.File]::WriteAllBytes($bad, $bytes)
+    $ds = 30 + [BitConverter]::ToUInt16($bytes, 26) + [BitConverter]::ToUInt16($bytes, 28)   # start of the data of the first entry (the manifest is small now, so one third in is not always data)
+    $bytes[$ds + 2] = $bytes[$ds + 2] -bxor 0xFF; [IO.File]::WriteAllBytes($bad, $bytes)
     Assert ((Read-StorageArchive -ZipPath $bad).Verified -eq $false) 'a flipped byte is caught (Verified false, no exception)'
     Copy-Item -LiteralPath $a.ZipPath -Destination (Join-Path $tmp 'swap.zip'); Break-Zip (Join-Path $tmp 'swap.zip')
     $r = Read-StorageArchive -ZipPath (Join-Path $tmp 'swap.zip')
@@ -141,12 +142,12 @@ try {
     Assert ($rows.Count -eq 2 -and $rows[0].key -eq 'codex:two.1234abcd') 'two rows, newest first'
     Add-StorageArchiveIndex -Target $idxTarget -Row ([pscustomobject]@{ key = 'claude:one'; harness = 'claude'; title = 'T1b'; bytes = 11; zipBytes = 5; archivedAt = '2026-11-15T12:00:00Z'; machineId = 'm'; entry = 'x' })
     $rows = @(Get-StorageArchiveIndex -Target $idxTarget)
-    Assert ($rows.Count -eq 2 -and (@($rows | Where-Object { $_.key -eq 'claude:one' })[0].title -eq 'T1b')) 'a newer archive of the same session replaces its row'
+    Assert ($rows.Count -eq 3 -and @($rows | Where-Object { $_.key -eq 'claude:one' }).Count -eq 2 -and $rows[0].title -eq 'T1b') 'R1-1: a newer archive of the same session is a second row, the older stays'
     $idxFile = Join-Path $idxTarget.Path 'archive-index.jsonl'
     [IO.File]::AppendAllText($idxFile, "this line is damaged`n")
     $warn = $null
     $rows = @(Get-StorageArchiveIndex -Target $idxTarget -WarningVariable warn -WarningAction SilentlyContinue)
-    Assert ($rows.Count -eq 2 -and $warn) 'a damaged line is skipped with a warning'
+    Assert ($rows.Count -eq 3 -and $warn) 'a damaged line is skipped with a warning'
     Remove-StorageArchiveIndex -Target $idxTarget -Key 'claude:one'
     Assert (@(Get-StorageArchiveIndex -Target $idxTarget -WarningAction SilentlyContinue).Count -eq 1 -and @(Get-ChildItem -LiteralPath $idxTarget.Path -Filter '*.tmp-*').Count -eq 0) 'a row is removed, no tmp file stays'
     Remove-StorageArchiveIndex -Target $idxTarget -Key 'nothing:here'
@@ -199,6 +200,27 @@ try {
     $cancel = @{ Cancel = $false }; $n = 0
     $r = @(Invoke-StorageArchive -Sessions @($ghost, $ghost, $ghost) -Target $target -Roots $roots -MachineId $mid -WorkDir $work -LockProbe $noLock -CancelToken $cancel -OnSession { $script:n++; if ($script:n -eq 1) { $cancel['Cancel'] = $true } })
     Assert ($r.Count -eq 1) "Cancel stops before the next session, not in the middle of one: $($r.Count) results"
+
+    # ---------------------------------------------------------------- R1-1: an archive never overwrites an older one of the same session
+    foreach ($d in $proj, $p1, $p2) { Set-Old $d }
+    $storeR = @{ Kind = 'local'; Path = (Join-Path $tmp 'storeR') }; $noIdx = @{ Kind = 'local'; Path = (Join-Path $tmp 'noindex') }
+    $sess = @((Get-StorageInventory -Roots $roots).Sessions | Where-Object { $_.Key -eq "claude:$cli" })[0]
+    $r1 = @(Invoke-StorageArchive -Sessions @($sess) -Target $storeR -Roots $roots -MachineId $mid -WorkDir $work -LockProbe $noLock)
+    Assert ($r1[0].Ok) "first archive: $($r1[0].Reason)"
+    $null = @(Invoke-StorageRestore -Entries @(@{ Key = "claude:$cli"; ZipPath = $r1[0].ZipPath }) -Target $noIdx -Roots $roots)
+    foreach ($d in $proj, $p1, $p2) { Set-Old $d }
+    Start-Sleep -Milliseconds 30
+    $sess = @((Get-StorageInventory -Roots $roots).Sessions | Where-Object { $_.Key -eq "claude:$cli" })[0]
+    $r2 = @(Invoke-StorageArchive -Sessions @($sess) -Target $storeR -Roots $roots -MachineId $mid -WorkDir $work -LockProbe $noLock)
+    Assert ($r2[0].Ok -and $r2[0].ZipPath -ne $r1[0].ZipPath -and (Test-Path -LiteralPath $r1[0].ZipPath) -and (Test-Path -LiteralPath $r2[0].ZipPath)) "R1-1: the second archive of the same key is a new file, the first one is still there ($($r2[0].Reason))"
+    $rx = @(Get-StorageArchiveIndex -Target $storeR)
+    Assert ($rx.Count -eq 2 -and $rx[0].entry -ne $rx[1].entry -and $rx[0].archiveId -match '\A\d{8}T\d{9}\z' -and $rx[0].archiveId -ne $rx[1].archiveId) 'R1-1: the index has two rows for the key, each with its own archiveId'
+    Assert ((Read-StorageArchive -ZipPath $r1[0].ZipPath).Manifest.archiveId -match '\A\d{8}T\d{9}\z') 'the manifest carries the archiveId'
+    $first = @($rx | Where-Object { $_.entry -like ('*' + (Split-Path -Leaf $r1[0].ZipPath)) })[0]
+    Remove-StorageArchiveIndex -Target $storeR -Key "claude:$cli" -Entry $first.entry
+    $rx = @(Get-StorageArchiveIndex -Target $storeR)
+    Assert ($rx.Count -eq 1 -and $rx[0].entry -notlike ('*' + (Split-Path -Leaf $r1[0].ZipPath)) -and (Test-Path -LiteralPath $r1[0].ZipPath)) 'a row is removed by its entry, the other archive row stays, no zip is deleted'
+    $null = @(Invoke-StorageRestore -Entries @($rx[0]) -Target $storeR -Roots $roots)
 
     # ---------------------------------------------------------------- Antigravity (S17, plan A): .db/-wal/-shm and brain\<id> only; summaries and hub cache are never touched
     $agyData = Join-Path $tmp 'agy\antigravity'; $agyId = 'cccccccc-1111-4222-8333-444444444444'
@@ -274,6 +296,76 @@ try {
     Remove-StorageSessionOriginal -Session $sess -Mode Delete -Roots $roots | Out-Null
     $res = @(Invoke-StorageRestore -Entries @(@{ Key = "claude:$cli"; ZipPath = $old }) -Target @{ Kind = 'local'; Path = (Join-Path $tmp 'out3') } -Roots $roots)
     Assert ($res[0].Ok -and (Test-Path (Join-Path $proj "$slug\$cli.jsonl"))) "an archive without mtimeUtcTicks restores: $($res[0].Reason)"
+
+    # ---------------------------------------------------------------- R1-4: every role may only write a path of its own shape
+    $cxHome = Join-Path $tmp 'plan\codex'; $agDir = Join-Path $tmp 'plan\agy'
+    $planRoots = @{ ClaudeProjects = (Join-Path $tmp 'plan\projects'); ClaudeProfiles = @(@{ Id = 'Default'; Name = 'Default'; SessionRoot = (Join-Path $tmp 'plan\p1\claude-code-sessions'); DataDir = (Join-Path $tmp 'plan\p1'); IsDefault = $true })
+        CodexHomes = @(@{ Id = 'Default'; Name = 'Default'; Home = $cxHome }); AgyDirs = @(@{ Id = 'agy1'; Name = 'Antigravity'; DataDir = $agDir }) }
+    function New-PlanManifest($harness, $role, $rel) {
+        [pscustomobject]@{ harness = $harness; id = 'abc123'; key = "${harness}:abc123"; cwd = 'C:\work\alpha'; parts = @([pscustomobject]@{ role = $role; rel = $rel; entry = 'files/0001'; size = 1; sha256 = ('a' * 64); profileId = 'Default' })
+            restore = [pscustomobject]@{ codex = [pscustomobject]@{ profileId = 'Default' }; antigravity = [pscustomobject]@{ profileId = 'agy1'; dataDir = $agDir; id = 'abc123' } } }
+    }
+    $bad = @(
+        @('codex', 'rollout', 'config.toml'), @('codex', 'rollout', 'sessions\2026\10\01\..\..\..\config.toml'), @('codex', 'rollout', 'sessions\2026\10\01\notes.txt'), @('codex', 'rollout', 'archived_sessions\sub\x.jsonl'),
+        @('antigravity', 'conversation-db', 'mcp_config.json'), @('antigravity', 'conversation-db', 'conversations\..\mcp_config.json'), @('antigravity', 'conversation-wal', 'conversations\x.txt'), @('antigravity', 'brain', 'mcp_config.json'), @('antigravity', 'brain', 'brain\..\x.json'),
+        @('claude', 'transcript', 'config.json'), @('claude', 'transcript', 'a\b\c.jsonl'), @('claude', 'transcript', '..\slug\abc123.jsonl'), @('claude', 'cli-dir', 'slug\abc123'), @('claude', 'cli-dir', 'slug\other-id\x.txt'), @('claude', 'cli-dir', 'slug\abc123\..\..\x'),
+        @('claude', 'profile-meta', 'config.json'), @('claude', 'profile-meta', 'a\o\notlocal.json'), @('claude', 'profile-meta', 'a\o\local_x.exe'), @('claude', 'profile-meta', '..\o\local_x.json'))
+    foreach ($b in $bad) { $m = New-PlanManifest $b[0] $b[1] $b[2]; $threw = $null; try { [void](Get-StorageRestorePlan -Manifest $m -Roots $planRoots) } catch { $threw = $_.Exception.Message }; Assert ($threw -like 'restore-refused*') "R1-4: $($b[0]) $($b[1]) '$($b[2])' is refused ($threw)" }
+    $good = @(
+        @('codex', 'rollout', 'sessions\2026\10\01\rollout-2026-10-01T08-00-00-abc123.jsonl'), @('codex', 'rollout', 'sessions\2026\10\01\rollout-2026-10-01T08-00-00-abc123.jsonl.zst'), @('codex', 'rollout', 'archived_sessions\rollout-2026-10-01T08-00-00-abc123.jsonl'),
+        @('antigravity', 'conversation-db', 'conversations\abc123.db'), @('antigravity', 'conversation-pb', 'conversations\abc123.pb'), @('antigravity', 'conversation-wal', 'conversations\abc123.db-wal'), @('antigravity', 'brain', 'brain\abc123\notes\plan.md'),
+        @('claude', 'transcript', 'C--work-alpha\abc123.jsonl'), @('claude', 'cli-dir', 'C--work-alpha\abc123\subagents\agent-1.jsonl'), @('claude', 'profile-meta', 'acct1\org1\local_x1.json'))
+    foreach ($g in $good) { $m = New-PlanManifest $g[0] $g[1] $g[2]; $threw = $null; try { [void](Get-StorageRestorePlan -Manifest $m -Roots $planRoots) } catch { $threw = $_.Exception.Message }; Assert (-not $threw) "R1-4: the shape $($g[0]) $($g[1]) '$($g[2])' is accepted ($threw)" }
+
+    # ---------------------------------------------------------------- R1-7: a session of 5000 files still archives (the manifest is big)
+    $bigId = 'bigbigbig-0000-4000-8000-000000000009'; $bigDir = Join-Path $proj "$slug\$bigId"
+    Write-Text (Join-Path $proj "$slug\$bigId.jsonl") '{"type":"user"}'
+    New-Item -ItemType Directory -Path "$bigDir\tool-results" -Force | Out-Null
+    1..5000 | ForEach-Object { [IO.File]::WriteAllText("$bigDir\tool-results\result-file-with-a-longer-name-$($_.ToString('0000')).txt", 'x') }
+    $bigSess = [pscustomobject]@{ Harness = 'claude'; Key = "claude:$bigId"; Id = $bigId; Title = 'Big'; Cwd = $cwd; LastActivity = 1; Created = 1; Profiles = @([pscustomobject]@{ Id = 'Default'; Name = 'Default' }); Bytes = 5000; State = 'idle'; Flags = @{}
+        Parts = @([pscustomobject]@{ Role = 'transcript'; Path = (Join-Path $proj "$slug\$bigId.jsonl"); Bytes = 15; Kind = 'file'; Files = 1; MTimeTicks = 1; ProfileId = '' }, [pscustomobject]@{ Role = 'cli-dir'; Path = $bigDir; Bytes = 5000; Kind = 'dir'; Files = 5000; MTimeTicks = 1; ProfileId = '' }) }
+    $bigA = $null; $threw = $null; try { $bigA = New-StorageArchive -Session $bigSess -OutDir (Join-Path $tmp 'outbig') } catch { $threw = $_.Exception.Message }
+    Assert ($bigA -and $bigA.Manifest.parts.Count -eq 5001 -and (Read-StorageArchive -ZipPath $bigA.ZipPath).Verified) "R1-7: 5001 files archive and read back ($threw)"
+    Remove-Item -LiteralPath $bigDir, (Join-Path $proj "$slug\$bigId.jsonl") -Recurse -Force
+
+    # ---------------------------------------------------------------- R1-5: a Claude CLI running in the session folder blocks a restore
+    $zc = @{ Key = "claude:$cli"; ZipPath = $r1[0].ZipPath }
+    $rr = @(Invoke-StorageRestore -Entries @($zc) -Target @{ Kind = 'local'; Path = (Join-Path $tmp 'noindex') } -Roots $roots -Running @{ cli = @('c:\WORK\alpha\') })
+    Assert ($rr[0].Ok -eq $false -and $rr[0].Reason -like '*Claude CLI*') "R1-5: a CLI in the folder of the session: refused ($($rr[0].Reason))"
+    $rr = @(Invoke-StorageRestore -Entries @($zc) -Target @{ Kind = 'local'; Path = (Join-Path $tmp 'noindex') } -Roots $roots -Running @{ cli = @('C:\work') })
+    Assert ($rr[0].Ok -eq $false) 'R1-5: a CLI in a parent folder: refused'
+    $rr = @(Invoke-StorageRestore -Entries @($zc) -Target @{ Kind = 'local'; Path = (Join-Path $tmp 'noindex') } -Roots $roots -Running @{ cli = @('*') })
+    Assert ($rr[0].Ok -eq $false -and $rr[0].Reason -like '*could not be read*') 'R1-5: a CLI whose folder is unknown (*): refused'
+    $rr = @(Invoke-StorageRestore -Entries @($zc) -Target @{ Kind = 'local'; Path = (Join-Path $tmp 'noindex') } -Roots $roots -Running @{ cli = @('C:\elsewhere') })
+    Assert ($rr[0].Ok -eq $true) "R1-5: a CLI somewhere else does not matter ($($rr[0].Reason))"
+    $rr = @(Invoke-StorageRestore -Entries @($zc) -Target @{ Kind = 'local'; Path = (Join-Path $tmp 'noindex'); PathMap = @{ 'C:\work' = 'D:\code' } } -Roots $roots -Running @{ cli = @('D:\code\alpha') })
+    Assert ($rr[0].Ok -eq $false) 'R1-5: with a PathMap the folder it will be restored for is the one that counts'
+    $slugMap = ConvertTo-ClaudeProjectSlug 'D:\code\alpha'; if (Test-Path (Join-Path $proj $slugMap)) { Remove-Item -LiteralPath (Join-Path $proj $slugMap) -Recurse -Force }
+
+    # ---------------------------------------------------------------- R1-2 in the flow: a transcript that grows while the archive is stored is not deleted
+    foreach ($d in $proj, $p1, $p2) { Set-Old $d }
+    $sess = @((Get-StorageInventory -Roots $roots).Sessions | Where-Object { $_.Key -eq "claude:$cli" })[0]
+    $tr = Join-Path $proj "$slug\$cli.jsonl"
+    $rg = @(Invoke-StorageArchive -Sessions @($sess) -Target @{ Kind = 'local'; Path = (Join-Path $tmp 'storeG') } -Roots $roots -MachineId $mid -WorkDir $work -LockProbe $noLock -OnPlaced { [IO.File]::AppendAllText($tr, "grew while stored`n") }.GetNewClosure())
+    Assert ($rg[0].Ok -and (Test-Path $tr) -and (Test-Path (Join-Path $proj "$slug\$cli\subagents\agent-1.jsonl")) -and @($rg[0].Warnings | Where-Object { $_ -like '*changed after it was archived*' }).Count -eq 1) "R1-2: the longer transcript and every other file are kept, with a warning ($($rg[0].Warnings -join '|'))"
+
+    # ---------------------------------------------------------------- R1-1 on Drive
+    # Drive: a second archive adds a row and a file; a Drive copy that fails its read-back leaves the older archives restorable
+    foreach ($d in $proj, $p1, $p2) { Set-Old $d }
+    $dBefore = @(Get-StorageArchiveIndex -Target $dTarget).Count
+    $sess = @((Get-StorageInventory -Roots $roots).Sessions | Where-Object { $_.Key -eq "claude:$cli" })[0]
+    $rd = @(Invoke-StorageArchive -Sessions @($sess) -Target $dTarget -Roots $roots -MachineId $mid -WorkDir $work -LockProbe $noLock)
+    Assert ($rd[0].Ok -and @(Get-StorageArchiveIndex -Target $dTarget).Count -eq $dBefore + 1) 'R1-1: a second Drive archive of the key adds a row'
+    $dNow = @(Get-StorageArchiveIndex -Target $dTarget)
+    $null = @(Invoke-StorageRestore -Entries @($dNow[0]) -Target $dTarget -Roots $roots)
+    foreach ($d in $proj, $p1, $p2) { Set-Old $d }
+    $sess = @((Get-StorageInventory -Roots $roots).Sessions | Where-Object { $_.Key -eq "claude:$cli" })[0]
+    $rbad = @(Invoke-StorageArchive -Sessions @($sess) -Target $dTarget -Roots $roots -MachineId $mid -WorkDir $work -LockProbe $noLock -OnPlaced { param($enc) $b = [IO.File]::ReadAllBytes($enc); $b[[int]($b.Length / 2)] = $b[[int]($b.Length / 2)] -bxor 1; [IO.File]::WriteAllBytes($enc, $b) })
+    $dAfter = @(Get-StorageArchiveIndex -Target $dTarget)
+    Assert ($rbad[0].Ok -eq $false -and $dAfter.Count -eq $dNow.Count) 'R1-1: a failed Drive save removes only its own new row'
+    $okAll = $true; foreach ($row in $dAfter) { $z = Receive-StorageDriveArchive -Entry $row -SyncRoot $dTarget.SyncRoot -Key $dTarget.Key -OutDir (Join-Path $tmp 'recvchk'); if (-not (Read-StorageArchive -ZipPath $z).Verified) { $okAll = $false } }
+    Assert $okAll 'R1-1: every older Drive archive can still be received and verified'
+
 } finally {
     Remove-TestTempDir $tmp
 }

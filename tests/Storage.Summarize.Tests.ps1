@@ -97,14 +97,14 @@ try {
     Assert ($obs.Prompt -notlike "*$secret*" -and $obs.Prompt -notlike '*abcdefghijabcdefghij*') 'a string that looks like a secret never reaches the runner'
     Assert ($obs.Existed -and $obs.Empty -and $obs.WorkDir -like (Join-Path ([IO.Path]::GetTempPath()) 'harness-summary-*') -and -not (Test-Path $obs.WorkDir)) 'the runner works in an empty temp folder that is removed afterwards'
     Assert ($obs.Timeout -eq (Get-StorageSummaryLimits).TimeoutSec -and $obs.Timeout -gt 0) 'with a timeout'
-    $zip = Join-Path $store ('claude\' + (Get-Date -Format 'yyyy-MM') + '\claude_c1.harchive.zip')
+    $zip = @(Get-ChildItem (Join-Path $store 'claude') -Recurse -Filter 'claude_c1.*.harchive.zip')[0].FullName   # R1-1: the file name has an archiveId
     Assert ((Read-StorageArchive -ZipPath $zip).Verified -and (Get-Sha $a.Parts[0].Path) -eq $before) 'the original was archived first and is untouched'
     $sum = [IO.File]::ReadAllText((Join-Path (Split-Path $zip) 'claude_c1.summary.md'))
     Assert ($sum -like '*# Chat c1*' -and $sum -like '*C:\work\alpha*' -and $sum -like '*The login was fixed in auth.ps1*' -and $sum -notlike "*$secret*" -and $res[0].Path -like '*claude_c1.summary.md') '<key>.summary.md has the title, the folder, the summary, redacted'
     # no tool, a Drive store, a session in use, an empty answer
     $script:Calls = @()
     $n = @(Invoke-StorageSummarize -Sessions @((New-Chat 'c2')) -Target $target -MachineId $machine -Confirmed -Runner $runner -Available @())
-    Assert (-not $n[0].Ok -and $n[0].Reason -like '*claude*codex*' -and $script:Calls.Count -eq 0 -and -not (Test-Path (Join-Path $store 'claude\*\claude_c2.harchive.zip'))) 'no CLI on the machine: a reason, no runner, no archive'
+    Assert (-not $n[0].Ok -and $n[0].Reason -like '*claude*codex*' -and $script:Calls.Count -eq 0 -and -not (Test-Path (Join-Path $store 'claude\*\claude_c2.*.harchive.zip'))) 'no CLI on the machine: a reason, no runner, no archive'
     $d = @(Invoke-StorageSummarize -Sessions @((New-Chat 'c3')) -Target @{ Kind = 'drive'; SyncRoot = $tmp; MachineId = $machine; Key = [byte[]](1..32); PathMap = @{} } -MachineId $machine -Confirmed -Runner $runner -Available @('claude'))
     Assert (-not $d[0].Ok -and $d[0].Reason -like 'store-unsupported*' -and $script:Calls.Count -eq 0) 'a Drive store is refused before anything is spent'
     $rc = New-Chat 'c4'; $rc.Parts[0].MTimeTicks = [DateTime]::UtcNow.Ticks; $rc.LastActivity = ([DateTimeOffset][DateTime]::UtcNow).ToUnixTimeMilliseconds()

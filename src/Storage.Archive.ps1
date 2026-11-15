@@ -12,7 +12,7 @@ Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 function Get-StorageArchiveLimits {
-    return @{ MaxBytes = [long]4GB; MaxEntries = 20000; MaxManifestBytes = 1MB }
+    return @{ MaxBytes = [long]4GB; MaxEntries = 20000; MaxManifestBytes = 16MB }
 }
 
 function Get-StorageKeySafe {
@@ -85,14 +85,14 @@ function Get-StorageArchiveRestoreInfo {
 # raised or lowered by tests only.
 function New-StorageArchive {
     param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)][string]$OutDir, [string]$MachineId = '',
-          [long]$MaxBytes = (Get-StorageArchiveLimits).MaxBytes, [int]$MaxEntries = (Get-StorageArchiveLimits).MaxEntries)
+          [long]$MaxBytes = (Get-StorageArchiveLimits).MaxBytes, [int]$MaxEntries = (Get-StorageArchiveLimits).MaxEntries, [string]$ArchiveId = (New-StorageArchiveId))
     $restore = Get-StorageArchiveRestoreInfo -Session $Session
     $files = @(Get-StorageArchiveFiles -Session $Session)
     $total = [long]0; foreach ($f in $files) { $total += $f.Size }
     if ($total -gt $MaxBytes) { throw ('archive-too-large: {0:N1} GB is over the {1:N1} GB limit for one archive.' -f ($total / 1GB), ($MaxBytes / 1GB)) }
     if ($files.Count -gt $MaxEntries) { throw "archive-too-large: $($files.Count) files is over the limit of $MaxEntries for one archive." }
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-    $final = Join-Path $OutDir ((Get-StorageKeySafe $Session.Key) + '.harchive.zip')
+    $final = Join-Path $OutDir ((Get-StorageKeySafe $Session.Key) + '.' + $ArchiveId + '.harchive.zip')
     $tmp = $final + '.tmp-' + [guid]::NewGuid().ToString('N')
     $parts = New-Object Collections.Generic.List[object]
     $zip = $null
@@ -112,16 +112,16 @@ function New-StorageArchive {
             $parts.Add([ordered]@{ role = [string]$f.Part.Role; originalPath = $f.Path; rel = $f.Rel; entry = $name; size = $size; sha256 = (($sha.Hash | ForEach-Object { $_.ToString('x2') }) -join ''); kind = 'file'; profileId = [string]$f.Part.ProfileId; mtimeUtcTicks = $f.MTimeTicks })
             $sha.Dispose()
         }
-        $manifest = [ordered]@{ format = 'harness-archive'; version = 1; key = [string]$Session.Key; harness = [string]$Session.Harness; id = [string]$Session.Id; title = [string]$Session.Title
+        $manifest = [ordered]@{ format = 'harness-archive'; version = 1; archiveId = $ArchiveId; key = [string]$Session.Key; harness = [string]$Session.Harness; id = [string]$Session.Id; title = [string]$Session.Title
             cwd = [string]$Session.Cwd; lastActivity = $Session.LastActivity; archivedAt = (Get-Date).ToUniversalTime().ToString('o'); machineId = $MachineId; parts = @($parts.ToArray()); restore = $restore }
         $w = New-Object IO.StreamWriter($zip.CreateEntry('archive.json').Open(), (New-Object Text.UTF8Encoding($false)))
-        try { $w.Write(($manifest | ConvertTo-Json -Depth 10)) } finally { $w.Dispose() }
+        try { $w.Write(($manifest | ConvertTo-Json -Depth 10 -Compress)) } finally { $w.Dispose() }
         $zip.Dispose(); $zip = $null
         $check = Read-StorageArchive -ZipPath $tmp
         if (-not $check.Verified) { throw "archive-verify-failed: the new archive does not read back correctly ($($check.Reason))." }
         if ([IO.File]::Exists($final)) { [IO.File]::Delete($final) }
         [IO.File]::Move($tmp, $final)
-        return @{ ZipPath = $final; Sha256 = (Get-StorageFileSha256 $final); Manifest = $check.Manifest }
+        return @{ ZipPath = $final; Sha256 = (Get-StorageFileSha256 $final); Manifest = $check.Manifest; ArchiveId = $ArchiveId }
     } finally {
         if ($zip) { $zip.Dispose() }
         if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
@@ -204,19 +204,21 @@ function Get-StorageArchiveIndex {
     return @($rows | Sort-Object { [string]$_.archivedAt } -Descending)
 }
 
-# One row per session key: a newer archive of the same session replaces the older row.
+# One row per archive (R1-1): a newer archive of the same session is a second row, the older one stays.
 function Add-StorageArchiveIndex {
     param([Parameter(Mandatory)]$Target, [Parameter(Mandatory)]$Row)
     $path = Join-Path $Target.Path 'archive-index.jsonl'
-    $rows = @(@(Read-StorageLocalIndex -Path $path) | Where-Object { [string]$_.key -ne [string]$Row.key }) + @($Row)
+    $rows = @(Read-StorageLocalIndex -Path $path) + @($Row)
     Write-StorageTextAtomic -Path $path -Text ((@($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 5 }) -join "`n") + "`n")
 }
 
+# Removes the rows of a key: only the row with this -Entry or -ArchiveId when one is given, else every row of the key. No zip is deleted.
 function Remove-StorageArchiveIndex {
-    param([Parameter(Mandatory)]$Target, [Parameter(Mandatory)][string]$Key)
+    param([Parameter(Mandatory)]$Target, [Parameter(Mandatory)][string]$Key, [string]$Entry = '', [string]$ArchiveId = '')
     $path = Join-Path $Target.Path 'archive-index.jsonl'
     $all = @(Read-StorageLocalIndex -Path $path)
-    $rows = @($all | Where-Object { [string]$_.key -ne $Key })
+    $hit = { param($r) [string]$r.key -eq $Key -and (-not $Entry -or [string]$r.entry -ceq $Entry) -and (-not $ArchiveId -or [string]$r.archiveId -ceq $ArchiveId) }
+    $rows = @($all | Where-Object { -not (& $hit $_) })
     if ($rows.Count -eq $all.Count) { return }
     Write-StorageTextAtomic -Path $path -Text $(if ($rows.Count) { (@($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 5 }) -join "`n") + "`n" } else { '' })
 }
@@ -229,12 +231,12 @@ function Copy-StorageArchiveToStore {
     $sub = Join-Path ([string]$Session.Harness) (Get-Date -Format 'yyyy-MM')
     $dir = Join-Path $StorePath $sub
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    $name = (Get-StorageKeySafe $Session.Key) + '.harchive.zip'
+    $name = (Get-StorageKeySafe $Session.Key) + $(if ($Archive.ArchiveId) { '.' + $Archive.ArchiveId } else { '' }) + '.harchive.zip'
     $final = Join-Path $dir $name; $tmp = $final + '.tmp-' + [guid]::NewGuid().ToString('N')
+    if ([IO.File]::Exists($final)) { throw 'archive-exists: an archive with this id is already in the store.' }   # never overwrite an older archive (R1-1)
     try {
         [IO.File]::Copy($Archive.ZipPath, $tmp)
         if ((Get-StorageFileSha256 $tmp) -ne $Archive.Sha256) { throw 'store-verify-failed: the copy in the store is not the archive that was built.' }
-        if ([IO.File]::Exists($final)) { [IO.File]::Delete($final) }
         [IO.File]::Move($tmp, $final)
     } finally { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } }
     return @{ Path = $final; Entry = ((([string]$Session.Harness) + '/' + (Get-Date -Format 'yyyy-MM') + '/' + $name)) }
@@ -244,7 +246,7 @@ function Copy-StorageArchiveToStore {
 # with what was built. When that fails the row and file on Drive are removed again and this throws.
 function Save-StorageArchiveToDriveChecked {
     param([Parameter(Mandatory)]$Archive, [Parameter(Mandatory)]$Session, [Parameter(Mandatory)]$Target, [Parameter(Mandatory)][string]$WorkDir, [scriptblock]$OnPlaced)
-    $entry = @{ Key = $Session.Key; Harness = $Session.Harness; Title = $Session.Title; Bytes = $Session.Bytes; ZipBytes = (Get-Item -LiteralPath $Archive.ZipPath).Length; LastActivity = $Session.LastActivity }
+    $entry = @{ Key = $Session.Key; Harness = $Session.Harness; Title = $Session.Title; Bytes = $Session.Bytes; ZipBytes = (Get-Item -LiteralPath $Archive.ZipPath).Length; LastActivity = $Session.LastActivity; ArchiveId = $Archive.ArchiveId }
     $row = Save-StorageArchiveToDrive -ZipPath $Archive.ZipPath -Entry $entry -SyncRoot $Target.SyncRoot -MachineId $Target.MachineId -Key $Target.Key
     $recv = Join-Path $WorkDir ('recv-' + [guid]::NewGuid().ToString('N'))
     try {
@@ -281,7 +283,7 @@ function Invoke-StorageArchiveOne {
             $again = Read-StorageArchive -ZipPath $placed.Path
             if (-not $again.Verified -or (Get-StorageFileSha256 $placed.Path) -ne $a.Sha256) { throw "store-verify-failed: the stored archive does not verify ($($again.Reason))." }
             Add-StorageArchiveIndex -Target $Target -Row ([pscustomobject][ordered]@{ key = [string]$Session.Key; harness = [string]$Session.Harness; title = [string]$Session.Title; bytes = [long]$Session.Bytes
-                zipBytes = (Get-Item -LiteralPath $placed.Path).Length; lastActivity = $Session.LastActivity; archivedAt = (Get-Date).ToUniversalTime().ToString('o'); machineId = $MachineId; entry = $placed.Entry; sha256 = $a.Sha256 })
+                zipBytes = (Get-Item -LiteralPath $placed.Path).Length; lastActivity = $Session.LastActivity; archivedAt = (Get-Date).ToUniversalTime().ToString('o'); machineId = $MachineId; entry = $placed.Entry; sha256 = $a.Sha256; archiveId = $a.ArchiveId })
             $res.ZipPath = $placed.Path
         }
     } catch {
@@ -291,7 +293,7 @@ function Invoke-StorageArchiveOne {
     } finally { if ($a -and [IO.File]::Exists($a.ZipPath)) { Remove-Item -LiteralPath $a.ZipPath -Force -ErrorAction SilentlyContinue } }
     try {
         $mode = $(if ($RecycleOriginals) { 'Recycle' } else { 'Delete' })
-        $rm = Remove-StorageSessionOriginal -Session $Session -Roots $Roots -Mode $mode -CodexRpc $CodexRpc -Recycler $Recycler
+        $rm = Remove-StorageSessionOriginal -Session $Session -Roots $Roots -Mode $mode -CodexRpc $CodexRpc -Recycler $Recycler -Manifest $a.Manifest
         if (@($rm.Skipped).Count) { $res.Warnings = @($rm.Skipped | ForEach-Object { "Not removed: $_" }) }
         $res.Ok = $true
     } catch { $res.Ok = $true; $res.Warnings = @("The archive is safe, but the original could not be removed: $($_.Exception.Message)") }
@@ -333,6 +335,24 @@ function Convert-StoragePathByMap {
     return $Path
 }
 
+# R1-4: the relative path of a part must have the shape Get-StoragePartRel gives its role, and carry the session's own id where
+# the path has one. A zip from elsewhere cannot make a role write into the root of CODEX_HOME or of an Antigravity folder.
+function Test-StorageRestoreRel {
+    param([string]$Role, [string]$Rel, [string]$Id)
+    if (@($Rel -split '\\' | Where-Object { $_ -in '', '.', '..' }).Count) { return $false }
+    $i = $(if ($Id) { [regex]::Escape($Id) } else { '[A-Za-z0-9._-]+' }); $n = '[A-Za-z0-9._-]+'; $f = '[^\\/:*?"<>|]+'
+    $shape = switch -Wildcard ($Role) {
+        'transcript' { "\A$n\\$i\.jsonl\z" }
+        'cli-dir' { "\A$n\\$i(\\$f)+\z" }
+        'profile-meta' { "\A$f\\$f\\local_$n\.json\z" }
+        'rollout' { "\Asessions\\\d{4}\\\d{2}\\\d{2}\\rollout-$n\.jsonl(\.zst)?\z|\Aarchived_sessions\\rollout-$n\.jsonl(\.zst)?\z" }
+        'conversation-*' { "\Aconversations\\$i\.(db|pb)(-wal|-shm)?\z" }
+        'brain' { "\Abrain\\$i(\\$f)+\z" }
+        default { return $false }
+    }
+    return ($Rel -match $shape)
+}
+
 # Where every file of the manifest goes on this machine, decided before anything is written. Throws when a path is not
 # safe or a profile that gets files has its app running. Returns @{ Items = @(@{Part; Dest}); Warnings }.
 function Get-StorageRestorePlan {
@@ -355,7 +375,7 @@ function Get-StorageRestorePlan {
     $allowed = @($Roots.ClaudeProjects) + @($Roots.ClaudeProfiles | ForEach-Object { $_.SessionRoot }) + @($codexHome) + @($agyRoot)
     foreach ($p in $Manifest.parts) {
         $rel = [string]$p.rel
-        if ($rel -match '\A[\\/]' -or $rel.Contains(':') -or $rel.Contains("`0")) { throw "restore-refused: unsafe path in the archive: $rel" }
+        if ($rel -match '\A[\\/]' -or $rel.Contains(':') -or $rel.Contains("`0") -or -not (Test-StorageRestoreRel -Role ([string]$p.role) -Rel $rel -Id ([string]$Manifest.id))) { throw "restore-refused: unsafe path in the archive: $rel" }
         $root = $null
         switch ([string]$p.role) {
             { $_ -in 'transcript', 'cli-dir' } {
@@ -381,6 +401,7 @@ function Get-StorageRestorePlan {
         if (-not (Test-StoragePathAllowed -Path $dest -Roots $allowed)) { throw "restore-refused: the path would leave the session folders: $rel" }
         $items.Add(@{ Part = $p; Dest = $dest })
     }
+    if ($Manifest.harness -eq 'claude') { $why = Get-StorageCliBlockReason -Cwd $newCwd -CliCwds @(@($Running['cli']) | Where-Object { $_ }); if ($why) { throw "restore-refused: $why" } }   # R1-5
     $run = @($Running[[string]$Manifest.harness])
     $busy = @($used.Keys | Where-Object { -not $_.StartsWith('missing:') -and $run -contains $_ } | ForEach-Object { $used[$_] })
     if ($busy.Count) { throw ('restore-refused: close ' + ($busy -join ', ') + ' first: its app is running.') }
@@ -453,7 +474,10 @@ function Invoke-StorageRestore {
                     [void](& $CodexRpc ([string]$c[0].Home) 'thread/read' @{ threadId = [string]$m.id; includeTurns = $false })
                 } else { $res.Warnings += 'The rollout is back; Codex has not been asked to pick it up yet.' }
             }
-            if ($Target.Kind -ne 'drive' -and $Target.Path) { Remove-StorageArchiveIndex -Target $Target -Key ([string]$m.key) }
+            if ($Target.Kind -ne 'drive' -and $Target.Path) {
+                if ($e.entry) { Remove-StorageArchiveIndex -Target $Target -Key ([string]$m.key) -Entry ([string]$e.entry) }
+                elseif ($m.PSObject.Properties['archiveId']) { Remove-StorageArchiveIndex -Target $Target -Key ([string]$m.key) -ArchiveId ([string]$m.archiveId) }
+            }
             $res.Ok = $true
         } catch { $res.Reason = $_.Exception.Message } finally {
             if ($zip) { $zip.Dispose() }

@@ -198,7 +198,7 @@ function Save-StorageSafetyArchive {
         $again = Read-StorageArchive -ZipPath $placed.Path
         if (-not $again.Verified -or (Get-StorageFileSha256 $placed.Path) -ne $a.Sha256) { throw "store-verify-failed: the stored archive does not verify ($($again.Reason))." }
         Add-StorageArchiveIndex -Target $Target -Row ([pscustomobject][ordered]@{ key = [string]$Session.Key; harness = [string]$Session.Harness; title = [string]$Session.Title; bytes = [long]$Session.Bytes
-            zipBytes = (Get-Item -LiteralPath $placed.Path).Length; lastActivity = $Session.LastActivity; archivedAt = (Get-Date).ToUniversalTime().ToString('o'); machineId = $MachineId; entry = $placed.Entry; sha256 = $a.Sha256 })
+            zipBytes = (Get-Item -LiteralPath $placed.Path).Length; lastActivity = $Session.LastActivity; archivedAt = (Get-Date).ToUniversalTime().ToString('o'); machineId = $MachineId; entry = $placed.Entry; sha256 = $a.Sha256; archiveId = $a.ArchiveId })
         return @{ ZipPath = $placed.Path; Dir = (Split-Path -Parent $placed.Path) }
     } catch {
         if ($placed -and [IO.File]::Exists($placed.Path)) { Remove-Item -LiteralPath $placed.Path -Force -ErrorAction SilentlyContinue }

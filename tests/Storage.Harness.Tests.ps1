@@ -35,7 +35,7 @@ try {
     $roots = @{ ClaudeProjects = $proj; ClaudeProfiles = @(@{ Id = 'Default'; Name = 'Default'; SessionRoot = (Join-Path $p1 'claude-code-sessions'); DataDir = $p1; IsDefault = $true }); CodexHomes = @(); AgyDirs = @() }
     $sess = @((Get-StorageInventory -Roots $roots).Sessions | Where-Object { $_.Key -eq "claude:$cli" })[0]
     $bin = New-Object Collections.Generic.List[string]
-    $recycler = { param($p) $bin.Add($p) }.GetNewClosure()
+    $recycler = { param($p) $bin.Add($p); Remove-Item -LiteralPath $p -Recurse -Force }.GetNewClosure()   # like the real bin: the path is gone afterwards (R1-6)
 
     $threw = $null; try { Remove-StorageSessionOriginal -Session $sess -Mode Recycle -Roots $roots -Recycler $recycler -VolumeInfo $nukeVolume } catch { $threw = $_.Exception.Message }
     Assert ($threw -like 'recycle-refused*' -and $threw -like '*archive it instead*' -and $bin.Count -eq 0 -and (Test-Path (Join-Path $proj "$slug\$cli.jsonl"))) "a bin that deletes for good: refused, nothing moved ($threw)"
@@ -43,7 +43,8 @@ try {
     Assert ($threw -like 'recycle-refused*' -and $bin.Count -eq 0) 'a probe that throws counts as no'
     $rm = Remove-StorageSessionOriginal -Session $sess -Mode Recycle -Roots $roots -Recycler $recycler -VolumeInfo $okVolume
     Assert ($bin.Count -eq 3 -and $rm.Removed.Count -eq 3) "all three parts went through the fake recycler: $($bin.Count)"
-    Assert ((Test-Path (Join-Path $proj "$slug\$cli.jsonl"))) 'the fake recycler moved nothing itself, so the files are still there'
+    Assert (-not (Test-Path (Join-Path $proj "$slug\$cli.jsonl"))) 'and the files are gone'
+    Write-Text (Join-Path $proj "$slug\$cli.jsonl") 'again'
 
     # a path outside the known folders is never removed
     $evil = $sess | ConvertTo-Json -Depth 6 | ConvertFrom-Json; $evil.Parts[0].Path = (Join-Path $tmp 'elsewhere\x.jsonl'); Write-Text $evil.Parts[0].Path 'x'
@@ -80,10 +81,11 @@ try {
     Assert ($threw -like 'recycle-refused*' -and $calls.Count -eq 0 -and (Test-Path $rollout)) 'the Recycle Bin is asked BEFORE Codex is told to archive: nothing moved'
     $rm = Remove-StorageSessionOriginal -Session $cx -Mode Recycle -Roots $cxRoots -CodexRpc $rpc -Recycler $recycler -VolumeInfo $okVolume
     $arch = Join-Path $codexHome "archived_sessions\rollout-2026-10-01T08-00-00-$tid.jsonl"
-    Assert ($calls.Count -eq 1 -and $calls[0] -eq "thread/archive $tid" -and $bin.Count -eq 1 -and $bin[0] -eq $arch -and (Test-Path $arch)) "archive first, then the file in archived_sessions goes to the bin: $($calls -join ',') / $($bin -join ',')"
+    Assert ($calls.Count -eq 1 -and $calls[0] -eq "thread/archive $tid" -and $bin.Count -eq 1 -and $bin[0] -eq $arch -and -not (Test-Path $arch)) "archive first, then the file in archived_sessions goes to the bin: $($calls -join ',') / $($bin -join ',')"
 
     # a full archive-and-restore of a Codex session with the fake app-server: delete via thread/delete, restore + thread/read
-    Move-Item -LiteralPath $arch -Destination $rollout
+    Write-Text $rollout ('{"type":"session_meta","payload":{"id":"' + $tid + '"}}' + "`n")
+    (Get-Item -LiteralPath $rollout).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-40)
     $store = @{ Kind = 'local'; Path = (Join-Path $tmp 'store') }; $calls.Clear()
     $delRpc = { param($CodexHome, $Method, $Params) $calls.Add("$Method $($Params.threadId)"); if ($Method -eq 'thread/delete') { Remove-Item -LiteralPath $rollout -Force } }.GetNewClosure()
     $r = @(Invoke-StorageArchive -Sessions @($cx) -Target $store -Roots $cxRoots -MachineId 'aaaaaaaa-0000-4000-8000-0000000000aa' -WorkDir (Join-Path $tmp 'work') -LockProbe { param($p) $false } -CodexRpc $delRpc)
@@ -115,6 +117,7 @@ try {
     Assert ($threw -like 'recycle-refused*' -and $bin.Count -eq 0) 'Antigravity Recycle is refused when the bin would delete for good'
     $rm = Remove-StorageSessionOriginal -Session $ag -Mode Recycle -Roots $agyRoots -Recycler $recycler -VolumeInfo $okVolume
     Assert ($bin.Count -eq 2 -and ($bin -notcontains (Join-Path $agyData 'conversation_summaries.db'))) 'Recycle sends the .db and the brain folder, not the summaries database'
+    Write-Text (Join-Path $agyData "conversations\$aid.db") 'db'; Write-Text (Join-Path $agyData "brain\$aid\a.md") 'a'   # the fake bin removed them
     $rm = Remove-StorageSessionOriginal -Session $ag -Mode Delete -Roots $agyRoots
     Assert ($rm.Removed.Count -eq 2 -and -not (Test-Path (Join-Path $agyData "conversations\$aid.db")) -and -not (Test-Path (Join-Path $agyData "brain\$aid")) -and (Test-Path (Join-Path $agyData 'conversation_summaries.db'))) 'Delete removes the same two and leaves the summaries database'
     $agOut = $ag.PSObject.Copy(); $agOut.Parts = @([pscustomobject]@{ Role = 'conversation-db'; Path = (Join-Path $tmp 'elsewhere\c.db'); Bytes = 1; Kind = 'file'; Files = 1; MTimeTicks = 1; ProfileId = 'agy1' }); Write-Text $agOut.Parts[0].Path 'x'
@@ -152,6 +155,56 @@ try {
     $calls.Clear()
     $threw = $null; try { Remove-StorageSessionOriginal -Session $cxF -Mode Recycle -Roots $cxRoots -CodexRpc $rpc -Recycler $recycler -VolumeInfo $okVolume } catch { $threw = $_.Exception.Message }
     Assert ($threw -like '*nothing to send to the Recycle Bin*' -and $calls.Count -eq 0 -and $bin.Count -eq 0) 'no file: Recycle is refused with a clear reason'
+
+    # ---------------------------------------------------------------- R1-6: the bin is checked before and after
+    $keepFile = Join-Path $tmp 'r16\keep.txt'; Write-Text $keepFile 'x'
+    $stays = { param($p) $bin.Add($p) }.GetNewClosure()   # a recycler that says OK and leaves the file where it is
+    $one = [pscustomobject]@{ Flags = @{}; Parts = @([pscustomobject]@{ Role = 'transcript'; Path = $keepFile; Bytes = 1; Kind = 'file' }) }
+    $bin.Clear(); $threw = $null; try { Invoke-StorageRecycle -Session $one -Paths @($keepFile) -Recycler $stays -VolumeInfo $okVolume } catch { $threw = $_.Exception.Message }
+    Assert ($threw -like 'recycle-failed*' -and $threw -like "*$keepFile*") "R1-6: a path that is still there after the recycler ran is an error ($threw)"
+    $goneFirst = Join-Path $tmp 'r16\gone-first.txt'; Write-Text $goneFirst 'x'
+    $bin.Clear(); $threw = $null; try { Invoke-StorageRecycle -Session $one -Paths @($goneFirst, (Join-Path $tmp 'r16\never-existed.txt')) -Recycler $recycler -VolumeInfo $okVolume } catch { $threw = $_.Exception.Message }
+    Assert ($threw -like 'recycle-missing*' -and $bin.Count -eq 0 -and (Test-Path $goneFirst)) 'R1-6: every path is checked before the first one is recycled'
+
+    # ---------------------------------------------------------------- R1-2: with a manifest only the archived files are removed
+    function New-R12Tree($name) {
+        $pr = Join-Path $tmp "$name\claude\projects"; $pf = Join-Path $tmp "$name\p1"; $c = 'eeeeeeee-0000-4000-8000-' + ([guid]::NewGuid().ToString('N').Substring(0, 12))
+        Write-Text (Join-Path $pr "$slug\$c.jsonl") ('{"type":"user","sessionId":"' + $c + '","cwd":"C:\\work\\beta","timestamp":"2026-10-01T08:00:00.000Z","message":{"role":"user","content":"hi"}}' + "`n")
+        Write-Text (Join-Path $pr "$slug\$c\tool-results\out.txt") 'out'; Write-Text (Join-Path $pr "$slug\$c\sub\deep.txt") 'deep'
+        Write-Text (Join-Path $pf 'claude-code-sessions\a\o\local_r.json') ('{"cliSessionId":"' + $c + '","title":"R","cwd":"C:\\work\\beta","createdAt":1759300000000,"lastActivityAt":1759300000000}')
+        foreach ($d in $pr, $pf) { Set-Old $d }
+        $rt = @{ ClaudeProjects = $pr; ClaudeProfiles = @(@{ Id = 'Default'; Name = 'Default'; SessionRoot = (Join-Path $pf 'claude-code-sessions'); DataDir = $pf; IsDefault = $true }); CodexHomes = @(); AgyDirs = @() }
+        $ss = @((Get-StorageInventory -Roots $rt).Sessions | Where-Object { $_.Key -eq "claude:$c" })[0]
+        $man = (New-StorageArchive -Session $ss -OutDir (Join-Path $tmp "$name\out")).Manifest
+        return @{ Roots = $rt; Session = $ss; Manifest = $man; Proj = $pr; Id = $c; Dir = (Join-Path $pr "$slug\$c") }
+    }
+    $t = New-R12Tree 'r12a'
+    Write-Text (Join-Path $t.Dir 'tool-results\born-later.txt') 'new file after the archive was built'
+    $rm = Remove-StorageSessionOriginal -Session $t.Session -Mode Delete -Roots $t.Roots -Manifest $t.Manifest
+    Assert ((Test-Path (Join-Path $t.Dir 'tool-results\born-later.txt')) -and -not (Test-Path (Join-Path $t.Dir 'tool-results\out.txt')) -and -not (Test-Path (Join-Path $t.Dir 'sub')) -and -not (Test-Path (Join-Path $t.Proj "$slug\$($t.Id).jsonl"))) 'R1-2: a file that was never archived is kept, the archived files and the empty folders are gone'
+    Assert (@($rm.Skipped | Where-Object { $_ -like '*born-later.txt*' }).Count -eq 1) 'and it is reported'
+    $t = New-R12Tree 'r12b'
+    [IO.File]::AppendAllText((Join-Path $t.Proj "$slug\$($t.Id).jsonl"), '{"type":"user","message":{"content":"written during the upload"}}' + "`n")
+    $threw = $null; try { Remove-StorageSessionOriginal -Session $t.Session -Mode Delete -Roots $t.Roots -Manifest $t.Manifest } catch { $threw = $_.Exception.Message }
+    Assert ($threw -like 'remove-refused*changed*' -and (Test-Path (Join-Path $t.Dir 'tool-results\out.txt')) -and (Test-Path (Join-Path $t.Dir 'sub\deep.txt'))) "R1-2: a transcript that grew after the archive stops the whole session, nothing is removed ($threw)"
+    $t = New-R12Tree 'r12c'
+    $f = Join-Path $t.Dir 'tool-results\out.txt'; (Get-Item -LiteralPath $f).LastWriteTimeUtc = [DateTime]::UtcNow
+    $rm = Remove-StorageSessionOriginal -Session $t.Session -Mode Delete -Roots $t.Roots -Manifest $t.Manifest
+    Assert (-not (Test-Path $f) -and -not (Test-Path $t.Dir)) 'R1-2: a file with a new mtime but the same size and sha256 is still the archived one'
+    $t = New-R12Tree 'r12d'
+    $outside = Join-Path $tmp 'r12d\outside'; Write-Text (Join-Path $outside 'precious.txt') 'do not touch'
+    $null = cmd /c mklink /J "$($t.Dir)\jct" "$outside" 2>&1
+    $rm = Remove-StorageSessionOriginal -Session $t.Session -Mode Delete -Roots $t.Roots -Manifest $t.Manifest
+    Assert ((Test-Path (Join-Path $outside 'precious.txt')) -and -not (Test-Path (Join-Path $t.Dir 'tool-results\out.txt'))) 'R1-2: a junction in the folder is not followed: its target is untouched'
+    $t = New-R12Tree 'r12e'
+    $bin.Clear()
+    $rm = Remove-StorageSessionOriginal -Session $t.Session -Mode Recycle -Roots $t.Roots -Manifest $t.Manifest -Recycler { param($p) $bin.Add($p); Remove-Item -LiteralPath $p -Recurse -Force }.GetNewClosure() -VolumeInfo $okVolume
+    Assert ($bin.Count -eq 4 -and @($bin | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0 -and -not (Test-Path $t.Dir)) "R1-2: Recycle sends the archived files one by one ($($bin.Count))"
+    # Codex: the rollout must still be the archived one before thread/delete
+    $cxm = (New-StorageArchive -Session $cx -OutDir (Join-Path $tmp 'r12cx')).Manifest
+    $calls.Clear(); [IO.File]::AppendAllText($rollout, "later line`n")
+    $threw = $null; try { Remove-StorageSessionOriginal -Session $cx -Mode Delete -Roots $cxRoots -CodexRpc $rpc -Manifest $cxm } catch { $threw = $_.Exception.Message }
+    Assert ($threw -like 'remove-refused*changed*' -and $calls.Count -eq 0) 'R1-2: a Codex rollout that grew after the archive: thread/delete is not called'
 } finally {
     Remove-TestTempDir $tmp
 }
