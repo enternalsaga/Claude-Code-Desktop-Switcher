@@ -161,6 +161,8 @@ Kiểm nhẹ: `tests/Storage.Compact.Tests.ps1`, `tests/Storage.Summarize.Tests.
 | U1-7 | View `Archived`: đọc index local và Drive; có các nút Restore, Delete archive, Open summary | |
 | U1-8 | Lần archive đầu khi chưa có `Storage.ArchiveTarget`: hỏi chọn thư mục, gợi ý `%USERPROFILE%\HarnessArchive`, hoặc chọn Drive nếu đã thiết lập sync | |
 | U1-9 | Preview PNG của tab Storage với dữ liệu giả qua `tools/Render-UiPreview.ps1` (≤15 dòng thêm), đính kèm đường dẫn PNG trong báo cáo ready | |
+| U1-10 | `New-StorageCodexRpc` trả về scriptblock `{ param($CodexHome, $Method, $Params) }` cho `-CodexRpc` của A1. Test với app-server giả theo kiểu GĐ2: mỗi `CodexHome` mở một app-server và dùng lại trong một lô; `Close-StorageCodexRpc` dừng hết, kể cả khi lô lỗi giữa chừng; lỗi RPC thì ném lỗi, không trả kết quả rỗng | Bổ sung 2026-11-15. Đặt trong `src/Ui.StorageActions.ps1`. Dùng lại `Start-CodexAppServer`, `Invoke-CodexRpc` và `Stop-CodexAppServer` (src/Harness.Codex.AppServer.ps1); không sửa file đó. Gọi thật chỉ ở US5 |
+| U1-11 | Dữ liệu và hành vi đã chốt từ các lane trước: Key của Codex và Antigravity có hậu tố `.<p8>`; phiên có cờ `Flags.DbUnreadable` hiện kèm cảnh báo và không chọn được để archive hoặc delete; `Inventory.Warnings` hiện thành dòng cảnh báo; restore từ Drive giữ nguyên dòng index trên Drive (view Archived đánh dấu "restored" khi Key đã có lại trong inventory); Antigravity hiện các nút Archive và Delete ở trạng thái tắt cho tới khi A1-6 land | Test hàm thuần cho từng điểm |
 
 Kiểm nhẹ: `tests/Ui.Storage.Tests.ps1`, và các test của `Ui.Main` đã có liên quan tới tab.
 
