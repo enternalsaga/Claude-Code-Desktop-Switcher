@@ -199,9 +199,44 @@ try {
     $cancel = @{ Cancel = $false }; $n = 0
     $r = @(Invoke-StorageArchive -Sessions @($ghost, $ghost, $ghost) -Target $target -Roots $roots -MachineId $mid -WorkDir $work -LockProbe $noLock -CancelToken $cancel -OnSession { $script:n++; if ($script:n -eq 1) { $cancel['Cancel'] = $true } })
     Assert ($r.Count -eq 1) "Cancel stops before the next session, not in the middle of one: $($r.Count) results"
-    $ag = $sess | ConvertTo-Json -Depth 6 | ConvertFrom-Json; $ag.Harness = 'antigravity'; $ag.Key = 'antigravity:x.12345678'
-    $r = @(Invoke-StorageArchive -Sessions @($ag) -Target $target -Roots $roots -MachineId $mid -WorkDir $work -LockProbe $noLock)
-    Assert ($r[0].Ok -eq $false -and $r[0].Reason -like '*Antigravity*') 'Antigravity is not archived yet (waits for spike S17)'
+
+    # ---------------------------------------------------------------- Antigravity (S17, plan A): .db/-wal/-shm and brain\<id> only; summaries and hub cache are never touched
+    $agyData = Join-Path $tmp 'agy\antigravity'; $agyId = 'cccccccc-1111-4222-8333-444444444444'
+    Write-Rand (Join-Path $agyData "conversations\$agyId.db") 4000 11
+    Write-Rand (Join-Path $agyData "conversations\$agyId.db-wal") 1500 12
+    Write-Rand (Join-Path $agyData "brain\$agyId\notes\plan.md") 700 13
+    Write-Rand (Join-Path $agyData "brain\$agyId\shot.png") 900 14
+    Set-Old (Join-Path $tmp 'agy')
+    $agyRoots = @{ ClaudeProjects = $proj; ClaudeProfiles = @(); CodexHomes = @(); AgyDirs = @(@{ Id = 'agy1'; Name = 'Antigravity'; DataDir = $agyData; IsDefault = $false }) }
+    $ags = @((Get-StorageInventory -Roots $agyRoots).Sessions | Where-Object { $_.Harness -eq 'antigravity' })[0]
+    Write-Rand (Join-Path $agyData 'conversation_summaries.db') 600 15   # written after the scan: these two must come out of the run unchanged
+    Write-Rand (Join-Path $agyData 'agyhub_summaries_proto.pb') 800 16
+    Set-Old (Join-Path $tmp 'agy')
+    $agyTree = Get-TreeHash (Join-Path $tmp 'agy')
+    $ags.Parts += [pscustomobject]@{ Role = 'summary-row'; Path = (Join-Path $agyData 'conversation_summaries.db'); Bytes = 0; Kind = 'row'; Files = 0; MTimeTicks = 0; ProfileId = '' }
+    $r = @(Invoke-StorageArchive -Sessions @($ags) -Target $target -Roots $agyRoots -MachineId $mid -WorkDir $work -LockProbe $noLock -Running @{ antigravity = @('agy1') })
+    Assert ($r[0].Ok -eq $false -and $r[0].Skipped -and $r[0].Reason -like '*Close*' -and (Get-TreeHash (Join-Path $tmp 'agy')) -eq $agyTree) "the app of the data folder is running: nothing is touched ($($r[0].Reason))"
+    $r = @(Invoke-StorageArchive -Sessions @($ags) -Target $target -Roots $agyRoots -MachineId $mid -WorkDir $work -LockProbe { param($p) $p -like '*-wal' })
+    Assert ($r[0].Ok -eq $false -and (Get-TreeHash (Join-Path $tmp 'agy')) -eq $agyTree) 'a locked file (a helper process still holds it after the window closed): nothing is touched'
+    $r = @(Invoke-StorageArchive -Sessions @($ags) -Target $target -Roots $agyRoots -MachineId $mid -WorkDir $work -LockProbe $noLock)
+    Assert ($r[0].Ok -eq $true) "Antigravity archive: $($r[0] | ConvertTo-Json -Compress)"
+    Assert (-not (Test-Path (Join-Path $agyData "conversations\$agyId.db")) -and -not (Test-Path (Join-Path $agyData "conversations\$agyId.db-wal")) -and -not (Test-Path (Join-Path $agyData "brain\$agyId"))) 'the .db, -wal and brain folder are gone'
+    Assert ((Test-Path (Join-Path $agyData 'conversation_summaries.db')) -and (Test-Path (Join-Path $agyData 'agyhub_summaries_proto.pb'))) 'the summaries database and the hub cache are left alone'
+    $agIx = @(Get-StorageArchiveIndex -Target $target | Where-Object { $_.harness -eq 'antigravity' })
+    Assert ($agIx.Count -eq 1 -and $agIx[0].entry -like 'antigravity/*') 'indexed under antigravity/'
+    $zm = (Read-StorageArchive -ZipPath (Join-Path $tmp ('store\' + $agIx[0].entry.Replace('/', '\')))).Manifest
+    Assert ($zm.restore.antigravity.id -eq $agyId -and $zm.restore.antigravity.dataDir -eq $agyData) 'the manifest records dataDir and id'
+    $res = @(Invoke-StorageRestore -Entries @($agIx[0]) -Target $target -Roots $agyRoots -Running @{ antigravity = @('agy1') })
+    Assert ($res[0].Ok -eq $false -and $res[0].Reason -like '*Antigravity*' -and -not (Test-Path (Join-Path $agyData "conversations\$agyId.db"))) 'restore needs the app closed'
+    $res = @(Invoke-StorageRestore -Entries @($agIx[0]) -Target $target -Roots $agyRoots)
+    Assert ($res[0].Ok -eq $true -and (Get-TreeHash (Join-Path $tmp 'agy')) -eq $agyTree) "restore gives back every byte, nothing else changes: $($res[0].Reason)"
+    $gone = @{ ClaudeProjects = $proj; ClaudeProfiles = @(); CodexHomes = @(); AgyDirs = @() }
+    Remove-StorageSessionOriginal -Session $ags -Mode Delete -Roots $agyRoots | Out-Null
+    $res = @(Invoke-StorageRestore -Entries @(@{ Key = $ags.Key; ZipPath = (Join-Path $tmp ('store\' + $agIx[0].entry.Replace('/', '\'))) }) -Target $target -Roots $gone)
+    Assert ($res[0].Ok -eq $false -and -not (Test-Path (Join-Path $agyData "conversations\$agyId.db"))) "an unknown data folder is refused, nothing written ($($res[0].Reason))"
+    $bins = New-Object Collections.Generic.List[string]
+    $threw = $null; try { Remove-StorageSessionOriginal -Session $ags -Mode Recycle -Roots $agyRoots -Recycler { param($p) $bins.Add($p) }.GetNewClosure() -VolumeInfo { param($p) @{ DriveType = 'Fixed'; IsDriveFs = $false; NukeOnDelete = 0; MaxCapacityMB = 10000 } } } catch { $threw = $_ }
+    Assert ($bins.Count -eq 0 -and $threw) 'Recycle of files that are already gone is reported (recycle-missing)'
 
     # ---------------------------------------------------------------- Drive: the stored copy is read back (Q1) before the original goes
     $script:ProfileRoot = Join-Path $tmp 'profile'; $script:SettingsPath = Join-Path $script:ProfileRoot 'settings.json'; $script:SwitcherHome = Join-Path $tmp 'profile\.switcher'; $script:SyncRetryDelayMs = 5

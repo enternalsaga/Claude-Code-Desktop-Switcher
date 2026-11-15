@@ -38,6 +38,8 @@ function Get-StoragePartRel {
             return ($head + $FilePath.Substring($dir.Length))
         }
         'profile-meta' { if ($FilePath -match '\\claude-code-sessions\\(.+)\z') { return $Matches[1] }; throw "archive-source-invalid: not a chat file of a profile: $FilePath" }
+        { $_ -like 'conversation-*' } { return ('conversations\' + (Split-Path -Leaf $FilePath)) }
+        'brain' { $dir = ([string]$Part.Path).TrimEnd('\'); return ('brain\' + (Split-Path -Leaf $dir) + $FilePath.Substring($dir.Length)) }
         'rollout' { if ($FilePath -match '\\(sessions\\\d{4}\\\d{2}\\\d{2}\\[^\\]+|archived_sessions\\[^\\]+)\z') { return $Matches[1] }; throw "archive-source-invalid: not a rollout under sessions: $FilePath" }
         default { throw "archive-source-invalid: unknown part '$($Part.Role)'" }
     }
@@ -69,7 +71,12 @@ function Get-StorageArchiveRestoreInfo {
     switch ($Session.Harness) {
         'claude' { return @{ claude = @{ profiles = $profiles } } }
         'codex' { return @{ codex = @{ profileId = $(if ($profiles.Count) { $profiles[0].profileId } else { '' }); threadsRow = @{ id = [string]$Session.Id; title = [string]$Session.Title; cwd = [string]$Session.Cwd; lastActivity = $Session.LastActivity; created = $Session.Created; archived = [bool]$Session.Flags.CodexArchived } } } }
-        default { throw "archive-unsupported: $($Session.Harness) sessions cannot be archived yet." }
+        'antigravity' {
+            $first = @($Session.Parts | Where-Object { $_.Role -like 'conversation-*' })[0]
+            if (-not $first) { throw 'archive-source-invalid: this Antigravity conversation has no database file.' }
+            return @{ antigravity = @{ profileId = $(if ($profiles.Count) { $profiles[0].profileId } else { '' }); dataDir = (Split-Path -Parent (Split-Path -Parent ([string]$first.Path))); id = [string]$Session.Id } }
+        }
+        default { throw "archive-unsupported: $($Session.Harness) sessions cannot be archived." }
     }
 }
 
@@ -261,7 +268,7 @@ function Invoke-StorageArchiveOne {
     $res = @{ Key = [string]$Session.Key; Ok = $false; Skipped = $false; Reason = ''; ZipPath = $null; Warnings = @() }
     $safe = Test-StorageSessionSafe -Session $Session @Guard
     if (-not $safe.Safe) { $res.Skipped = $true; $res.Reason = $safe.Reason; return $res }
-    if ($Session.Harness -notin 'claude', 'codex') { $res.Reason = "$($Session.Harness) sessions cannot be archived yet (Antigravity waits for spike S17)."; $res.Reason = $res.Reason.Replace('antigravity', 'Antigravity'); return $res }
+    if ($Session.Harness -notin 'claude', 'codex', 'antigravity') { $res.Reason = "$($Session.Harness) sessions cannot be archived."; return $res }
     $a = $null; $placed = $null
     try {
         $a = New-StorageArchive -Session $Session -OutDir $WorkDir -MachineId $MachineId
@@ -338,7 +345,14 @@ function Get-StorageRestorePlan {
         if (-not $c.Count) { throw 'restore-refused: no CODEX_HOME is known.' }
         $codexHome = [string]$c[0].Home
     }
-    $allowed = @($Roots.ClaudeProjects) + @($Roots.ClaudeProfiles | ForEach-Object { $_.SessionRoot }) + @($codexHome)
+    $agyRoot = $null
+    if ($Manifest.harness -eq 'antigravity') {
+        $ar = $Manifest.restore.antigravity
+        $d = @($Roots.AgyDirs | Where-Object { [string]$_.Id -ieq [string]$ar.profileId }); if (-not $d.Count) { $d = @($Roots.AgyDirs | Where-Object { [string]$_.DataDir -ieq [string]$ar.dataDir }) }
+        if (-not $d.Count) { throw 'restore-refused: the Antigravity data folder of this archive is not known on this machine.' }
+        $agyRoot = [string]$d[0].DataDir; $used[[string]$d[0].Id] = [string]$d[0].Name
+    }
+    $allowed = @($Roots.ClaudeProjects) + @($Roots.ClaudeProfiles | ForEach-Object { $_.SessionRoot }) + @($codexHome) + @($agyRoot)
     foreach ($p in $Manifest.parts) {
         $rel = [string]$p.rel
         if ($rel -match '\A[\\/]' -or $rel.Contains(':') -or $rel.Contains("`0")) { throw "restore-refused: unsafe path in the archive: $rel" }
@@ -360,6 +374,7 @@ function Get-StorageRestorePlan {
                 $root = $codexHome
                 if ($rel -match '\Aarchived_sessions\\rollout-(\d{4})-(\d{2})-(\d{2})T[^\\]*\z') { $rel = "sessions\$($Matches[1])\$($Matches[2])\$($Matches[3])\" + (Split-Path -Leaf $rel) }
             }
+            { $_ -like 'conversation-*' -or $_ -eq 'brain' } { if (-not $agyRoot) { throw "restore-refused: unexpected part '$($p.role)'" }; $root = $agyRoot }
             default { throw "restore-refused: unknown part '$($p.role)'" }
         }
         $dest = Join-Path $root $rel

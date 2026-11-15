@@ -91,6 +91,11 @@ Assert ($c.Text -like '*2 sessions (11 MB)*' -and $c.Text -like '*Recoverable fr
 $cliWarn = '*Close any Claude Code terminal still working in these folders first; it cannot be detected.*'
 Assert ((Get-StorageConfirmContent -Action 'Archive' -Rows $sel -TargetText 'x').Text -like $cliWarn -and $c.Text -like $cliWarn) 'Archive and Delete with a Claude session warn about open Claude Code terminals'
 Assert ((Get-StorageConfirmContent -Action 'Delete' -Rows @((Row 'codex:x1.11223344'))).Text -notlike $cliWarn) 'a Codex-only batch has no such warning'
+. (Import-TestFunctions -Files @((Join-Path $root 'src\Storage.Harness.ps1')) -Names @('Get-StorageHarnessRemovalNotice'))
+$agyBatch = @((Row 'claude:c1'), (Row 'antigravity:g1.aabbccdd'))
+Assert ((Get-StorageConfirmContent -Action 'Archive' -Rows $agyBatch -TargetText 'x').Text -like '*Conversation unavailable*' -and (Get-StorageConfirmContent -Action 'Delete' -Rows $agyBatch).Text -like '*Conversation unavailable*') 'S17: Archive and Delete with an Antigravity session say the conversation stays listed as unavailable'
+Assert ((Get-StorageConfirmContent -Action 'Archive' -Rows $sel -TargetText 'x').Text -notlike '*Conversation unavailable*' -and (Get-StorageConfirmContent -Action 'Delete' -Rows $sel).Text -notlike '*Conversation unavailable*') 'a Claude and Codex batch has no such sentence'
+Assert ((Get-StorageConfirmContent -Action 'Restore' -Rows $agyBatch).Text -notlike '*Conversation unavailable*') 'Restore does not say it'
 $plan = @(@{ Key = 'claude:c1'; Tool = 'claude'; InputChars = 40000; EstTokens = 10000 }, @{ Key = 'codex:x1.11223344'; Tool = 'codex'; InputChars = 8000; EstTokens = 2000 })
 $c = Get-StorageConfirmContent -Action 'Summarize' -Rows $sel -Plan $plan
 Assert ($c.Text -like '*claude, codex*' -and $c.Text -like '*12,000 input tokens*' -and $c.Text -like '*sends the redacted transcript to Anthropic, OpenAI using your claude, codex sign-in and uses tokens*' -and $c.DefaultButton -eq 'Cancel' -and $c.Ok -eq 'Summarize') "Summarize: tool, tokens and the cost sentence: $($c.Text)"

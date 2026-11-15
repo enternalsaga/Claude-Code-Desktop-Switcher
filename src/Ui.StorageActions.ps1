@@ -200,6 +200,9 @@ function Get-StorageConfirmContent {
     }
     $body = $t.Body
     if ($Action -in 'Archive', 'Delete' -and @($rows | Where-Object { $_.Session -and $_.Session.Harness -eq 'claude' }).Count) { $body += "`n`nClose any Claude Code terminal still working in these folders first; it cannot be detected." }
+    if ($Action -in 'Archive', 'Delete' -and (Get-Command Get-StorageHarnessRemovalNotice -ErrorAction SilentlyContinue)) {
+        foreach ($h in @($rows | Where-Object { $_.Session } | ForEach-Object { $_.Session.Harness } | Sort-Object -Unique)) { $note = Get-StorageHarnessRemovalNotice -Harness $h; if ($note) { $body += "`n`n$note" } }
+    }
     if (@($Blocked).Count) { $body += "`n`nLeft out:`n" + ((@($Blocked | Select-Object -First 8 | ForEach-Object { '- {0}: {1}' -f $_.Title, $_.Reason }) -join "`n")) + $(if (@($Blocked).Count -gt 8) { "`n- and $(@($Blocked).Count - 8) more" } else { '' }) }
     return @{ Title = $t.Title; Text = $body; Ok = $t.Ok; DefaultButton = 'Cancel' }
 }

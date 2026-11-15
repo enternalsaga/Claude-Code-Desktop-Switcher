@@ -34,12 +34,26 @@ function Get-StorageCodexHomeOf {
     return [string]$h[0].Home
 }
 
-function Remove-StorageClaudePaths {
-    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)]$Roots, [Parameter(Mandatory)][string]$Mode, [scriptblock]$Recycler, [scriptblock]$VolumeInfo)
-    $allowed = @($Roots.ClaudeProjects) + @($Roots.ClaudeProfiles | ForEach-Object { $_.SessionRoot })
+# What the UI may offer for a harness: Archive, Delete and Restore work for all three; anything else does not.
+function Test-StorageHarnessSupported {
+    param([Parameter(Mandatory)][string]$Harness, [Parameter(Mandatory)][string]$Action)
+    return ($Harness -in 'claude', 'codex', 'antigravity' -and $Action -in 'Archive', 'Delete', 'Restore')
+}
+
+# The words a confirmation box must show before the files of a session are removed (S17: Antigravity keeps listing the conversation).
+function Get-StorageHarnessRemovalNotice {
+    param([Parameter(Mandatory)][string]$Harness)
+    if ($Harness -ne 'antigravity') { return '' }
+    return 'Antigravity keeps the conversation in its list after its files are removed. Opening it shows "Conversation unavailable" until you restore it here or delete the entry inside Antigravity. Close Antigravity before you continue.'
+}
+
+# Removes the file and folder parts of a session (a summaries "row" part is never touched). Every path must lie below one of
+# the allowed roots. Delete = for good; Recycle = through Invoke-StorageRecycle.
+function Remove-StoragePartPaths {
+    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)][string[]]$Allowed, [Parameter(Mandatory)][string]$Mode, [scriptblock]$Recycler, [scriptblock]$VolumeInfo, [string]$Label = 'known')
     $paths = New-Object Collections.Generic.List[string]
     foreach ($p in @($Session.Parts | Where-Object { $_.Kind -ne 'row' })) {
-        if (-not (Test-StoragePathAllowed -Path ([string]$p.Path) -Roots $allowed)) { throw "remove-refused: $($p.Path) is not inside a known Claude folder." }
+        if (-not (Test-StoragePathAllowed -Path ([string]$p.Path) -Roots $Allowed)) { throw "remove-refused: $($p.Path) is not inside a $Label folder." }
         $paths.Add([string]$p.Path)
     }
     $done = New-Object Collections.Generic.List[string]
@@ -50,6 +64,20 @@ function Remove-StorageClaudePaths {
         foreach ($p in $paths) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force }; $done.Add($p) }
     }
     return @{ Removed = $done.ToArray(); Skipped = @() }
+}
+
+function Remove-StorageClaudePaths {
+    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)]$Roots, [Parameter(Mandatory)][string]$Mode, [scriptblock]$Recycler, [scriptblock]$VolumeInfo)
+    $allowed = @($Roots.ClaudeProjects) + @($Roots.ClaudeProfiles | ForEach-Object { $_.SessionRoot })
+    return (Remove-StoragePartPaths -Session $Session -Allowed $allowed -Mode $Mode -Recycler $Recycler -VolumeInfo $VolumeInfo -Label 'known Claude')
+}
+
+# Antigravity (S17, plan A): the conversation .db/-wal/-shm and brain\<id> only. conversation_summaries.db and
+# agyhub_summaries_proto.pb are never touched, so the app still lists the conversation as unavailable.
+function Remove-StorageAgyPaths {
+    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)]$Roots, [Parameter(Mandatory)][string]$Mode, [scriptblock]$Recycler, [scriptblock]$VolumeInfo)
+    $allowed = @($Roots.AgyDirs | ForEach-Object { $_.DataDir })
+    return (Remove-StoragePartPaths -Session $Session -Allowed $allowed -Mode $Mode -Recycler $Recycler -VolumeInfo $VolumeInfo -Label 'known Antigravity data')
 }
 
 # Codex. Through the app-server: a permanent removal (after a verified archive) is thread/delete, which removes the row and
@@ -95,6 +123,7 @@ function Remove-StorageSessionOriginal {
     switch ($Session.Harness) {
         'claude' { return (Remove-StorageClaudePaths -Session $Session -Roots $Roots -Mode $Mode -Recycler $Recycler -VolumeInfo $VolumeInfo) }
         'codex' { return (Remove-StorageCodexSession -Session $Session -Roots $Roots -Mode $Mode -CodexRpc $CodexRpc -Recycler $Recycler -VolumeInfo $VolumeInfo) }
-        default { throw "remove-unsupported: $($Session.Harness) sessions cannot be removed yet." }
+        'antigravity' { return (Remove-StorageAgyPaths -Session $Session -Roots $Roots -Mode $Mode -Recycler $Recycler -VolumeInfo $VolumeInfo) }
+        default { throw "remove-unsupported: $($Session.Harness) sessions cannot be removed." }
     }
 }

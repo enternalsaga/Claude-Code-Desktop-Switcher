@@ -95,6 +95,32 @@ try {
     Assert ($back[0].Ok -and (Test-Path $rollout) -and $calls.Count -eq 1 -and $calls[0] -eq "thread/read $tid") "the rollout is back under sessions\yyyy\mm\dd and Codex is asked to read it: $($back[0] | ConvertTo-Json -Compress)"
     Assert ([IO.File]::ReadAllText($rollout).Contains($tid)) 'same content'
 
+    # what the UI may offer, and the words it must show before Antigravity files are removed
+    foreach ($h in 'claude', 'codex', 'antigravity') { foreach ($act in 'Archive', 'Delete', 'Restore') { Assert ((Test-StorageHarnessSupported -Harness $h -Action $act) -eq $true) "$h $act is supported" } }
+    Assert ((Test-StorageHarnessSupported -Harness 'antigravity' -Action 'Trim') -eq $false -and (Test-StorageHarnessSupported -Harness 'other' -Action 'Archive') -eq $false) 'anything else is not'
+    $note = Get-StorageHarnessRemovalNotice -Harness 'antigravity'
+    Assert ($note -like '*Conversation unavailable*' -and $note -like '*Antigravity*' -and $note -like '*restore*') 'the Antigravity notice says the conversation stays listed as unavailable'
+    Assert ((Get-StorageHarnessRemovalNotice -Harness 'claude') -eq '') 'no notice for the other harnesses'
+
+    # Antigravity removal: parts of the conversation only, inside the data folder, never the summaries row
+    $agyData = Join-Path $tmp 'agy\antigravity'; $aid = 'dddddddd-1111-4222-8333-444444444444'
+    Write-Text (Join-Path $agyData "conversations\$aid.db") 'db'; Write-Text (Join-Path $agyData "brain\$aid\a.md") 'a'; Write-Text (Join-Path $agyData 'conversation_summaries.db') 'sum'
+    $agyRoots = @{ ClaudeProjects = $proj; ClaudeProfiles = @(); CodexHomes = @(); AgyDirs = @(@{ Id = 'agy1'; Name = 'Antigravity'; DataDir = $agyData; IsDefault = $false }) }
+    $ag = [pscustomobject]@{ Harness = 'antigravity'; Key = "antigravity:$aid.12345678"; Id = $aid; Title = 'T'; Cwd = ''; LastActivity = 1; Created = 1; Profiles = @([pscustomobject]@{ Id = 'agy1'; Name = 'Antigravity' }); Bytes = 3; State = 'idle'; Flags = @{}
+        Parts = @([pscustomobject]@{ Role = 'conversation-db'; Path = (Join-Path $agyData "conversations\$aid.db"); Bytes = 2; Kind = 'file'; Files = 1; MTimeTicks = 1; ProfileId = 'agy1' },
+                  [pscustomobject]@{ Role = 'brain'; Path = (Join-Path $agyData "brain\$aid"); Bytes = 1; Kind = 'dir'; Files = 1; MTimeTicks = 1; ProfileId = 'agy1' },
+                  [pscustomobject]@{ Role = 'summary-row'; Path = (Join-Path $agyData 'conversation_summaries.db'); Bytes = 0; Kind = 'row'; Files = 0; MTimeTicks = 0; ProfileId = '' }) }
+    $bin.Clear()
+    $threw = $null; try { Remove-StorageSessionOriginal -Session $ag -Mode Recycle -Roots $agyRoots -Recycler $recycler -VolumeInfo $nukeVolume } catch { $threw = $_.Exception.Message }
+    Assert ($threw -like 'recycle-refused*' -and $bin.Count -eq 0) 'Antigravity Recycle is refused when the bin would delete for good'
+    $rm = Remove-StorageSessionOriginal -Session $ag -Mode Recycle -Roots $agyRoots -Recycler $recycler -VolumeInfo $okVolume
+    Assert ($bin.Count -eq 2 -and ($bin -notcontains (Join-Path $agyData 'conversation_summaries.db'))) 'Recycle sends the .db and the brain folder, not the summaries database'
+    $rm = Remove-StorageSessionOriginal -Session $ag -Mode Delete -Roots $agyRoots
+    Assert ($rm.Removed.Count -eq 2 -and -not (Test-Path (Join-Path $agyData "conversations\$aid.db")) -and -not (Test-Path (Join-Path $agyData "brain\$aid")) -and (Test-Path (Join-Path $agyData 'conversation_summaries.db'))) 'Delete removes the same two and leaves the summaries database'
+    $agOut = $ag.PSObject.Copy(); $agOut.Parts = @([pscustomobject]@{ Role = 'conversation-db'; Path = (Join-Path $tmp 'elsewhere\c.db'); Bytes = 1; Kind = 'file'; Files = 1; MTimeTicks = 1; ProfileId = 'agy1' }); Write-Text $agOut.Parts[0].Path 'x'
+    $threw = $null; try { Remove-StorageSessionOriginal -Session $agOut -Mode Delete -Roots $agyRoots } catch { $threw = $_.Exception.Message }
+    Assert ($threw -like 'remove-refused*' -and (Test-Path $agOut.Parts[0].Path)) 'a file outside the data folder is refused'
+
     # a recycle of a file that is not there is an error, not a silent success (the fake app-server moves nothing here)
     $calls.Clear(); $bin.Clear()
     $noMove = { param($CodexHome, $Method, $Params) $calls.Add("$Method $($Params.threadId)") }.GetNewClosure()
