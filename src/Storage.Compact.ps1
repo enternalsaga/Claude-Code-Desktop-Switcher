@@ -7,9 +7,9 @@
 
 Add-Type -AssemblyName System.Web.Extensions
 
-# Which harness may be cut in place. Codex passed spike S15; Claude stays a read-only copy until spike S14 passes (then this is
-# a one-line change). A Codex sub-agent rollout is never cut in place.
-$script:StorageTrimInPlace = @{ claude = $false; codex = $true }
+# Which harness may be cut in place. Codex passed spike S15 and Claude passed S14; a harness set to $false only gets a read-only
+# copy. A Codex sub-agent rollout is never cut in place.
+$script:StorageTrimInPlace = @{ claude = $true; codex = $true }
 
 function Get-StorageTrimLimits { return @{ Threshold = 16KB; Head = 2KB; Tail = 1KB } }
 

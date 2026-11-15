@@ -34,6 +34,25 @@ try {
     $r = Test-StorageSessionSafe -Session $idle -Now $now -CliCwds @('c:\WORK\')
     Assert ($r.State -eq 'live' -and $r.Reason -like '*claude*') 'a running Claude CLI in the same folder is live (case and trailing slash ignored)'
     Assert ((Test-StorageSessionSafe -Session $idle -Now $now -CliCwds @('C:\other')).Safe) 'another folder does not matter'
+    # folders match whole names, either one inside the other
+    $mk = { param($cwd) $s = New-Sess 'claude' @('Default') @((New-FilePart $f1)); $s.Cwd = $cwd; $s }
+    $live = { param($cwd, $cli) (Test-StorageSessionSafe -Session (& $mk $cwd) -Now $now -CliCwds @($cli)).State -eq 'live' }
+    Assert (& $live 'D:\a\b' 'D:\a\b') 'equal folders match'
+    Assert (& $live 'D:\a\b' 'd:\A\B') 'case is ignored'
+    Assert ((& $live 'D:\a\b\' 'D:\a\b') -and (& $live 'D:\a\b' 'D:\a\b\')) 'a trailing backslash on either side is ignored'
+    Assert (& $live 'D:\a\b' 'D:\a\b\src\deep') 'a CLI in a sub-folder of the session folder matches'
+    Assert (& $live 'D:\a\b\pkg' 'D:\a\b') 'a session folder inside the CLI folder matches'
+    Assert (-not (& $live 'D:\a\bc' 'D:\a\b') -and -not (& $live 'D:\a\b' 'D:\a\bc') -and -not (& $live 'D:\a\b' 'D:\a\b2\x')) 'D:\a\bc is not D:\a\b (whole folder names)'
+    Assert (-not (& $live '' 'D:\a\b')) 'a session without a folder matches no CLI'
+    # a CLI whose folder could not be read is the token '*': every Claude session is live, other harnesses are not touched
+    $r = Test-StorageSessionSafe -Session $idle -Now $now -CliCwds @('*')
+    Assert ($r.Safe -eq $false -and $r.State -eq 'live' -and $r.Reason -eq 'A Claude CLI is running and its folder could not be read; close Claude Code terminals first.') "an unreadable CLI folder blocks Claude: $($r | ConvertTo-Json -Compress)"
+    Assert ((Test-StorageSessionSafe -Session (New-Sess 'codex' @('P1') @((New-FilePart $f1))) -Now $now -CliCwds @('*')).Safe) 'and does not block Codex'
+    # the same folders can come inside -Running (the UI hands one table to every action)
+    $r = Test-StorageSessionSafe -Session $idle -Now $now -Running @{ cli = @('C:\work') }
+    Assert ($r.State -eq 'live' -and $r.Reason -like '*claude*') 'Running.cli carries the CLI folders too'
+    Assert ((Test-StorageSessionSafe -Session $idle -Now $now -Running @{ cli = @('C:\other') }).Safe) 'and another folder does not matter there either'
+    Assert ((Test-StorageSessionSafe -Session $idle -Now $now -Running @{ cli = @('*') }).State -eq 'live') 'a * in Running.cli blocks Claude as well'
 
     # protected: the profile's app is running
     $r = Test-StorageSessionSafe -Session $idle -Now $now -Running @{ claude = @('Default') }

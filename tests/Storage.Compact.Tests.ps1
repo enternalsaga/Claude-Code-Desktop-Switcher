@@ -99,7 +99,7 @@ try {
     Assert ($zr -like 'trim-unsupported*') "the refusal says why: $zr"
 
     # ---- C1-3: Invoke-StorageTrim -------------------------------------------------------------------------------------------------------------
-    Assert ($script:StorageTrimInPlace.codex -eq $true -and $script:StorageTrimInPlace.claude -eq $false) 'the constant: Codex in place (S15), Claude a read-only copy until S14'
+    Assert ($script:StorageTrimInPlace.codex -eq $true -and $script:StorageTrimInPlace.claude -eq $true) 'the constant: Codex (S15) and Claude (S14) are cut in place'
     $old = [DateTime]::UtcNow.AddDays(-40); $oldMs = ([DateTimeOffset]$old).ToUnixTimeMilliseconds()
     $store = Join-Path $tmp 'store'; $target = @{ Kind = 'local'; Path = $store; PathMap = @{} }
     $machine = 'aaaaaaaa-0000-4000-8000-000000000001'
@@ -148,23 +148,32 @@ try {
     Assert ($res[0].Ok -and $res[0].Mode -eq 'ReadOnlyCopy' -and (Get-Sha $cs.Parts[0].Path) -eq $bs -and @($res[0].Warnings).Count -ge 1) 'a sub-agent rollout falls back to a read-only copy and says so'
     # Claude: InPlace asked, the constant says no -> read-only copy
     $cl = New-ClaudeFiles 'c1'; $bl = Get-Sha $cl.Parts[0].Path
-    $res = @(Invoke-StorageTrim -Sessions @($cl) -Target $target -Mode InPlace -MachineId $machine)
+    $script:StorageTrimInPlace.claude = $false   # the gate closed: InPlace is only a request
+    try { $res = @(Invoke-StorageTrim -Sessions @($cl) -Target $target -Mode InPlace -MachineId $machine) } finally { $script:StorageTrimInPlace.claude = $true }
     $md = Join-Path $store ('claude\' + (Get-Date -Format 'yyyy-MM') + '\claude_c1.trimmed.md')
-    Assert ($res[0].Ok -and $res[0].Mode -eq 'ReadOnlyCopy' -and (Get-Sha $cl.Parts[0].Path) -eq $bl) 'Claude stays untouched while S14 has not passed'
+    Assert ($res[0].Ok -and $res[0].Mode -eq 'ReadOnlyCopy' -and (Get-Sha $cl.Parts[0].Path) -eq $bl) 'with the gate closed Claude stays untouched and gets a read-only copy'
     $mdText = [IO.File]::ReadAllText($md)
     Assert ($mdText -like '*Chat c1*' -and $mdText -like '*KB trimmed; full output in archive claude:c1*' -and $mdText -notlike '*' + ('B' * 5000) + '*') 'claude_c1.trimmed.md reads the chat with the big output cut'
     Assert (Test-Path (Join-Path (Split-Path $md) 'claude_c1.trim.json')) 'and has its trim.json'
     $res = @(Invoke-StorageTrim -Sessions @($cl) -Target $target -Mode ReadOnlyCopy -MachineId $machine)
     Assert ($res[0].Ok -and (Get-Sha $cl.Parts[0].Path) -eq $bl) 'ReadOnlyCopy keeps the original byte for byte'
-    # Claude in place once the constant is flipped, with a tool-results file and a sub-agent file
-    $script:StorageTrimInPlace.claude = $true
-    try {
-        $cl2 = New-ClaudeFiles 'c2' -WithCli; $cliDir = $cl2.Parts[1].Path; $subBefore = Get-Sha (Join-Path $cliDir 'subagents\agent-1.jsonl')
-        $res = @(Invoke-StorageTrim -Sessions @($cl2) -Target $target -Mode InPlace -MachineId $machine)
-        Assert ($res[0].Ok -and $res[0].Mode -eq 'InPlace') "Claude InPlace after the flip: $($res[0].Reason)"
-        Assert ((Get-Item (Join-Path $cliDir 'tool-results\out.txt')).Length -lt 4000 -and (Get-Item $cl2.Parts[0].Path).Length -lt 12000 -and (Get-Sha (Join-Path $cliDir 'subagents\agent-1.jsonl')) -eq $subBefore) 'the transcript and the tool-results file are cut; other files of the folder are not'
-        Assert ((Read-StorageArchive -ZipPath (Join-Path $store ('claude\' + (Get-Date -Format 'yyyy-MM') + '\claude_c2.harchive.zip'))).Verified) 'with an archive made first'
-    } finally { $script:StorageTrimInPlace.claude = $false }
+    # Claude in place (S14 passed), with a tool-results file and a sub-agent file
+    $cl2 = New-ClaudeFiles 'c2' -WithCli; $cliDir = $cl2.Parts[1].Path; $subBefore = Get-Sha (Join-Path $cliDir 'subagents\agent-1.jsonl')
+    $res = @(Invoke-StorageTrim -Sessions @($cl2) -Target $target -Mode InPlace -MachineId $machine)
+    Assert ($res[0].Ok -and $res[0].Mode -eq 'InPlace') "Claude InPlace: $($res[0].Reason)"
+    Assert ((Get-Item (Join-Path $cliDir 'tool-results\out.txt')).Length -lt 4000 -and (Get-Item $cl2.Parts[0].Path).Length -lt 12000 -and (Get-Sha (Join-Path $cliDir 'subagents\agent-1.jsonl')) -eq $subBefore) 'the transcript and the tool-results file are cut; other files of the folder are not'
+    Assert ((Read-StorageArchive -ZipPath (Join-Path $store ('claude\' + (Get-Date -Format 'yyyy-MM') + '\claude_c2.harchive.zip'))).Verified) 'with an archive made first'
+    # the guard for a Claude session: recent, open file, running app, running CLI in its folder
+    $cg = New-ClaudeFiles 'g1'; $bg = Get-Sha $cg.Parts[0].Path
+    $r1 = @(Invoke-StorageTrim -Sessions @($cg) -Target $target -Mode InPlace -MachineId $machine -LockProbe { param($p) $true })
+    Assert ($r1[0].Skipped -and $r1[0].Reason -like '*open in another program*' -and (Get-Sha $cg.Parts[0].Path) -eq $bg) 'Claude: a file open elsewhere (live) is skipped and untouched'
+    $r2 = @(Invoke-StorageTrim -Sessions @($cg) -Target $target -Mode InPlace -MachineId $machine -Running @{ claude = @('Default') })
+    Assert ($r2[0].Skipped -and $r2[0].Reason -like 'Close Default first*' -and (Get-Sha $cg.Parts[0].Path) -eq $bg) 'Claude: a running app of the profile (protected) is skipped and untouched'
+    $r3 = @(Invoke-StorageTrim -Sessions @($cg) -Target $target -Mode InPlace -MachineId $machine -CliCwds @('C:\work\alpha'))
+    Assert ($r3[0].Skipped -and $r3[0].Reason -like '*Claude CLI is running*' -and (Get-Sha $cg.Parts[0].Path) -eq $bg) 'Claude: a CLI running in the folder of the session is skipped and untouched'
+    $cg.Parts[0].MTimeTicks = [DateTime]::UtcNow.Ticks; $cg.LastActivity = ([DateTimeOffset][DateTime]::UtcNow).ToUnixTimeMilliseconds()
+    $r4 = @(Invoke-StorageTrim -Sessions @($cg) -Target $target -Mode InPlace -MachineId $machine)
+    Assert ($r4[0].Skipped -and $r4[0].Reason -like 'Used in the last*' -and (Get-Sha $cg.Parts[0].Path) -eq $bg) 'Claude: a recent session is skipped and untouched'
     # a recent session is skipped in place (not for a read-only copy)
     $cr = New-CodexFiles 'r1'; $cr.Parts[0].MTimeTicks = [DateTime]::UtcNow.Ticks; $cr.LastActivity = ([DateTimeOffset][DateTime]::UtcNow).ToUnixTimeMilliseconds(); $br = Get-Sha $cr.Parts[0].Path
     $res = @(Invoke-StorageTrim -Sessions @($cr) -Target $target -Mode InPlace -MachineId $machine)

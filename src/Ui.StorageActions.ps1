@@ -165,6 +165,7 @@ function Get-StorageRunningIds {
         $ids.antigravity = @(Find-AntigravityInstall | Where-Object { Find-AgyMainProcessId -Exe $_.Exe } | ForEach-Object { [string]$_.Id })
     } catch { Write-HarnessLog "Storage: could not tell whether Antigravity runs: $($_.Exception.Message)" }
     try { $ids.codex = @(Get-CodexProfiles | Where-Object { $_.Pid } | ForEach-Object { [string]$_.Id }) } catch { Write-HarnessLog "Storage: could not tell whether Codex runs: $($_.Exception.Message)" }
+    try { $ids.cli = @(Get-StorageClaudeCliCwds) } catch { $ids.cli = @('*'); Write-HarnessLog "Storage: could not list the Claude CLIs: $($_.Exception.Message)" }   # the guard reads cli from -Running
     return $ids
 }
 

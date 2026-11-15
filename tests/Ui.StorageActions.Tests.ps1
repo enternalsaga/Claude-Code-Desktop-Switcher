@@ -88,6 +88,15 @@ $plan3 = Get-StorageActionPlan -Rows @([pscustomobject]@{ Key = 'claude:c1'; Tit
 Assert ($plan3.Safe.Count -eq 0 -and $plan3.Blocked[0].Reason -like '*open in another program*') 'a locked session is left out'
 $ids = Get-StorageRunningIds -Roots @{} -Source { @{ claude = @('A'); codex = @(); antigravity = @() } }
 Assert ($ids.claude -contains 'A') 'running ids come from the source given'
+# the folders of the running Claude CLIs ride in the same table, so every action (archive, delete, trim, summarize) sees them
+function Get-StorageClaudeCliCwds { return @('D:\Work\alpha') }
+Assert ((Get-StorageRunningIds -Roots @{ ClaudeProfiles = @() }).cli -contains 'D:\Work\alpha') 'Running.cli lists the folders of the running Claude CLIs'
+function Get-StorageClaudeCliCwds { throw 'wmi down' }
+Assert ((Get-StorageRunningIds -Roots @{ ClaudeProfiles = @() }).cli -contains '*') 'when the CLIs cannot be listed the token * blocks every Claude session'
+Remove-Item Function:\Get-StorageClaudeCliCwds
+$planCli = Get-StorageActionPlan -Rows @((Row 'claude:c1'), (Row 'codex:x1.11223344')) -Action 'Delete' -Running @{ cli = @('*') }
+Assert (@($planCli.Blocked | Where-Object { $_.Key -eq 'claude:c1' -and $_.Reason -like 'A Claude CLI is running*' }).Count -eq 1 -and @($planCli.Safe | Where-Object { $_.Key -eq 'codex:x1.11223344' }).Count -eq 1) 'an unreadable CLI folder blocks the Claude session of the plan, not the Codex one'
+foreach ($act in 'Archive', 'Delete', 'Trim') { Assert ((Get-StorageJobScript -Action $act) -like '*-Running $A.Running*') "the $act job passes the running table (with the CLI folders) to the guard" }
 
 # ---- U1-6: what every confirmation says ----------------------------------------------------------------------------------------------------------
 $sel = @((Row 'claude:c1'), (Row 'codex:x1.11223344'))

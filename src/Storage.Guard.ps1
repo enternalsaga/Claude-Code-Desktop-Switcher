@@ -28,8 +28,10 @@ function Test-StorageSessionSafe {
     foreach ($p in @($Session.Parts | Where-Object { $_.Kind -eq 'file' })) {
         if (& $LockProbe ([string]$p.Path)) { return (& $out $false 'live' 'A file of this session is open in another program.') }
     }
+    $CliCwds = @($CliCwds) + @($Running['cli'] | Where-Object { $_ })   # the UI hands one table (-Running) to every action; cli = the folders of running Claude CLIs
+    if ($Session.Harness -eq 'claude' -and $CliCwds -contains '*') { return (& $out $false 'live' 'A Claude CLI is running and its folder could not be read; close Claude Code terminals first.') }
     $cwd = ([string]$Session.Cwd).TrimEnd('\')
-    if ($Session.Harness -eq 'claude' -and $cwd -and @($CliCwds | Where-Object { $_.TrimEnd('\') -ieq $cwd }).Count) {
+    if ($Session.Harness -eq 'claude' -and $cwd -and @($CliCwds | Where-Object { $c = $_.TrimEnd('\'); $c -and ($c -ieq $cwd -or $c.StartsWith($cwd + '\', 'OrdinalIgnoreCase') -or $cwd.StartsWith($c + '\', 'OrdinalIgnoreCase')) }).Count) {   # same folder, or one inside the other (whole folder names only)
         return (& $out $false 'live' 'A Claude CLI is running in the folder of this session.')
     }
     $running = @($Running[[string]$Session.Harness])
