@@ -42,7 +42,8 @@
 
 ```
 Harness        'claude' | 'codex' | 'antigravity'
-Key            '<harness>:<id>'   (Claude: cliSessionId nếu có, không thì tên jsonl; Codex: thread id; Agy: conversation id)
+Key            Claude: 'claude:<cliSessionId hoặc tên jsonl>'. Codex / Agy: '<harness>:<id>.<p8>', p8 = 8 hex đầu SHA-256 của profile Id viết thường,
+               vì import native GĐ2 giữ nguyên id nên cùng id có thể ở nhiều profile (review I1, 2026-11-15). Khớp pattern key của D1.
 Title, Cwd, LastActivity (unix ms), Created
 Profiles       @( @{ Id; Name } )  profile nào tham chiếu tới phiên này (Claude có thể nhiều; rỗng = CLI / không thuộc profile)
 Parts          @( @{ Role; Path; Bytes; Kind = 'file'|'dir' } )   mọi mảnh dữ liệu của phiên (§2.2)
