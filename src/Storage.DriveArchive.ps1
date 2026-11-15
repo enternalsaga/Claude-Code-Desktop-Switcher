@@ -108,7 +108,10 @@ function Get-StorageDriveArchiveIndex {
                 if ($f.Name -match ('\A(' + $script:StorageDriveGuid + ')\.jsonl\z')) { $ids.Add($Matches[1]) }   # skips tmp files and "name (1).jsonl"
             }
         }
-    } else { $ids.Add($(if ($MachineId) { $MachineId } else { [string](Get-SyncMachine).Id })) }
+    } else {
+        if ($MachineId -and $MachineId -notmatch ('\A' + $script:StorageDriveGuid + '\z')) { throw 'machine-id-invalid' }
+        $ids.Add($(if ($MachineId) { $MachineId } else { [string](Get-SyncMachine).Id }))
+    }
     $names = Get-SyncMachineNames -Root $SyncRoot
     $out = New-Object Collections.Generic.List[object]
     foreach ($id in $ids) {
@@ -164,6 +167,9 @@ function Remove-StorageDriveArchive {
     Assert-StorageDriveOwnMachine -MachineId $MachineId
     $file = Resolve-StorageDrivePath -SyncRoot $SyncRoot -RelPath ([string]$Entry.path)
     if (([string]$Entry.path).Split('/')[1] -ne $MachineId) { throw 'not-own-machine: archives on Drive are deleted only by the machine that owns them.' }
+    # The path must be the one this entry's own harness and key give, so an entry cannot delete another archive.
+    if ([string]$Entry.key -notmatch $script:StorageDriveKeyPattern -or [string]$Entry.harness -notmatch '\A[a-z][a-z0-9]{0,31}\z' -or
+        [string]$Entry.path -cne (Get-StorageDriveRelPath -MachineId $MachineId -Harness ([string]$Entry.harness) -Key ([string]$Entry.key))) { throw 'archive-path-invalid' }
     $indexPath = Join-Path $SyncRoot "archives\$MachineId.jsonl"
     $kept = @(@(Read-StorageDriveIndexRows -Path $indexPath -MachineId $MachineId) | Where-Object { [string]$_.key -ne [string]$Entry.key })
     Write-SyncFileAtomic -Path $indexPath -Text (ConvertTo-SyncIndexText -Rows $kept)

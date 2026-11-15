@@ -96,6 +96,8 @@ try {
     Assert (@(Get-StorageDriveArchiveIndex -SyncRoot $drive -Key $key).Count -eq 1) 'machine B alone lists only its own'
     Assert (@(Get-StorageDriveArchiveIndex -SyncRoot $drive -Key $key -AllMachines).Count -eq 3) 'all machines list three'
     Assert (Test-Path -LiteralPath (Join-Path $drive "archives\$idB\agy")) 'machine B writes in its own folder'
+    Assert-Throws { Get-StorageDriveArchiveIndex -SyncRoot $drive -Key $key -MachineId '..\x' } 'a -MachineId that is not a GUID is refused'
+    Assert (@(Get-StorageDriveArchiveIndex -SyncRoot $drive -Key $key -MachineId $idA).Count -eq 2) 'a GUID -MachineId reads that machine'
 
     # hostile or damaged lines are skipped with a warning, the rest is listed
     $bIndex = Join-Path $drive "archives\$idB.jsonl"
@@ -149,6 +151,10 @@ try {
 
     # ---------------------------------------------------------------- delete from the Drive (own archives only)
     Use-Machine $idA 'LAPTOP-A'
+    # an Entry whose key says one session but whose path names another archive of this machine must not delete that one
+    $mixed = $a.PSObject.Copy(); $mixed.path = "archives/$idA/codex/codex_019a0000-aaaa-7bbb-8ccc-ddddeeeeffff.harchive.zip.enc"
+    Assert-Throws { Remove-StorageDriveArchive -Entry $mixed -SyncRoot $drive -MachineId $idA } 'an Entry whose path does not match its own harness and key is refused'
+    Assert ((Test-Path -LiteralPath (Join-Path $drive ($mixed.path -replace '/', '\'))) -and @(Get-StorageDriveArchiveIndex -SyncRoot $drive -Key $key).Count -eq 2) 'the refused delete changed nothing'
     $b1 = @(Get-StorageDriveArchiveIndex -SyncRoot $drive -Key $key | Where-Object { $_.Key -eq $entry2.Key })[0]
     Remove-StorageDriveArchive -Entry $b1 -SyncRoot $drive -MachineId $idA
     Assert (@(Get-StorageDriveArchiveIndex -SyncRoot $drive -Key $key).Count -eq 1) 'the row is gone'
