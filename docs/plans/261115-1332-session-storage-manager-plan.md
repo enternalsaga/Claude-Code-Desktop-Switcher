@@ -197,3 +197,14 @@ Q1–Q11 nằm trong spec §9. Thêm các câu sau:
 
 - **Build một file** (`tools/Build-SingleFile.ps1`) phải parse được và có đủ các file `Storage.*`.
 - **Install**: một work session thực hiện, theo pipeline §7 của quy tắc vai trò.
+
+## 12. Việc sau (ghi 2026-11-15, chưa giao)
+
+| Việc | Khi nào làm | Ghi chú |
+|---|---|---|
+| Tách `src/Ui.StorageActions.ps1`: chuyển phần dialog và job (Read-StorageTargetChoice, Show-StorageResults, Start-StorageJob, Get-StorageJobScript...) sang `src/Ui.StorageJobs.ps1` | Khi file vượt khoảng 700 dòng, hoặc phần job và logic thuần lớn lên | File UI có giới hạn 800 dòng theo CLAUDE.md (orchestra, 2026-11-15); lúc ghi việc này file có 506 dòng. Không đổi hành vi, chạy lại các test Ui.Storage* |
+| Cắt thêm `toolUseResult` trong jsonl Claude | Khi cần giải phóng thêm dung lượng | Bản thử của S14 đã cắt cả trường này và resume vẫn ổn |
+| Hộp xác nhận Trim thêm câu nhắc đóng terminal Claude Code | Một commit 1 dòng | Archive và Delete đã có câu này |
+| Antigravity phương án B (xóa `agyhub_summaries_proto.pb` để danh sách sạch hẳn) | Nếu user muốn | Cần spike với 2 conversation, có user xem |
+| S19 cho Codex rồi mở cổng tóm tắt bằng `codex` | Khi gateway của Codex sửa xong | Hiện `$script:StorageSummarizeReady.codex = $false` |
+| Sidecar (summary, trimmed, trim.json) cho kho Drive, có mã hóa | Nếu user dùng kho Drive và cần các file này | Hiện kho Drive từ chối ReadOnlyCopy và Summarize ngay từ đầu, trước khi tốn token |
