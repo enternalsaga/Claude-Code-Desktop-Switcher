@@ -118,7 +118,10 @@ Mọi thao tác ghi (archive, trim, summarize với archive trước, delete, re
 5. Gỡ bản gốc khỏi app:
    - **Claude:** xóa jsonl, `<cli>\` và các `local_*.json` ở mọi profile tham chiếu. Profile tham chiếu đang chạy thì chặn từ bước 1.
    - **Codex (chốt theo S16, 2026-11-15):** zip lấy rollout từ `rollout_path` hiện tại của dòng `threads`. Chỉ sau khi bước 3 và 4 đạt mới gọi `thread/delete` qua app-server. Lệnh này xóa hẳn cả dòng `threads` lẫn file, và đúng là cái ta cần, vì zip đã kiểm sha là bản sao lưu. Không dùng `thread/archive` để giải phóng dung lượng: lệnh đó chỉ chuyển file sang `archived_sessions\`, file vẫn nằm trên đĩa. Không ghi thẳng vào `state_5.sqlite`.
-   - **Antigravity:** app đóng. Xóa `.db`, `-wal`, `-shm`, `brain\<id>`. Dòng trong `conversation_summaries.db` xử lý theo S17.
+   - **Antigravity (đề xuất theo S17, 2026-11-15; chờ orchestra chốt):** chỉ gỡ khi app đã đóng **và** mọi file của phiên đều không bị khóa. Kiểm khóa bằng LockProbe của Guard, vì sau khi đóng cửa sổ vẫn còn process phụ giữ file, nên `Find-AgyMainProcessId` không đủ. Xóa `.db`, `-wal`, `-shm` và `brain\<id>`.
+     - **Không** sửa `conversation_summaries.db`. **Không** đụng `agyhub_summaries_proto.pb`, vì đó là protobuf không có tài liệu, và app tự dựng lại dòng summary từ file này.
+     - Hệ quả mà người dùng thấy: conversation vẫn còn trong danh sách của Antigravity, nhưng mở ra thì báo "Conversation unavailable". Hộp xác nhận phải nói rõ điều này.
+     - Restore chỉ cần chép lại `.db` (cùng `-wal`) và `brain\<id>`. S17 đã xác nhận chat quay lại đủ nội dung.
 6. Bản gốc bị xóa hẳn hay qua Recycle Bin: theo Q1, mặc định xóa hẳn sau khi bước 3 và 4 đạt. Có hộp xác nhận.
 7. Ghi một dòng vào `archive-index.jsonl` của kho: `{ key, harness, title, bytes, zipBytes, archivedAt, machineId, entry }`.
 
@@ -131,7 +134,7 @@ Mọi thao tác ghi (archive, trim, summarize với archive trước, delete, re
    - Profile Claude không còn thì ghi vào Default và cảnh báo (Q6).
 4. Đăng ký lại:
    - **Codex (chốt theo S16):** chép rollout về đúng `sessions\yyyy\mm\dd\<tên gốc>`, rồi gọi `thread/read` qua app-server. Codex tự đăng ký lại phiên, mọi cột giống bản gốc trừ `recency_at_ms`. Nếu `thread/read` không đăng ký lại được thì dùng `Register-CodexThread` như GĐ2.
-   - **Antigravity:** theo S17.
+   - **Antigravity:** chép lại `.db`, `-wal` và `brain\<id>`, khi app đóng. Không cần ghi DB nào, vì app tự lập chỉ mục lại (S17).
    - **Claude:** chỉ cần ghi file. Desktop đọc `local_*.json` khi khởi động.
 5. Xóa dòng khỏi `archive-index.jsonl` và giữ zip lại. Chỉ xóa zip khi user chọn "Delete archive".
 
@@ -170,7 +173,7 @@ Mọi thao tác ghi (archive, trim, summarize với archive trước, delete, re
   
   Không thỏa thì báo "cannot go to the Recycle Bin, archive it instead", và không xóa gì.
 - **Codex:** không dùng `thread/delete`, vì lệnh này xóa hẳn. Thay vào đó gọi `thread/archive` để app tự chuyển rollout sang `archived_sessions\` và đặt `archived=1`, rồi đưa file ở đó vào Recycle Bin. Dòng `archived=1` còn lại thành mồ côi. S16 đã thử: vô hại, app-server không lỗi, và phiên không hiện trong danh sách vì danh sách lọc `archived = 0`. Cách này không cần ghi DB, kể cả khi app đang mở.
-- **Antigravity:** dòng summary xử lý giống bước gỡ bản gốc ở §5.1 (theo S17), nhưng không archive.
+- **Antigravity:** đưa `.db`, `-wal`, `-shm` và `brain\<id>` vào Recycle Bin, không đụng DB nào, giống §5.1. Conversation vẫn hiện trong danh sách của Antigravity ở trạng thái "unavailable" cho tới khi user xóa nó trong chính app, hoặc khôi phục file từ thùng rác.
 - **Hộp xác nhận** ghi số phiên, tổng dung lượng, danh sách profile bị ảnh hưởng, và câu "Recoverable from the Recycle Bin until it is emptied".
 
 ## 6. Kho lưu trữ
