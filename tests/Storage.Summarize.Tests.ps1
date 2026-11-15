@@ -27,10 +27,10 @@ function Get-Sha($p) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToL
 $secret = 'sk-' + ('abcdefghij' * 3)
 try {
     # ---- the gate -----------------------------------------------------------------------------------------------------------------------------
-    Assert ($script:StorageSummarizeReady.claude -eq $true -and $script:StorageSummarizeReady.codex -eq $false) 'S19: claude is ready, codex is still blocked'
+    Assert ($script:StorageSummarizeReady.claude -eq $true -and $script:StorageSummarizeReady.codex -eq $true) 'S19: claude and codex are both ready'
     Assert ((Test-StorageSummarizeReady -Installed @('claude', 'codex')) -eq $true -and (Test-StorageSummarizeReady -Installed @('claude')) -eq $true) 'the gate is open when claude is on the machine'
-    Assert ((Test-StorageSummarizeReady -Installed @('codex')) -eq $false -and (Test-StorageSummarizeReady -Installed @()) -eq $false) 'a codex-only machine, or no CLI at all: closed'
-    Assert ((@(Get-StorageAvailableSummaryTools -Installed @('claude', 'codex')) -join ',') -eq 'claude' -and @(Get-StorageAvailableSummaryTools -Installed @('codex')).Count -eq 0) 'only tools that are ready and installed are available'
+    Assert ((Test-StorageSummarizeReady -Installed @('codex')) -eq $true -and (Test-StorageSummarizeReady -Installed @()) -eq $false) 'a codex-only machine: open; no CLI at all: closed'
+    Assert ((@(Get-StorageAvailableSummaryTools -Installed @('claude', 'codex')) -join ',') -eq 'claude,codex' -and (@(Get-StorageAvailableSummaryTools -Installed @('codex')) -join ',') -eq 'codex') 'every installed tool that is ready is available'
     $saved = $script:StorageSummarizeReady; $script:StorageSummarizeReady = @{ claude = $false; codex = $false }
     Assert ((Test-StorageSummarizeReady -Installed @('claude', 'codex')) -eq $false) 'no tool ready: closed even with both installed'
     $script:StorageSummarizeReady = $saved
@@ -42,10 +42,15 @@ try {
     }
     $sc = New-Bare 'claude' 'claude:c1' 40000 'transcript'; $sx = New-Bare 'codex' 'codex:x1.11223344' 8000 'rollout'; $sa = New-Bare 'antigravity' 'antigravity:g1.aabbccdd' 4000 'conversation-db' '.db'
     $plan = @(Get-StorageSummaryPlan -Sessions @($sc, $sx, $sa) -Available @('claude', 'codex'))
-    Assert ($plan.Count -eq 3 -and $plan[0].Key -eq 'claude:c1' -and $plan[0].Tool -eq 'claude' -and $plan[1].Tool -eq 'claude' -and $plan[2].Tool -eq 'claude') 'while codex is not ready a Codex session is summarized with claude too; Antigravity takes claude'
+    Assert ($plan.Count -eq 3 -and $plan[0].Key -eq 'claude:c1' -and $plan[0].Tool -eq 'claude' -and $plan[1].Tool -eq 'codex' -and $plan[2].Tool -eq 'claude') 'a Codex session is summarized with codex, a Claude or Antigravity session with claude'
     Assert ($plan[0].InputChars -eq 40000 -and $plan[0].EstTokens -eq 10000 -and $plan[1].EstTokens -eq 2000) 'tokens are characters divided by 4'
     $plan = @(Get-StorageSummaryPlan -Sessions @($sc, $sx, $sa) -Available @('codex'))
-    Assert ($null -eq $plan[0].Tool -and $null -eq $plan[1].Tool -and $null -eq $plan[2].Tool) 'codex is never chosen while it is not ready, even when it is the only CLI on the machine'
+    Assert ($plan[0].Tool -eq 'codex' -and $plan[1].Tool -eq 'codex' -and $plan[2].Tool -eq 'codex') 'with only codex on the machine every session uses codex'
+    $plan = @(Get-StorageSummaryPlan -Sessions @($sc, $sx) -Available @('claude'))
+    Assert ($plan[0].Tool -eq 'claude' -and $plan[1].Tool -eq 'claude') 'with only claude on the machine a Codex session falls back to claude'
+    $script:StorageSummarizeReady = @{ claude = $true; codex = $false }
+    try { $plan = @(Get-StorageSummaryPlan -Sessions @($sx) -Available @('claude', 'codex')) } finally { $script:StorageSummarizeReady = @{ claude = $true; codex = $true } }
+    Assert ($plan[0].Tool -eq 'claude') 'a tool whose gate is closed is skipped even when installed'
     $plan = @(Get-StorageSummaryPlan -Sessions @($sc) -Available @())
     Assert ($null -eq $plan[0].Tool) 'no CLI: no tool'
     $plan = @(Get-StorageSummaryPlan -Sessions @((New-Bare 'claude' 'claude:big' 3MB 'transcript')) -Available @('claude'))

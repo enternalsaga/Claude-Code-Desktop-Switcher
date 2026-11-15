@@ -5,9 +5,9 @@
 # archives. Needs Storage.Compact.ps1 (the archive first, the transcript readers, the sidecar files), Storage.Guard.ps1,
 # Storage.Scan.ps1 and Harness.Core.ps1 (Protect-TranscriptEntries, ConvertTo-HandoffMarkdown). ASCII only.
 
-# The gate of the UI button, per tool. A tool is ready once spike S19 has measured a real headless call with it: claude did (2026-11-15),
-# codex is still blocked. A blocked tool is never chosen, so a Codex session is summarized with claude until codex is ready.
-$script:StorageSummarizeReady = @{ claude = $true; codex = $false }
+# The gate of the UI button, per tool. A tool is ready once spike S19 has measured a real headless call with it: claude did (2026-11-15,
+# 22 s) and codex did (2026-11-15, 9 s). A tool set to $false is never chosen.
+$script:StorageSummarizeReady = @{ claude = $true; codex = $true }
 
 # The tools that are both ready and on the machine. -Installed is for tests; by default it looks for the CLIs on the PATH.
 function Get-StorageAvailableSummaryTools {
