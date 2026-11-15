@@ -52,7 +52,7 @@ function Update-MainCatalog {
 
 # ---- tab bookkeeping (pure) ----------------------------------------------------------------------------------------------
 
-function Get-MainTabKeys { return @('claude', 'codex', 'antigravity', 'drive') }
+function Get-MainTabKeys { return @('claude', 'codex', 'antigravity', 'drive', 'storage') }
 
 function Get-MainLastTab {
     $v = [string](Get-Setting 'Ui.LastTab')
@@ -93,6 +93,7 @@ function Update-MainTab {
     if (-not $st.Tabs) { return }
     if (-not $Key) { $Key = [string]$st.Tabs.SelectedTab.Name }
     if ($Key -eq 'drive') { if ($st.Drive) { Update-SyncDriveTab -Ctx $st.Drive } }
+    elseif ($Key -eq 'storage') { if ($st.Storage) { Update-StorageTab -Ctx $st.Storage } }
     elseif ($st.Panels.ContainsKey($Key)) {
         if ($st.Profiles.ContainsKey($Key) -and -not $st.ProfilesLoaded[$Key]) { Update-HarnessProfilePanel -Ctx $st.Profiles[$Key]; $st.ProfilesLoaded[$Key] = $true }
         Update-ChatPanel -Ctx $st.Panels[$Key]
@@ -275,6 +276,7 @@ function Convert-SwitcherToTabs {
         foreach ($k in 'codex', 'antigravity') { Add-HarnessTabContent -Key $k -Page $pages[$k] }
         $st.Drive = New-SyncDriveTab
         $pages['drive'].Controls.Add($st.Drive.Panel)
+        try { $st.Storage = New-StorageTab; $pages['storage'].Controls.Add($st.Storage.Panel) } catch { Write-HarnessLog "Main window: Storage tab failed: $($_.Exception.Message)" }
         foreach ($k in Get-MainTabKeys) { [void]$tabs.TabPages.Add($pages[$k]) }
         $st.Tabs = $tabs
         $Form.Controls.Add($tabs)

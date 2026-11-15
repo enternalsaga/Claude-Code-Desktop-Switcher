@@ -11,7 +11,10 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 $env:COMPUTERNAME = 'PREVIEW-PC'   # this process only: the pictures must not carry the real machine name
-foreach ($f in 'Ui.ChatStatus', 'Ui.Main', 'Ui.MainChats', 'Ui.MainDrive', 'Ui.Harness', 'Ui.Sync', 'Ui.SyncWizard', 'Ui.Tray') { . (Join-Path $Root "src\$f.ps1") }
+foreach ($f in 'Ui.ChatStatus', 'Ui.Main', 'Ui.MainChats', 'Ui.MainDrive', 'Ui.Harness', 'Ui.Sync', 'Ui.SyncWizard', 'Ui.Tray', 'Harness.Sync.Config', 'Storage.Guard', 'Storage.Scan', 'Storage.Inventory', 'Ui.Storage', 'Ui.StorageActions') { . (Join-Path $Root "src\$f.ps1") }
+function Get-StorageRootsFromConfig { param($Config) return @{} }   # the Storage tab reads nothing until Scan is pressed
+function Get-SyncMachine { [pscustomobject]@{ Id = 'aaaaaaaa-0000-4000-8000-000000000001'; Name = 'PREVIEW-PC' } }
+function Get-StorageArchiveIndex { param($Target, [switch]$AllMachines) return @([pscustomobject]@{ key = 'claude:c1'; harness = 'claude'; title = 'Fix login redirect'; bytes = 10MB; zipBytes = 2MB; lastActivity = 1; archivedAt = '2026-11-14T10:00:00Z'; machineId = 'm1'; entry = 'claude/2026-11/c1.harchive.zip'; sha256 = ('a' * 64) }) }
 
 # ---- the look of ClaudeSwitcher.ps1 --------------------------------------------------------------------------------------------
 $bg = [System.Drawing.Color]::FromArgb(250, 249, 245); $ink = [System.Drawing.Color]::FromArgb(38, 38, 36); $muted = [System.Drawing.Color]::FromArgb(120, 118, 112)
@@ -173,6 +176,19 @@ foreach ($k in Get-MainTabKeys) {
     if ($k -in 'codex', 'antigravity') { [void]$st.Profiles[$k].List.Handle }
     Update-MainTab -Key $k   # draws from the cache only: nothing is read until a button is pressed
     if ($k -eq 'claude') { Save-PreviewForm -Form $form -Name 'tab-claude-not-loaded' -Page $st.Tabs.TabPages[$k] -Tabs $st.Tabs }
+    if ($k -eq 'storage') {   # not scanned, then scanned (filter + sort), then the archived view; the scan itself is faked
+        $sc = $st.Storage; [void]$sc.List.Handle; [void]$sc.ArchList.Handle; [void]$sc.ProfileList.Handle; $pgS = $st.Tabs.TabPages[$k]
+        Save-PreviewForm -Form $form -Name 'tab-storage-not-scanned' -Page $pgS -Tabs $st.Tabs
+        $mk = { param($h, $id, $t, $mb, $d, $s, $pr) [pscustomobject]@{ Harness = $h; Key = "${h}:$id"; Id = $id; Title = $t; Cwd = $here; LastActivity = (& $ms ($d * 24) 0); Profiles = @($pr | ForEach-Object { [pscustomobject]@{ Id = $_; Name = $_ } }); Parts = @(); Bytes = [long]($mb * 1MB); State = $s; Flags = @{ IsCliOnly = (-not $pr.Count); HasZst = $false; Trimmable = $true; ArchivedRef = $false; DbUnreadable = $false } } }
+        $sc.Inventory = [pscustomobject]@{ Sessions = @((& $mk 'claude' 'c1' 'Fix login redirect' 120 40 'idle' @('Default')), (& $mk 'claude' 'c2' 'CLI scratch' 45 0 'recent' @()), (& $mk 'codex' 'x1' 'Parser bug' 30 90 'idle' @('Spare')), (& $mk 'antigravity' 'g1.aabbccdd' 'Landing page copy' 8 5 'idle' @('Default'))); Profiles = @([pscustomobject]@{ Harness = 'claude'; Id = 'Default'; Name = 'Default'; DataDir = 'C:\fake'; DataBytes = [long]30MB; DataFiles = 9; IsDefault = $true }, [pscustomobject]@{ Harness = 'codex'; Id = 'Spare'; Name = 'Spare'; DataDir = 'C:\fake2'; DataBytes = [long]8MB; DataFiles = 4; IsDefault = $false }); Totals = @{}; ScannedAt = Get-Date; Files = 900; Seconds = 8.2; Cancelled = $false; Warnings = @() }
+        $sc.Checked['claude:c1'] = $true; $sc.Checked['codex:x1'] = $true; $sc.Stats = Get-StorageStats -Inventory $sc.Inventory; Update-StorageTab -Ctx $sc
+        Save-PreviewForm -Form $form -Name 'tab-storage-scanned' -Page $pgS -Tabs $st.Tabs
+        $sc.View.harness = 'claude'; $sc.View.sortColumn = 'Title'; $sc.View.descending = $false; Update-StorageTab -Ctx $sc
+        Save-PreviewForm -Form $form -Name 'tab-storage-filtered' -Page $pgS -Tabs $st.Tabs
+        $script:Store['Storage.ArchiveTarget'] = @{ kind = 'local'; path = 'D:\HarnessArchive' }; Set-StorageMode -Ctx $sc -Mode 'Archived'
+        Save-PreviewForm -Form $form -Name 'tab-storage-archived' -Page $pgS -Tabs $st.Tabs
+        continue
+    }
     # What pressing Load chats / Refresh does.
     if ($k -eq 'drive') { Invoke-MainRefresh -Tab 'drive' } else { Update-ChatPanel -Ctx $st.Panels[$k] -Load }
     if ($k -in 'claude', 'codex', 'antigravity') { $panelCtx = $st.Panels[$k]; if ($panelCtx.List.Items.Count) { $panelCtx.List.Items[1 % $panelCtx.List.Items.Count].Selected = $true } }

@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-foreach ($f in 'Ui.ChatStatus', 'Ui.Main', 'Ui.MainChats', 'Ui.MainDrive') { . (Join-Path $root "src\$f.ps1") }
+foreach ($f in 'Ui.ChatStatus', 'Ui.Main', 'Ui.MainChats', 'Ui.MainDrive', 'Ui.Storage', 'Ui.StorageActions') { . (Join-Path $root "src\$f.ps1") }
 
 # ---- fakes for what ClaudeSwitcher.ps1 and the harness layer give the window --------------------------------------------
 $script:Store = @{}
@@ -276,7 +276,10 @@ $refreshed = $false
 Convert-SwitcherToTabs -Form $form -RefreshClaude { $script:refreshedClaude = $true }
 $tabs = @($form.Controls | Where-Object { $_ -is [System.Windows.Forms.TabControl] })
 Assert ($tabs.Count -eq 1 -and $form.Controls.Count -eq 1) "the form holds only the TabControl, got $($form.Controls.Count) controls"
-Assert ($tabs[0].TabPages.Count -eq 4 -and (@($tabs[0].TabPages | ForEach-Object { $_.Name }) -join ',') -eq 'claude,codex,antigravity,drive') 'four tabs'
+Assert ($tabs[0].TabPages.Count -eq 5 -and (@($tabs[0].TabPages | ForEach-Object { $_.Name }) -join ',') -eq 'claude,codex,antigravity,drive,storage') 'five tabs, Storage last'
+Assert ($tabs[0].TabPages['storage'].Text -eq 'Storage' -and $tabs[0].TabPages['storage'].Controls.Count -eq 1) 'U1-2: the Storage tab holds its panel'
+$stg = (Get-MainState).Storage
+Assert ($stg -and $stg.ScanLabel.Text -like 'Not scanned yet*' -and -not $stg.Busy -and $null -eq $stg.Job) 'U1-2: Storage starts as Not scanned yet, nothing running'
 $claudePage = $tabs[0].TabPages['claude']
 $old = @($claudePage.Controls | Where-Object { $_ -is [System.Windows.Forms.Panel] -and $_.Name -eq 'switcherLegacy' })
 Assert ($old.Count -eq 1) 'the old controls sit in one panel on the Claude tab'
@@ -333,8 +336,9 @@ $lvV4.Items[0].Tag = (& $pr 'claude' 'Default')
 Convert-SwitcherToTabs -Form $formV4 -RefreshClaude { }
 $st = Get-MainState; $cp = $st.Panels['claude']
 Assert ($counter.Calls.Count -eq 0 -and $script:CatalogCalls -eq 0) 'opening the window reads nothing'
-foreach ($k in 'claude', 'codex', 'drive', 'claude') { Update-MainTab -Key $k }
-Assert ($counter.Calls.Count -eq 0 -and $script:CatalogCalls -eq 0) 'changing tabs reads nothing'
+function Start-StorageScan { $script:StorageScanCalls++; throw 'a scan must only start when Scan is pressed' }
+foreach ($k in 'claude', 'codex', 'drive', 'storage', 'claude') { Update-MainTab -Key $k }
+Assert ($counter.Calls.Count -eq 0 -and $script:CatalogCalls -eq 0 -and [int]$script:StorageScanCalls -eq 0) 'changing tabs reads nothing, and no storage scan starts'
 Assert ($cp.List.Items.Count -eq 0 -and $cp.Status.Text -like '*not loaded*' -and (& $flag $cp.LoadButton)) 'before the first load: empty list, a note and the Load chats button'
 Assert ($cp.LoadButton.Text -eq 'Load chats') 'the button says Load chats'
 Update-ChatPanel -Ctx $cp -Load
