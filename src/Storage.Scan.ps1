@@ -171,6 +171,7 @@ function Get-StorageScanFunctionNames {
         'Get-StorageTitleLine', 'Read-StorageClaudeJsonlMeta', 'Get-ClaudeProfileRefs', 'Get-ClaudeTranscripts',
         'New-StorageSessionBuilder', 'ConvertTo-StorageSession', 'Get-ClaudeStorageSessions',
         'Read-StorageCodexRows', 'Get-StorageDbSignature', 'Get-CodexStorageSessions',
+        'Get-StorageClaudeWindowMeta', 'Test-StorageUnderDir',
         'Read-StorageAgyRows', 'ConvertFrom-StorageWorkspace', 'Get-AgyStorageSessions', 'Get-StorageProfileFolder', 'Get-StorageGuidPattern', 'Get-StorageProfileTag', 'Get-StorageInventory',
         'Initialize-WinSqlite', 'ConvertTo-SqliteUtf8', 'Open-SqliteReadOnly', 'Close-Sqlite', 'Invoke-SqliteQuery', 'Copy-SqliteSnapshot', 'ConvertFrom-CodexPath'
     )
@@ -182,6 +183,7 @@ function Get-StorageScanFunctionNames {
 # -ItemDelayMs is only raised by tests, to make a small fixture last long enough to watch.
 function Start-StorageScan {
     param([Parameter(Mandatory)][hashtable]$Roots, [string]$CachePath, [int]$ItemDelayMs = 0, [int]$RecentMinutes = 30)
+    Clear-StoragePendingClose
     $iss = [Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     foreach ($n in (Get-StorageScanFunctionNames)) {
         $c = Get-Command -Name $n -CommandType Function -ErrorAction Stop
@@ -212,18 +214,53 @@ try {
 function Stop-StorageScan {
     param([Parameter(Mandatory)]$Scan)
     $Scan.Cancel['Cancel'] = $true
+    Stop-StorageChildProcesses -Progress $Scan.Progress   # a CLI that is working would otherwise run until its timeout
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while (-not $Scan.Progress['Finished'] -and $sw.ElapsedMilliseconds -lt 900) { Start-Sleep -Milliseconds 10 }
     if (-not $Scan.Progress['Finished']) {
         [void]$Scan.PowerShell.BeginStop($null, $null)
-        $Scan.Progress['Cancelled'] = $true; $Scan.Progress['Finished'] = $true
+        $Scan.Progress['Cancelled'] = $true; $Scan.Progress['HardStopped'] = $true; $Scan.Progress['Finished'] = $true
     }
 }
 
-# Frees the runspace of a finished or stopped scan.
+# The process ids a job started for itself (Progress.ChildPids, a list the job writes, e.g. a claude or codex CLI) are killed
+# with their children: taskkill /T /F. Never throws.
+function Stop-StorageChildProcesses {
+    param($Progress)
+    try {
+        foreach ($id in @($Progress['ChildPids'])) { if ($id) { try { & taskkill.exe /PID ([int]$id) /T /F 2>&1 | Out-Null } catch { } } }
+    } catch { }
+}
+
+# Scans whose runspace was told to stop but has not finished stopping: they are disposed later, so that closing never waits.
+$script:StoragePendingClose = New-Object Collections.Generic.List[object]
+
+function Clear-StoragePendingClose {
+    foreach ($p in $script:StoragePendingClose.ToArray()) {
+        $done = $true
+        try { $done = ($p.Handle.IsCompleted -or ($p.Stop -and $p.Stop.IsCompleted)) } catch { }
+        if (-not $done) { continue }
+        try { $p.Scan.PowerShell.Dispose() } catch { }
+        try { $p.Scan.Runspace.Dispose() } catch { }
+        [void]$script:StoragePendingClose.Remove($p)
+    }
+}
+
+# Frees the runspace of a finished or stopped scan. A job that is still running is not waited for (the UI thread must not
+# hang on a long VACUUM or a CLI): its children are killed, it is told to stop asynchronously and it is disposed by a later
+# call (here, Start-StorageScan or Start-StorageJob).
 function Close-StorageScan {
     param([Parameter(Mandatory)]$Scan)
-    try { if (-not $Scan.Handle.IsCompleted) { $Scan.PowerShell.Stop() } } catch { }
+    Clear-StoragePendingClose
+    $running = $false
+    try { $running = -not $Scan.Handle.IsCompleted } catch { }
+    if ($running) {
+        Stop-StorageChildProcesses -Progress $Scan.Progress
+        $stop = $null
+        try { $stop = $Scan.PowerShell.BeginStop($null, $null) } catch { }
+        $script:StoragePendingClose.Add(@{ Scan = $Scan; Handle = $Scan.Handle; Stop = $stop })
+        return
+    }
     try { $Scan.PowerShell.Dispose() } catch { }
     try { $Scan.Runspace.Dispose() } catch { }
 }

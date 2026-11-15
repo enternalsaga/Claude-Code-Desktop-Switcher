@@ -58,8 +58,12 @@ function Get-StorageFirstString {
 # The small local_<id>.json of the desktop app: which transcript (cliSessionId), the title, the folder, the times.
 function Read-StorageLocalMeta {
     param([Parameter(Mandatory)][string]$Path)
-    $o = $null
-    try { $o = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8) | ConvertFrom-Json } catch { }
+    # Throws when the file cannot be opened or is not JSON (the app may be writing it right now): an empty answer would be cached
+    # and would make the session look CLI-only. The caller turns the error into a warning and does not cache it.
+    $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try { $text = (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd() } finally { $fs.Dispose() }
+    $o = $text | ConvertFrom-Json
+    if ($o -isnot [pscustomobject]) { throw 'the file is not a JSON object' }
     $act = $null; $created = $null
     if ($o -and $o.PSObject.Properties['lastActivityAt'] -and $o.lastActivityAt -is [ValueType]) { $act = [long]$o.lastActivityAt }
     if ($o -and $o.PSObject.Properties['createdAt'] -and $o.createdAt -is [ValueType]) { $created = [long]$o.createdAt }
@@ -82,7 +86,20 @@ function Get-StorageTitleLine {
 # expressions avoid parsing the big lines; only title lines and the first user message are parsed as JSON.
 function Read-StorageClaudeJsonlMeta {
     param([Parameter(Mandatory)][string]$Path)
-    $ht = Read-JsonlHeadTail -Path $Path
+    # A line longer than the window is cut at its edge and dropped, so a folder or a time can be missing: read again with a
+    # window twice as big, up to 1 MB, until the folder and both times are found or the whole file has been read.
+    $window = 65536
+    while ($true) {
+        $ht = Read-JsonlHeadTail -Path $Path -HeadBytes $window -TailBytes $window
+        $meta = Get-StorageClaudeWindowMeta -HeadTail $ht
+        if (($meta.cwd -and $meta.first -and $meta.last) -or $ht.Complete -or $window -ge 1MB) { return $meta }
+        $window *= 2
+    }
+}
+
+function Get-StorageClaudeWindowMeta {
+    param([Parameter(Mandatory)]$HeadTail)
+    $ht = $HeadTail
     $cwd = $null; $first = $null; $last = $null; $user = $null
     $titles = @{}
     $n = 0
@@ -101,12 +118,13 @@ function Read-StorageClaudeJsonlMeta {
             } catch { }
         }
     }
+    $tailKinds = @{}
     for ($i = $ht.Tail.Count - 1; $i -ge 0; $i--) {
         $l = $ht.Tail[$i]
         if ($l.Length -gt 300000) { continue }
         if ($null -eq $last -and $l -match '"timestamp":"([^"]+)"') { $last = ConvertTo-StorageMs $Matches[1] }
         $t = Get-StorageTitleLine $l
-        if ($t) { $titles[$t.Kind] = $t.Text }   # a rename is appended at the end, so the tail wins
+        if ($t -and -not $tailKinds.ContainsKey($t.Kind)) { $titles[$t.Kind] = $t.Text; $tailKinds[$t.Kind] = $true }   # a rename is appended at the end: walking back, the first one seen is the newest and the tail beats the head
     }
     $title = $(if ($titles['custom-title']) { $titles['custom-title'] } elseif ($titles['ai-title']) { $titles['ai-title'] } elseif ($titles['summary']) { $titles['summary'] } else { $user })
     return @{ title = $title; cwd = $cwd; first = $first; last = $last }
@@ -114,7 +132,7 @@ function Read-StorageClaudeJsonlMeta {
 
 # Every local_*.json of every profile (account and organisation folders in between), with the cached meta.
 function Get-ClaudeProfileRefs {
-    param([array]$Profiles = @(), $Cache, $Cancel)
+    param([array]$Profiles = @(), $Cache, $Cancel, $Warnings)
     $refs = New-Object Collections.Generic.List[object]
     foreach ($p in $Profiles) {
         $root = [string]$p.SessionRoot
@@ -123,8 +141,13 @@ function Get-ClaudeProfileRefs {
             foreach ($org in @(Get-StorageEntries -Dir $acct.FullName | Where-Object { $_ -is [IO.DirectoryInfo] })) {
                 foreach ($f in @(Get-StorageEntries -Dir $org.FullName | Where-Object { $_ -is [IO.FileInfo] -and $_.Name -like 'local_*.json' })) {
                     if (Test-StorageCancel $Cancel) { return $refs.ToArray() }
-                    $meta = Get-StorageCachedMeta -Cache $Cache -Key $f.FullName -Size $f.Length -Ticks $f.LastWriteTimeUtc.Ticks -Reader { param($k) Read-StorageLocalMeta -Path $k }
-                    $refs.Add(@{ ProfileId = [string]$p.Id; ProfileName = [string]$p.Name; Path = $f.FullName; Bytes = [long]$f.Length; Ticks = $f.LastWriteTimeUtc.Ticks; Name = $f.BaseName; Meta = $meta })
+                    $unreadable = $false
+                    try { $meta = Get-StorageCachedMeta -Cache $Cache -Key $f.FullName -Size $f.Length -Ticks $f.LastWriteTimeUtc.Ticks -Reader { param($k) Read-StorageLocalMeta -Path $k } }
+                    catch {
+                        $unreadable = $true; $meta = @{ cli = $null; title = $null; cwd = $null; activity = $null; created = $null }
+                        if ($null -ne $Warnings) { $Warnings.Add("Could not read $($f.FullName): $($_.Exception.Message) The sessions of this profile are marked unreadable until the next scan can read it.") }
+                    }
+                    $refs.Add(@{ ProfileId = [string]$p.Id; ProfileName = [string]$p.Name; Path = $f.FullName; Bytes = [long]$f.Length; Ticks = $f.LastWriteTimeUtc.Ticks; Name = $f.BaseName; Meta = $meta; Unreadable = $unreadable })
                 }
             }
         }
@@ -195,7 +218,7 @@ function ConvertTo-StorageSession {
 # with no local file at all is CLI-only. Sessions come back in no particular order.
 function Get-ClaudeStorageSessions {
     param([string]$ProjectsDir, [array]$Profiles = @(), $Cache, $Cancel, $Progress, $Warnings, [int]$ItemDelayMs = 0, [datetime]$Now = [DateTime]::UtcNow, [int]$RecentMinutes = 30)
-    $refs = @(Get-ClaudeProfileRefs -Profiles $Profiles -Cache $Cache -Cancel $Cancel)
+    $refs = @(Get-ClaudeProfileRefs -Profiles $Profiles -Cache $Cache -Cancel $Cancel -Warnings $Warnings)
     $transcripts = @(Get-ClaudeTranscripts -ProjectsDir $ProjectsDir -Cancel $Cancel)
     Set-StorageProgress -Progress $Progress -Phase 'claude' -Total ($refs.Count + $transcripts.Count)
     $by = @{}
@@ -225,6 +248,7 @@ function Get-ClaudeStorageSessions {
         $b = $by[$id]
         Add-StoragePart -List $b.Parts -Role 'profile-meta' -Path $r.Path -Bytes $r.Bytes -Ticks $r.Ticks -ProfileId $r.ProfileId
         $b.Profiles[$r.ProfileId] = $r.ProfileName
+        if ($r.Unreadable) { $b.Flags['DbUnreadable'] = $true }
         $act = $(if ($null -ne $r.Meta['activity']) { [long]$r.Meta['activity'] } else { [long]([DateTimeOffset][DateTime]::new($r.Ticks, [DateTimeKind]::Utc)).ToUnixTimeMilliseconds() })
         if ($r.Meta['title'] -and $act -gt $b.RefAct) { $b.RefTitle = [string]$r.Meta['title']; $b.RefAct = $act }
         if ($r.Meta['cwd']) { $b.Cwd = [string]$r.Meta['cwd'] }
@@ -234,6 +258,7 @@ function Get-ClaudeStorageSessions {
     }
     foreach ($b in $by.Values) {
         $b.Flags['IsCliOnly'] = ($b.Profiles.Count -eq 0)
+        if ($b.Flags['IsCliOnly'] -and @($refs | Where-Object { $_.Unreadable }).Count) { $b.Flags['DbUnreadable'] = $true }   # it may belong to the profile file that could not be read
         $b.Flags['Trimmable'] = [bool]@($b.Parts | Where-Object { $_.Role -eq 'transcript' }).Count
         if (-not $b.AltTitle -and -not $b.RefTitle -and $b.Id.Length -ge 8) { $b.AltTitle = 'Chat ' + $b.Id.Substring(0, 8) }
         ConvertTo-StorageSession -Builder $b -Now $Now -RecentMinutes $RecentMinutes
@@ -320,81 +345,24 @@ function Get-CodexStorageSessions {
     }
 }
 
-# ---- Antigravity -------------------------------------------------------------------------------------------------------
-
-function Read-StorageAgyRows {
-    param([Parameter(Mandatory)][string]$Path)
-    $snap = $null
-    try {
-        $snap = Copy-SqliteSnapshot -Path $Path
-        $h = Open-SqliteReadOnly -Path $snap
-        try { $rows = @(Invoke-SqliteQuery -Handle $h -Sql 'select conversation_id, title, preview, last_modified_time, workspace_uris from conversation_summaries') } finally { Close-Sqlite -Handle $h }
-        return @($rows | ForEach-Object { @{ id = [string]$_.conversation_id; title = $_.title; preview = $_.preview; modified = $_.last_modified_time; uris = $_.workspace_uris } })
-    } finally {
-        if ($snap -and [IO.Directory]::Exists((Split-Path -Parent $snap))) { Remove-Item -LiteralPath (Split-Path -Parent $snap) -Recurse -Force -ErrorAction SilentlyContinue }
-    }
-}
-
-# The first file:/// workspace of a summaries row as a Windows path.
-function ConvertFrom-StorageWorkspace {
-    param($Uris)
-    if (-not $Uris -or ([string]$Uris) -notmatch 'file:///([^\s",\]]+)') { return $null }
-    return ([uri]::UnescapeDataString($Matches[1])).Replace('/', '\')
-}
-
-# One session per conversation file (.db or .pb, with its -wal and -shm), plus its brain folder and its summaries row.
-function Get-AgyStorageSessions {
-    param([array]$Dirs = @(), $Cache, $Cancel, $Progress, $Warnings, [int]$ItemDelayMs = 0, [datetime]$Now = [DateTime]::UtcNow, [int]$RecentMinutes = 30)
-    $roles = @{ '' = 'conversation-db'; '-wal' = 'conversation-wal'; '-shm' = 'conversation-shm' }
-    foreach ($d in $Dirs) {
-        $data = [string]$d.DataDir
-        $convDir = Join-Path $data 'conversations'
-        if (-not $data -or -not [IO.Directory]::Exists($convDir)) { continue }
-        $byId = @{}
-        foreach ($f in @(Get-StorageEntries -Dir $convDir | Where-Object { $_ -is [IO.FileInfo] })) {
-            if ($f.Name -notmatch '\A(.+?)\.(db|pb)(-wal|-shm)?\z') { continue }
-            if (-not $byId.ContainsKey($Matches[1])) { $byId[$Matches[1]] = New-Object Collections.Generic.List[object] }
-            $role = $(if ($Matches[2] -eq 'pb') { 'conversation-pb' } else { $roles[[string]$Matches[3]] })
-            $byId[$Matches[1]].Add(@{ File = $f; Role = $role })
-        }
-        $sumDb = Join-Path $data 'conversation_summaries.db'
-        $rows = @(); $unreadable = $false
-        if ([IO.File]::Exists($sumDb)) {
-            $sig = Get-StorageDbSignature -Path $sumDb
-            try { $rows = @(Get-StorageCachedMeta -Cache $Cache -Key $sumDb -Size $sig.Size -Ticks $sig.Ticks -Reader { param($k) Read-StorageAgyRows -Path $k }) }
-            catch { $unreadable = $true; if ($null -ne $Warnings) { $Warnings.Add("Antigravity summaries of '$($d.Name)' could not be read: $($_.Exception.Message)") } }
-        }
-        $row = @{}; foreach ($r in $rows) { $row[[string]$r['id']] = $r }
-        Set-StorageProgress -Progress $Progress -Phase 'antigravity' -Total $byId.Count
-        foreach ($id in $byId.Keys) {
-            if (Test-StorageCancel $Cancel) { return }
-            if ($ItemDelayMs) { Start-Sleep -Milliseconds $ItemDelayMs }
-            $b = New-StorageSessionBuilder -Harness 'antigravity' -Id $id -Tag ([string]$d.Id)
-            if ($unreadable) { $b.Flags['DbUnreadable'] = $true }
-            $b.Profiles[[string]$d.Id] = [string]$d.Name
-            foreach ($p in $byId[$id]) { Add-StoragePart -List $b.Parts -Role $p.Role -Path $p.File.FullName -Bytes $p.File.Length -Ticks $p.File.LastWriteTimeUtc.Ticks }
-            $brain = Join-Path (Join-Path $data 'brain') $id
-            if ([IO.Directory]::Exists($brain)) { $m = Measure-StorageDir -Path $brain -Cancel $Cancel; Add-StoragePart -List $b.Parts -Role 'brain' -Path $brain -Bytes $m.Bytes -Kind 'dir' -Files $m.Files -Ticks $m.NewestTicks }
-            if ($row.ContainsKey($id)) {
-                $r = $row[$id]
-                Add-StoragePart -List $b.Parts -Role 'summary-row' -Path $sumDb -Kind 'row' -Files 0
-                $b.AltTitle = $(if ($r['title']) { [string]$r['title'] } elseif ($r['preview']) { [string]$r['preview'] } else { $null })
-                $b.Cwd = ConvertFrom-StorageWorkspace $r['uris']
-                $ms = ConvertTo-StorageMs $r['modified']; if ($ms) { $b.Activity = $ms }
-            }
-            Set-StorageActivityFromParts -Builder $b
-            ConvertTo-StorageSession -Builder $b -Now $Now -RecentMinutes $RecentMinutes
-            Set-StorageProgress -Progress $Progress -Done 1
-        }
-    }
-}
-
 # ---- the inventory and the statistics --------------------------------------------------------------------------------
+
+# Is Path the folder Dir or below it (whole folder names, case ignored)?
+function Test-StorageUnderDir {
+    param([string]$Path, [string]$Dir)
+    if (-not $Path -or -not $Dir) { return $false }
+    $p = $Path.TrimEnd('\'); $d = $Dir.TrimEnd('\')
+    return ($p -ieq $d -or $p.StartsWith($d + '\', [StringComparison]::OrdinalIgnoreCase))
+}
 
 function Get-StorageProfileFolder {
     param([string]$Harness, $P, [string]$DataDir, $Cancel)
     $m = $(if ($DataDir -and [IO.Directory]::Exists($DataDir)) { Measure-StorageDir -Path $DataDir -Cancel $Cancel } else { [pscustomobject]@{ Bytes = [long]0; Files = 0 } })
-    return [pscustomobject]@{ Harness = $Harness; Id = [string]$P.Id; Name = [string]$P.Name; DataDir = $DataDir; DataBytes = [long]$m.Bytes; DataFiles = [int]$m.Files; IsDefault = [bool]$P.IsDefault }
+    $bytes = [long]$m.Bytes; $files = [int]$m.Files
+    # A Claude profile can keep its chat files outside its data folder (the Default profile of the Store app): measure that too.
+    $sr = [string]$P.SessionRoot
+    if ($sr -and [IO.Directory]::Exists($sr) -and -not (Test-StorageUnderDir -Path $sr -Dir $DataDir)) { $s = Measure-StorageDir -Path $sr -Cancel $Cancel; $bytes += [long]$s.Bytes; $files += [int]$s.Files }
+    return [pscustomobject]@{ Harness = $Harness; Id = [string]$P.Id; Name = [string]$P.Name; DataDir = $DataDir; SessionRoot = $sr; DataBytes = $bytes; DataFiles = $files; IsDefault = [bool]$P.IsDefault }
 }
 
 # Walks the three harnesses and returns @{ Sessions; Profiles; Totals; ScannedAt; Files; Reads; Seconds; Cancelled }.
@@ -449,9 +417,9 @@ function Get-StorageStats {
     $archive.Saved = $archive.Bytes - $archive.ZipBytes
     $perProfile = foreach ($p in @($Inventory.Profiles)) {
         $mine = @($live | Where-Object { $_.Harness -eq $p.Harness -and @($_.Profiles | Where-Object { $_.Id -eq $p.Id }).Count })
-        $prefix = ([string]$p.DataDir).TrimEnd('\') + '\'
+        $sr = $(if ($p.PSObject.Properties['SessionRoot']) { [string]$p.SessionRoot } else { '' })
         $inside = [long]0
-        foreach ($s in $mine) { foreach ($part in $s.Parts) { if (([string]$part.Path).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $inside += $part.Bytes } } }
+        foreach ($s in $mine) { foreach ($part in $s.Parts) { if ((Test-StorageUnderDir -Path ([string]$part.Path) -Dir ([string]$p.DataDir)) -or (Test-StorageUnderDir -Path ([string]$part.Path) -Dir $sr)) { $inside += $part.Bytes } } }
         $shared = [long]0; $sum = [long]0
         foreach ($s in $mine) { $sum += $s.Bytes; if (@($s.Profiles).Count -gt 1) { $shared += $s.Bytes } }
         [pscustomobject]@{ Harness = $p.Harness; Id = $p.Id; Name = $p.Name; Sessions = $mine.Count; SessionBytes = $sum; SharedBytes = $shared

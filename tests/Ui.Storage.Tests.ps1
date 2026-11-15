@@ -107,7 +107,7 @@ $idxLocal = @([pscustomobject]@{ key = 'claude:c1'; harness = 'claude'; title = 
 $idxDrive = @([pscustomobject]@{ key = 'codex:gone.aabbccdd'; harness = 'codex'; Title = 'Old codex chat'; bytes = 4194304; zipBytes = 1048576; lastActivity = (& $ms 90); archivedAt = '2026-11-10T09:00:00Z'; machineId = 'aaaaaaaa-0000-4000-8000-000000000001'; MachineName = 'LAPTOP'; path = 'archives/x' })
 $arch = @(Get-StorageArchivedRows -Local $idxLocal -Drive $idxDrive -InventoryKeys @('claude:c1') -ThisMachine 'aaaaaaaa-0000-4000-8000-000000000001')
 Assert ($arch.Count -eq 2 -and $arch[0].Key -eq 'claude:c1' -and $arch[0].SourceText -eq 'Local folder' -and $arch[1].SourceText -eq 'Drive (this machine)') "archived rows from both stores, newest first: $(Get-Keys $arch)"
-Assert ($arch[0].Restored -and $arch[0].StatusText -eq 'Restored' -and -not $arch[1].Restored -and $arch[1].StatusText -eq 'Archived') 'U1-11: a key that is back in the inventory is marked restored, and its index row is kept'
+Assert ($arch[0].Restored -and $arch[0].StatusText -eq 'Live' -and -not $arch[1].Restored -and $arch[1].StatusText -eq 'Archived') 'U1-11: a key that is back in the inventory is marked Live, and its index row is kept'
 Assert ($arch[0].SavedText -eq '8 MB' -and $arch[1].Title -eq 'Old codex chat' -and $arch[1].SizeText -eq '4 MB') 'sizes and the saved space'
 $arch2 = @(Get-StorageArchivedRows -Local @() -Drive @([pscustomobject]@{ key = 'claude:o'; harness = 'claude'; Title = 'From B'; bytes = 1; zipBytes = 1; lastActivity = 1; archivedAt = '2026-11-12T09:00:00Z'; machineId = 'bbbbbbbb-0000-4000-8000-000000000002'; MachineName = 'DESKTOP-B'; path = 'archives/y' }) -InventoryKeys @() -ThisMachine 'aaaaaaaa-0000-4000-8000-000000000001')
 Assert ($arch2[0].SourceText -eq 'Drive (DESKTOP-B)') 'a row from another machine names it'
@@ -128,7 +128,7 @@ try {
     function Start-StorageJob { param($Script, $Arguments, $Total) $j = [pscustomobject]@{ Progress = (New-FakeProgress); Cancel = @{ Cancel = $false }; Script = $Script; Args = $Arguments; Total = $Total }; $j.Progress['Total'] = $Total; $script:Jobs += $j; return $j }
     function Show-StorageConfirm { param($Content) $script:Confirms += , $Content; return $script:ConfirmAnswer }
     function Show-StorageResults { param($Rows, $Title) $script:Shown += , @{ Rows = $Rows; Title = $Title } }
-    function Get-StorageRunningIds { param($Roots, $Source) return @{ claude = @(); codex = @(); antigravity = @() } }
+    function Get-StorageRunningIds { param($Roots, $Source) return @{ claude = @(); codex = @(); antigravity = @(); seq = $script:Confirms.Count } }
     function Get-SyncMachine { [pscustomobject]@{ Id = 'aaaaaaaa-0000-4000-8000-000000000001'; Name = 'PC' } }
     function Test-SyncReady { return $false }
     $flag = { param($c) [bool][System.Windows.Forms.Control].GetMethod('GetState', [Reflection.BindingFlags]'NonPublic,Instance', $null, [Type[]]@([int]), $null).Invoke($c, @(2)) }
@@ -240,6 +240,7 @@ try {
     Invoke-StorageAction -Ctx $ctx -Name 'Archive'
     $job = $script:Jobs[-1]
     Assert ($script:Jobs.Count -eq 1 -and $job.Total -eq 2 -and $job.Script -match 'Invoke-StorageArchive' -and $job.Args.Target.Kind -eq 'local' -and $job.Args.Target.Path -eq 'D:\HarnessArchive' -and $job.Args.NeedCodex -eq $true -and $job.Args.MachineId -eq 'aaaaaaaa-0000-4000-8000-000000000001' -and (@($job.Args.Sessions | ForEach-Object { $_.Key }) -join ',') -eq 'claude:c1,codex:x1.11223344') 'Yes starts one background job for the two sessions, with the store, the machine and the Codex wrapper'
+    Assert ($job.Args.Running.seq -eq $script:Confirms.Count) 'R3-3: the running apps are read again on the UI thread right after the confirmation, and that value goes to the job'
     Assert ($ctx.Busy -and -not $ctx.Buttons['Archive'].Enabled -and $ctx.Stop.Enabled) 'while it runs every action is off and Stop is on'
     Invoke-StorageAction -Ctx $ctx -Name 'Delete'
     Assert ($script:Jobs.Count -eq 1) 'a second action while busy does nothing'
@@ -284,16 +285,26 @@ try {
     $zip = Join-Path $storeDir 'claude\2026-11\claude_c1.harchive.zip'; [IO.File]::WriteAllText($zip, 'zip')
     [IO.File]::WriteAllText((Join-Path $storeDir 'claude\2026-11\claude_c1.summary.md'), 'summary')
     $script:Store['Storage.ArchiveTarget'] = @{ kind = 'local'; path = $storeDir }
-    $script:RemovedIdx = @(); function Remove-StorageArchiveIndex { param($Target, $Key) $script:RemovedIdx += $Key }
+    $script:RemovedIdx = @(); function Remove-StorageArchiveIndex { param($Target, $Key, $Entry) $script:RemovedIdx += $Key; $script:RemovedEntry = $Entry }
     Read-StorageArchivedList -Ctx $ctx; Update-StorageTab -Ctx $ctx
     [void]$ctx.ArchList.Handle; $ctx.ArchList.Items[0].Selected = $true; Update-StorageButtons -Ctx $ctx
     Assert ($ctx.Buttons['OpenSummary'].Enabled -and (Get-StorageSummaryFile -Row $ctx.ArchList.Items[0].Tag) -like '*claude_c1.summary.md') 'Open summary is on when <key>.summary.md sits beside the zip'
     Invoke-StorageAction -Ctx $ctx -Name 'DeleteArchive'
-    Assert (-not (Test-Path -LiteralPath $zip) -and $script:RemovedIdx -contains 'claude:c1' -and $script:Confirms[-1].Text -like '*cannot be undone*') 'Delete archive removes the zip and its row after a confirmation'
+    Assert (-not (Test-Path -LiteralPath $zip) -and $script:RemovedIdx -contains 'claude:c1' -and $script:RemovedEntry -like '*claude_c1*' -and $script:Confirms[-1].Text -like '*cannot be undone*') 'Delete archive removes the zip and its row after a confirmation'
     # a restored key is marked restored
     $script:IndexRows = @($script:IndexRows)
     $ctx.Inventory = $inv; Read-StorageArchivedList -Ctx $ctx
-    Assert ($ctx.ArchivedRows[0].Restored -and $ctx.ArchivedRows[0].StatusText -eq 'Restored') 'U1-11: a key that is back in the inventory shows Restored'
+    Assert ($ctx.ArchivedRows[0].Restored -and $ctx.ArchivedRows[0].StatusText -eq 'Live') 'U1-11: a key that is back in the inventory shows Live'
+    # R3-10: after a Restore the row is marked and the status asks for a scan; R3-2: a hard-stopped action marks the list stale
+    function Show-StorageResults { param($Rows, $Title) }
+    $dup = $ctx.ArchivedRows[0].PSObject.Copy(); $dup.Row = [pscustomobject]@{ key = $ctx.ArchivedRows[0].Row.key; entry = 'other/entry.harchive.zip' }
+    $ctx.ArchivedRows = @($ctx.ArchivedRows[0], $dup)
+    $ctx.JobKind = 'Restore'; $ctx.JobRows = @($ctx.ArchivedRows[0]); $ctx.JobBlocked = @()
+    Complete-StorageJob -Ctx $ctx -Job ([pscustomobject]@{ Progress = @{ Result = @(@{ Key = 'claude:c1'; Ok = $true; Skipped = $false; Reason = ''; Warnings = @() }); Cancelled = $false; Error = $null } })
+    Assert ($ctx.Status.Text -like '*Scan again to see the restored sessions*' -and $ctx.ArchivedRows[0].StatusText -eq 'Restored - scan again' -and $ctx.ArchivedRows[1].StatusText -ne 'Restored - scan again') 'R3-10 (only the restored archive, not another one of the same key): Restore tells the user to scan again and marks the restored archive row'
+    $ctx.JobKind = 'Archive'; $ctx.Stale = $false
+    Complete-StorageJob -Ctx $ctx -Job ([pscustomobject]@{ Progress = @{ Result = $null; Cancelled = $true; HardStopped = $true; Error = $null } })
+    Assert ($ctx.Stale -and $ctx.Status.Text -like '*Scan again*') 'R3-2: an action that was hard-stopped marks the list stale and says Scan again'
     # a Drive row of another machine: restore maps the folders, delete is off
     function Test-SyncReady { return $true }
     function Get-StorageDriveTarget { return @{ Kind = 'drive'; SyncRoot = 'X:\HarnessSync-test'; MachineId = 'aaaaaaaa-0000-4000-8000-000000000001'; Key = [byte[]](1..64); PathMap = @{} } }

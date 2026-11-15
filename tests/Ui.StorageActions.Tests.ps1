@@ -72,7 +72,7 @@ Remove-Item Function:\Invoke-StorageTrim, Function:\Invoke-StorageSummarize, Fun
 $a = Get-StorageArchivedActionState -Row ([pscustomobject]@{ Restored = $false; Source = 'local'; MachineId = 'm1' }) -ThisMachine 'm1'
 Assert ($a.Restore -and $a.DeleteArchive -and -not $a.OpenSummary) 'archived view: Restore and Delete archive on a local row'
 $a = Get-StorageArchivedActionState -Row ([pscustomobject]@{ Restored = $true; Source = 'drive'; MachineId = 'm2' }) -ThisMachine 'm1' -SummaryExists $true
-Assert (-not $a.Restore -and -not $a.DeleteArchive -and $a.OpenSummary) 'U1-11: a restored row cannot be restored again; another machine archive cannot be deleted from here'
+Assert ($a.Restore -and -not $a.DeleteArchive -and $a.OpenSummary) 'R3-1: a row that is live again can still be restored (the current files become .bak); another machine archive cannot be deleted from here'
 Assert (-not (Get-StorageArchivedActionState -Row $null).Restore) 'no archived row selected: all off'
 
 # ---- the guard decides what a button may touch -----------------------------------------------------------------------------------------------
@@ -213,9 +213,55 @@ $res = @(Invoke-StorageDeleteBatch -Sessions @($sC1, $sZ, $sX1) -Roots @{} -Prog
 Assert ($res.Count -eq 1 -and $res[0].Ok -and $prog['Done'] -eq 1) "Cancel stops before the next session, never in the middle of one: $($res.Count) result(s)"
 Remove-Item Function:\Remove-StorageSessionOriginal
 
+# ---- R3: restore of a live key, a fresh running table, Drive limits, one capability lookup per redraw -----------------------------------------------------
+$c = Get-StorageConfirmContent -Action 'Restore' -Rows @([pscustomobject]@{ Bytes = 4MB; Title = 'x'; Restored = $true })
+Assert ($c.Text -like '*kept as .bak*') 'R3-1: restoring a session that is live again says its current files are kept as .bak'
+$c = Get-StorageConfirmContent -Action 'Restore' -Rows @([pscustomobject]@{ Bytes = 4MB; Title = 'x'; Restored = $false })
+Assert ($c.Text -notlike '*is live again*') 'R3-1: a session that is not live has no such sentence'
+foreach ($act in 'Archive', 'Delete', 'Restore', 'Trim', 'Summarize') {
+    Assert ((Get-StorageJobScript -Action $act) -notlike '*Get-StorageRunningIds*') "R3-3: the $act job does not read the running apps itself (its runspace lacks ClaudeExe and ClaudeApp)"
+}
+function Invoke-StorageTrim { param($Sessions, $Target, $Mode) }
+function Invoke-StorageSummarize { param($Sessions, $Target, [switch]$Confirmed) }
+function Test-StorageSummarizeReady { return $true }
+$script:StorageTrimInPlace = @{ claude = $true; codex = $true }
+Set-StorageTargetSetting -Kind 'drive'
+$st = Get-StorageActionState -Rows @((Row 'claude:c1'))
+Assert ($st.Trim -and -not $st.Summarize) 'R3-8: with a Drive store Summarize is off (Trim of a Claude session is done in place and stays on)'
+Assert ((Get-StorageActionBlock -Session $sC1 -Action 'Summarize') -like '*Drive*') 'R3-8: the reason names Drive'
+$sub = New-Sess 'claude' 'claude:sub1' 'Sub-agent' (1 * $MB) 40 @('Default') @{ Subagent = $true }
+Assert ((Get-StorageActionBlock -Session $sub -Action 'Trim') -like '*read-only trim copy*Drive*' -and -not (Get-StorageActionBlock -Session $sC1 -Action 'Trim')) 'R3-8: a sub-agent rollout (a read-only copy) is refused for Drive; an in-place trim is not'
+Set-StorageTargetSetting -Kind 'local' -Path 'D:\HarnessArchive'
+Assert ((Get-StorageActionState -Rows @((Row 'claude:c1'))).Summarize -and -not (Get-StorageActionBlock -Session $sub -Action 'Trim')) 'R3-8: with a local folder both are on again'
+$script:GetCommandCalls = 0
+function Get-Command { $script:GetCommandCalls++; Microsoft.PowerShell.Core\Get-Command @args }
+$manyRows = @((Row 'claude:c1'), (Row 'codex:x1.11223344'), (Row 'antigravity:g1.aabbccdd'), (Row 'claude:c2'), (Row 'codex:z.11223344'))
+[void](Get-StorageActionState -Rows $manyRows)
+$once = $script:GetCommandCalls
+[void](Get-StorageActionState -Rows ($manyRows + $manyRows + $manyRows))
+Assert ($once -gt 0 -and $script:GetCommandCalls -eq 2 * $once) "R3-9: the capability lookup runs once per redraw, whatever the number of rows ($once lookups for 5 rows, $($script:GetCommandCalls - $once) for 15)"
+Remove-Item Function:\Get-Command
+Remove-Item Function:\Invoke-StorageTrim, Function:\Invoke-StorageSummarize, Function:\Test-StorageSummarizeReady
+
+# ---- R3 item 4: deleting one archive keeps the other archives of the same key ------------------------------------------------------------------------
+. (Import-TestFunctions -Files @((Join-Path $root 'src\Storage.Archive.ps1')) -Names @('Write-StorageTextAtomic', 'Read-StorageLocalIndex', 'Remove-StorageArchiveIndex'))
+$ad = Join-Path ([IO.Path]::GetTempPath()) ('r3-del-' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path (Join-Path $ad 'claude\2026-11') -Force | Out-Null
+    foreach ($n in 'a', 'b') { [IO.File]::WriteAllText((Join-Path $ad "claude\2026-11\claude_c1.$n.harchive.zip"), 'zip') }
+    $lines = @('a', 'b') | ForEach-Object { (@{ key = 'claude:c1'; entry = "claude/2026-11/claude_c1.$_.harchive.zip" } | ConvertTo-Json -Compress) }
+    [IO.File]::WriteAllText((Join-Path $ad 'archive-index.jsonl'), (($lines -join "`n") + "`n"))
+    $row = [pscustomobject]@{ Source = 'local'; Key = 'claude:c1'; Row = [pscustomobject]@{ key = 'claude:c1'; entry = 'claude/2026-11/claude_c1.a.harchive.zip' } }
+    Remove-StorageArchiveRow -Row $row -Target @{ Kind = 'local'; Path = $ad }
+    $left = @(Read-StorageLocalIndex -Path (Join-Path $ad 'archive-index.jsonl'))
+    Assert (-not (Test-Path -LiteralPath (Join-Path $ad 'claude\2026-11\claude_c1.a.harchive.zip')) -and (Test-Path -LiteralPath (Join-Path $ad 'claude\2026-11\claude_c1.b.harchive.zip')) -and $left.Count -eq 1 -and $left[0].entry -like '*c1.b.*') 'R3 item 4: deleting one archive removes its zip and its index row only; the other archive of the same key stays listed'
+} finally { Remove-Item -LiteralPath $ad -Recurse -Force -ErrorAction SilentlyContinue }
+
 # ---- results ------------------------------------------------------------------------------------------------------------------------------------------------------
 $rr = @(Get-StorageResultRows -Results @(@{ Key = 'claude:c1'; Ok = $true; Skipped = $false; Reason = ''; Warnings = @('Not removed: x') }, @{ Key = 'claude:c2'; Ok = $false; Skipped = $true; Reason = 'recent' }, @{ Key = 'codex:q'; Ok = $false; Skipped = $false; Reason = 'broke' }) -Rows @((Row 'claude:c1'), (Row 'claude:c2')))
 Assert ($rr[0].Status -eq 'Done' -and $rr[0].Title -eq 'Fix the login' -and $rr[0].Reason -eq 'Not removed: x' -and $rr[1].Status -eq 'Skipped' -and $rr[1].Reason -eq 'recent' -and $rr[2].Status -eq 'Failed' -and $rr[2].Title -eq 'codex:q') 'result rows: done, skipped with the reason, failed; a key with no row shows the key'
+$rn = @(Get-StorageResultRows -Results @(@{ Key = 'claude:c1'; Ok = $true; Skipped = $false; Reason = 'nothing to trim: no tool output over 16 KB was found.'; Warnings = @() }) -Rows @())
+Assert ($rn[0].Status -eq 'Done' -and $rn[0].Reason -like 'nothing to trim*') 'a Trim that found nothing to cut is Done with its reason shown as information, not Failed'
 $inv2 = Remove-StorageInventorySessions -Inventory $inv -Keys @('claude:c1', 'codex:x1.11223344')
 Assert (@($inv2.Sessions).Count -eq 4 -and @($inv.Sessions).Count -eq 6 -and $inv2.Files -eq 1) 'archived or deleted sessions leave a copy of the inventory; the scan result itself is untouched'
 

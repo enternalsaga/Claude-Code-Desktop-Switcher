@@ -5,6 +5,7 @@ $root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $root 'src\Harness.Codex.Chats.ps1')
 . (Join-Path $root 'src\Storage.Scan.ps1')
 . (Join-Path $root 'src\Storage.Inventory.ps1')
+. (Join-Path $root 'src\Storage.Inventory.Antigravity.ps1')
 
 # Only a fake tree under %TEMP%\storage-test-*; nothing of ~\.claude, CODEX_HOME or Antigravity is ever touched.
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('storage-test-' + [guid]::NewGuid().ToString('N'))
@@ -251,6 +252,59 @@ try {
     Assert ($st.Archive.Sessions -eq 0 -and $st.Archive.Bytes -eq 0) 'the archive block is there, empty until A1 fills it'
     $both = Get-StorageStats -Inventory ([pscustomobject]@{ Sessions = @(); Profiles = @() })
     Assert ($both.ByProfile.Count -eq 0 -and $both.CliOnly.Bytes -eq 0 -and $both.ByHarness.claude.Bytes -eq 0) 'stats of an empty inventory'
+
+    # ---------------------------------------------------------------- R3-5: the newest title wins; R3-6: a line longer than the window
+    $rt = Join-Path $tmp 'r3'
+    $tl = { param($kind, $key, $text) '{"type":"' + $kind + '","' + $key + '":"' + $text + '","sessionId":"s"}' }
+    Write-Text (Join-Path $rt 't1.jsonl') ((& $line $cli1 '2026-11-10T08:00:00.000Z') + "`n" + (& $tl 'custom-title' 'customTitle' 'First name') + "`n" + (& $line $cli1 '2026-11-10T09:00:00.000Z') + "`n" + (& $tl 'custom-title' 'customTitle' 'Second name') + "`n" + (& $line $cli1 '2026-11-10T10:00:00.000Z') + "`n")
+    Assert ((Read-StorageClaudeJsonlMeta -Path (Join-Path $rt 't1.jsonl')).title -eq 'Second name') 'R3-5: a session renamed twice shows the newest name'
+    $filler = '{"type":"assistant","message":{"content":"' + ('f' * 100000) + '"}}'
+    Write-Text (Join-Path $rt 'big-last.jsonl') ((& $line $cli1 '2026-11-10T08:00:00.000Z') + "`n" + $filler + "`n" + '{"type":"assistant","timestamp":"2026-11-12T10:00:00.000Z","message":{"content":"' + ('z' * 200000) + '"}}' + "`n")
+    $bl = Read-StorageClaudeJsonlMeta -Path (Join-Path $rt 'big-last.jsonl')
+    Assert ($bl.last -eq (ConvertTo-StorageMs '2026-11-12T10:00:00.000Z') -and $bl.first -and $bl.cwd) "R3-6: a last line of 200 KB still gives the last time: $($bl.last)"
+    Write-Text (Join-Path $rt 'big-first.jsonl') ('{"type":"user","cwd":"C:\\work\\first","timestamp":"2026-11-10T08:00:00.000Z","message":{"role":"user","content":"' + ('y' * 200000) + '"}}' + "`n" + $filler + "`n" + (& $line $cli1 '2026-11-10T09:00:00.000Z') + "`n")
+    $bf = Read-StorageClaudeJsonlMeta -Path (Join-Path $rt 'big-first.jsonl')
+    Assert ($bf.cwd -eq 'C:\work\first' -and $bf.first) 'R3-6: a first line of 200 KB still gives the folder and the first time'
+    # ---------------------------------------------------------------- R3-4: a local_*.json that cannot be read is not cached as empty
+    $rp = Join-Path $rt 'proj'; $cliR = 'aaaaaaaa-0000-4000-8000-0000000000r1'.Replace('r1', 'f1')
+    Write-Text (Join-Path $rp "C--w\$cliR.jsonl") ((& $line $cliR '2026-11-10T08:00:00.000Z') + "`n")
+    $rprof = Join-Path $rt 'prof'; $lj = Join-Path $rprof 'claude-code-sessions\a\b\local_r.json'
+    Write-Text $lj (& $localJson $cliR 'Locked title' 1762800000000)
+    $rroots = @{ ClaudeProjects = $rp; ClaudeProfiles = @(@{ Id = 'R'; Name = 'R'; SessionRoot = (Join-Path $rprof 'claude-code-sessions'); DataDir = $rprof; IsDefault = $false }); CodexHomes = @(); AgyDirs = @() }
+    $rcache = New-StorageCache
+    $fs = [IO.File]::Open($lj, 'Open', 'ReadWrite', 'None')
+    try { $ri = Get-StorageInventory -Roots $rroots -Cache $rcache } finally { $fs.Dispose() }
+    Assert (-not $rcache.Entries.ContainsKey($lj)) 'R3-4: the unreadable file has no cache entry'
+    Assert (@($ri.Warnings | Where-Object { $_ -like '*local_r.json*' }).Count -eq 1) "R3-4: and a warning names it: $($ri.Warnings -join '|')"
+    Assert (@($ri.Sessions | Where-Object { $_.Flags.DbUnreadable }).Count -ge 1 -and (Get-Session $ri "claude:$cliR").Flags.DbUnreadable) 'R3-4: the sessions that cannot be told apart are marked unreadable, so they cannot be archived or deleted'
+    $ri2 = Get-StorageInventory -Roots $rroots -Cache $rcache
+    $s2 = Get-Session $ri2 "claude:$cliR"
+    Assert ($s2.Profiles.Count -eq 1 -and -not $s2.Flags.DbUnreadable -and -not $s2.Flags.IsCliOnly -and $s2.Title -eq 'Locked title' -and @($ri2.Warnings).Count -eq 0) 'R3-4: the next scan reads it and the session is whole'
+    Write-Text $lj '{ not json'
+    $ri3 = Get-StorageInventory -Roots $rroots -Cache (New-StorageCache)
+    Assert (@($ri3.Warnings | Where-Object { $_ -like '*local_r.json*' }).Count -eq 1 -and (Get-Session $ri3 "claude:$cliR").Flags.DbUnreadable) 'R3-4: a file that is not JSON counts as unreadable too'
+    # ---------------------------------------------------------------- R3-11: a session root outside the data folder is measured as well
+    $dd = Join-Path $rt 'data'; $sr = Join-Path $rt 'sess-root'
+    Write-Bytes (Join-Path $dd 'Cache\a.bin') 1000; Write-Bytes (Join-Path $sr 'acct\org\local_q.json') 500
+    $pf = Get-StorageProfileFolder -Harness 'claude' -P @{ Id = 'D'; Name = 'D'; IsDefault = $true; SessionRoot = $sr } -DataDir $dd
+    Assert ($pf.DataBytes -eq 1500 -and $pf.DataFiles -eq 2 -and $pf.SessionRoot -eq $sr) "R3-11: data folder + session root outside it: $($pf.DataBytes)"
+    $inner = Join-Path $dd 'claude-code-sessions'; Write-Bytes (Join-Path $inner 'x\y\local_i.json') 200
+    $pf2 = Get-StorageProfileFolder -Harness 'claude' -P @{ Id = 'D'; Name = 'D'; IsDefault = $true; SessionRoot = $inner } -DataDir $dd
+    Assert ($pf2.DataBytes -eq 1200) "R3-11: a session root inside the data folder is not counted twice: $($pf2.DataBytes)"
+    $fk = [pscustomobject]@{ Sessions = @([pscustomobject]@{ Harness = 'claude'; Key = 'claude:q'; Bytes = 500; Flags = @{ IsCliOnly = $false }; Profiles = @([pscustomobject]@{ Id = 'D'; Name = 'D' })
+            Parts = @(@{ Role = 'profile-meta'; Path = (Join-Path $sr 'acct\org\local_q.json'); Bytes = 500; Kind = 'file' }) })
+        Profiles = @([pscustomobject]@{ Harness = 'claude'; Id = 'D'; Name = 'D'; DataDir = $dd; SessionRoot = $sr; DataBytes = 1500 }) }
+    Assert ((Get-StorageStats -Inventory $fk).ByProfile[0].AppDataBytes -eq 1000) 'R3-11: app data is data + session root minus the session parts in either'
+
+    # ---------------------------------------------------------------- R3-7: a failed fallback copy leaves no snapshot folder behind
+    $snapTmp = Join-Path $rt 'snaptemp'; New-Item -ItemType Directory -Path $snapTmp -Force | Out-Null
+    Write-Text (Join-Path $rt 'notadb.db') 'this is not a database'
+    $oldTmp = $env:TEMP; $oldTmp2 = $env:TMP; $threw = $false
+    try {
+        $env:TEMP = $snapTmp; $env:TMP = $snapTmp
+        try { & { function Copy-Item { throw 'disk full' }; [void](Copy-SqliteSnapshot -Path (Join-Path $rt 'notadb.db')) } } catch { $threw = ($_.Exception.Message -like '*disk full*') }
+    } finally { $env:TEMP = $oldTmp; $env:TMP = $oldTmp2 }
+    Assert ($threw -and @(Get-ChildItem -LiteralPath $snapTmp -Filter 'sqlite-snap-*').Count -eq 0) 'R3-7: when the backup copy fails the error is thrown and no sqlite-snap folder is left'
 
     # roots built from a config: only the shape is checked here, never real paths
     Assert ($null -ne (Get-Command Get-StorageRootsFromConfig -CommandType Function)) 'the real-roots builder exists'

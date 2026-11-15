@@ -107,8 +107,14 @@ function Copy-SqliteSnapshot {
         if (Get-Command Write-HarnessLog -ErrorAction SilentlyContinue) { Write-HarnessLog $why } else { Write-Warning $why }
         if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }
     } finally { if ($db) { Close-Sqlite -Handle $db } }
-    foreach ($suffix in '', '-wal', '-shm') {
-        if (Test-Path -LiteralPath ($Path + $suffix)) { Copy-Item -LiteralPath ($Path + $suffix) -Destination (Join-Path $dir ((Split-Path -Leaf $Path) + $suffix)) }
+    try {
+        foreach ($suffix in '', '-wal', '-shm') {
+            if (Test-Path -LiteralPath ($Path + $suffix)) { Copy-Item -LiteralPath ($Path + $suffix) -Destination (Join-Path $dir ((Split-Path -Leaf $Path) + $suffix)) -ErrorAction Stop }
+        }
+    } catch {
+        # A half copy of the database (titles, folders) must not stay in %TEMP%.
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        throw
     }
     return (Join-Path $dir (Split-Path -Leaf $Path))
 }

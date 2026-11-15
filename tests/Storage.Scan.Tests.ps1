@@ -5,6 +5,7 @@ $root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $root 'src\Harness.Codex.Chats.ps1')
 . (Join-Path $root 'src\Storage.Scan.ps1')
 . (Join-Path $root 'src\Storage.Inventory.ps1')
+. (Join-Path $root 'src\Storage.Inventory.Antigravity.ps1')
 
 # Only a fake tree under %TEMP%\storage-test-*; nothing of ~\.claude, CODEX_HOME or Antigravity is ever touched.
 function New-StorageTestDir {
@@ -147,6 +148,27 @@ try {
     Assert (-not (Test-Path -LiteralPath (Join-Path $tmp 'bg\cache-stop.json'))) 'a cancelled scan does not write a half cache'
     Close-StorageScan -Scan $scan
 
+    # R3-2: a job that hangs for 30 s and has a child process: Stop and Close return at once, the child is killed, the runspace is freed later
+    $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+    $ps = [powershell]::Create(); $ps.Runspace = $rs; [void]$ps.AddScript('Start-Sleep -Seconds 30')
+    $kid = Start-Process -FilePath (Get-Command powershell.exe).Source -ArgumentList '-NoProfile', '-Command', 'Start-Sleep 60' -PassThru -WindowStyle Hidden
+    $pids = New-Object Collections.Generic.List[int]; $pids.Add($kid.Id)
+    $hang = [pscustomobject]@{ Progress = [hashtable]::Synchronized(@{ Finished = $false; Cancelled = $false; ChildPids = $pids }); Cancel = [hashtable]::Synchronized(@{ Cancel = $false }); PowerShell = $ps; Runspace = $rs; Handle = $ps.BeginInvoke() }
+    Start-Sleep -Milliseconds 300
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    Stop-StorageScan -Scan $hang
+    $stopMs = $sw.ElapsedMilliseconds; $sw.Restart()
+    Close-StorageScan -Scan $hang
+    $closeMs = $sw.ElapsedMilliseconds
+    Assert ($stopMs -lt 2000 -and $closeMs -lt 2000) "R3-2: Stop ($stopMs ms) and Close ($closeMs ms) of a hanging job return in under 2 s"
+    $kid.Refresh(); $deadline = [DateTime]::UtcNow.AddSeconds(5); while (-not $kid.HasExited -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+    Assert $kid.HasExited 'R3-2: the child process in Progress.ChildPids was killed'
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while ($script:StoragePendingClose.Count -and [DateTime]::UtcNow -lt $deadline) { Clear-StoragePendingClose; Start-Sleep -Milliseconds 100 }
+    Assert ($script:StoragePendingClose.Count -eq 0 -and $rs.RunspaceStateInfo.State -eq 'Closed') 'R3-2: the stopped runspace is disposed afterwards, not by the caller'
+    Stop-StorageChildProcesses -Progress @{ ChildPids = @(2147480000, $null) }
+    Assert $true 'killing a process that does not exist is not an error'
+
     # an error inside the runspace comes back through Progress.Error and is never thrown at the caller
     $blocker = Join-Path $tmp 'blocker'; [IO.File]::WriteAllText($blocker, 'a file where a folder is needed')
     $scan = Start-StorageScan -Roots $roots -CachePath (Join-Path $blocker 'cache.json')
@@ -158,11 +180,11 @@ try {
     $names = @(Get-StorageScanFunctionNames)
     foreach ($nm in $names) { Assert (Get-Command $nm -CommandType Function -ErrorAction SilentlyContinue) "shipped function not defined: $nm" }
     $defined = New-Object Collections.Generic.List[string]
-    foreach ($f in 'Storage.Scan.ps1', 'Storage.Inventory.ps1') {
+    foreach ($f in 'Storage.Scan.ps1', 'Storage.Inventory.ps1', 'Storage.Inventory.Antigravity.ps1') {
         $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root "src\$f"), [ref]$null, [ref]$null)
         foreach ($d in $ast.FindAll({ param($x) $x -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) { $defined.Add($d.Name) }
     }
-    $notShipped = @($defined | Where-Object { $names -notcontains $_ -and $_ -notin 'Start-StorageScan', 'Stop-StorageScan', 'Close-StorageScan', 'Get-StorageScanFunctionNames', 'Get-StorageRootsFromConfig', 'Get-StorageStats' })
+    $notShipped = @($defined | Where-Object { $names -notcontains $_ -and $_ -notin 'Start-StorageScan', 'Stop-StorageScan', 'Close-StorageScan', 'Stop-StorageChildProcesses', 'Clear-StoragePendingClose', 'Get-StorageScanFunctionNames', 'Get-StorageRootsFromConfig', 'Get-StorageStats' })
     Assert ($notShipped.Count -eq 0) "functions of the scan files that the runspace would miss: $($notShipped -join ', ')"
     Assert (-not (Get-ChildItem ([IO.Path]::GetTempPath()) -Directory -Filter 'sqlite-snap-*' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-5) })) 'no snapshot folder left behind'
 } finally {

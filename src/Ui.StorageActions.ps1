@@ -7,8 +7,9 @@
 # Whether Archive | Delete | Restore works for a harness: asks Test-StorageHarnessSupported (lane A1-6) when it exists, else the
 # default is claude and codex yes, antigravity no (until A1-6 can remove an Antigravity session).
 function Test-StorageUiHarnessSupported {
-    param([AllowEmptyString()][string]$Harness, [Parameter(Mandatory)][string]$Action)
-    if (Get-Command Test-StorageHarnessSupported -CommandType Function -ErrorAction SilentlyContinue) { return [bool](Test-StorageHarnessSupported -Harness $Harness -Action $Action) }
+    param([AllowEmptyString()][string]$Harness, [Parameter(Mandatory)][string]$Action, $HasCheck = $null)   # HasCheck: already looked up by the caller
+    if ($null -eq $HasCheck) { $HasCheck = [bool](Get-Command Test-StorageHarnessSupported -CommandType Function -ErrorAction SilentlyContinue) }
+    if ($HasCheck) { return [bool](Test-StorageHarnessSupported -Harness $Harness -Action $Action) }
     return ($Harness -ne 'antigravity')
 }
 
@@ -101,16 +102,37 @@ function Get-StorageSelectionLabel {
     return ('Selected: {0} session{1}, {2}' -f $rows.Count, $(if ($rows.Count -eq 1) { '' } else { 's' }), (Format-StorageSize $bytes))
 }
 
+# What the gates below need, looked up once per redraw or plan (R3-9) and not once per row: whether Trim and Summarize exist and are
+# ready, and which store the archives go to (R3-8: Drive cannot hold what Summarize and a read-only Trim write beside the archive).
+function Get-StorageActionContext {
+    $t = $null; try { $t = Get-StorageTargetSetting } catch { }
+    $has = { param($n) [bool](Get-Command $n -CommandType Function -ErrorAction SilentlyContinue) }
+    return @{ TrimReady = (& $has 'Invoke-StorageTrim'); HarnessCheck = (& $has 'Test-StorageHarnessSupported'); TargetKind = $(if ($t) { [string]$t.kind } else { '' })
+             SummarizeReady = [bool]((& $has 'Invoke-StorageSummarize') -and (& $has 'Test-StorageSummarizeReady') -and (Test-StorageSummarizeReady)) }
+}
+
+# How a trim of this session is done: in place when its harness can and it is not a sub-agent rollout (Invoke-StorageTrim decides the same).
+function Get-StorageTrimModeOf {
+    param([Parameter(Mandatory)]$Session)
+    return $(if ($script:StorageTrimInPlace -and $script:StorageTrimInPlace[[string]$Session.Harness] -and -not $Session.Flags.Subagent) { 'InPlace' } else { 'ReadOnlyCopy' })
+}
+
 # Why an action cannot be done to this session, or '' when it can. Action: Archive | Delete | Trim | Summarize.
 function Get-StorageActionBlock {
-    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)][string]$Action)
+    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)][string]$Action, [hashtable]$Context)
     if ($Session.Flags.DbUnreadable) { return 'The database of this profile could not be read, so what belongs to this session is not known.' }
-    if ($Action -in 'Archive', 'Delete' -and -not (Test-StorageUiHarnessSupported -Harness $Session.Harness -Action $Action)) { return 'Antigravity sessions cannot be archived or deleted yet.' }
+    if (-not $Context) { $Context = Get-StorageActionContext }
+    if ($Action -in 'Archive', 'Delete' -and -not (Test-StorageUiHarnessSupported -Harness $Session.Harness -Action $Action -HasCheck $Context.HarnessCheck)) { return 'Antigravity sessions cannot be archived or deleted yet.' }
+    if ($Action -notin 'Trim', 'Summarize') { return '' }
     if ($Action -eq 'Trim') {
-        if (-not (Get-Command Invoke-StorageTrim -CommandType Function -ErrorAction SilentlyContinue)) { return 'Trim is not available yet.' }
+        if (-not $Context.TrimReady) { return 'Trim is not available yet.' }
         if ($Session.Harness -eq 'antigravity' -or -not $Session.Flags.Trimmable -or $Session.Flags.HasZst) { return 'This session cannot be trimmed.' }
+        if ($Context.TargetKind -eq 'drive' -and (Get-StorageTrimModeOf -Session $Session) -ne 'InPlace') { return 'A read-only trim copy cannot be stored on Drive. Choose a local archive folder with Change...' }
     }
-    if ($Action -eq 'Summarize' -and -not ((Get-Command Invoke-StorageSummarize -CommandType Function -ErrorAction SilentlyContinue) -and (Get-Command Test-StorageSummarizeReady -CommandType Function -ErrorAction SilentlyContinue) -and (Test-StorageSummarizeReady))) { return 'Summarize is not available yet.' }
+    if ($Action -eq 'Summarize') {
+        if (-not $Context.SummarizeReady) { return 'Summarize is not available yet.' }
+        if ($Context.TargetKind -eq 'drive') { return 'A summary cannot be stored on Drive. Choose a local archive folder with Change...' }
+    }
     return ''
 }
 
@@ -119,7 +141,8 @@ function Get-StorageActionBlock {
 function Get-StorageActionState {
     param([array]$Rows)
     $rows = @($Rows | Where-Object { $null -ne $_ })
-    $on = { param($a) [bool]@($rows | Where-Object { $_.Actionable -and -not (Get-StorageActionBlock -Session $_.Session -Action $a) }).Count }
+    $ctx = Get-StorageActionContext
+    $on = { param($a) [bool]@($rows | Where-Object { $_.Actionable -and -not (Get-StorageActionBlock -Session $_.Session -Action $a -Context $ctx) }).Count }
     $one = $(if ($rows.Count -eq 1) { $rows[0] } else { $null })
     return @{ Archive = (& $on 'Archive'); Trim = (& $on 'Trim'); Summarize = (& $on 'Summarize'); Delete = (& $on 'Delete')
               Include = [bool]($one -and $one.State -eq 'recent' -and -not $one.Actionable -and $one.Selectable) }
@@ -130,7 +153,7 @@ function Get-StorageActionState {
 function Get-StorageArchivedActionState {
     param($Row, [string]$ThisMachine = '', [bool]$SummaryExists = $false)
     if (-not $Row) { return @{ Restore = $false; DeleteArchive = $false; OpenSummary = $false } }
-    return @{ Restore = (-not $Row.Restored -and (Test-StorageUiHarnessSupported -Harness ([string]$Row.Harness) -Action 'Restore')); DeleteArchive = ($Row.Source -eq 'local' -or [string]$Row.MachineId -eq $ThisMachine); OpenSummary = $SummaryExists }
+    return @{ Restore = (Test-StorageUiHarnessSupported -Harness ([string]$Row.Harness) -Action 'Restore'); DeleteArchive = ($Row.Source -eq 'local' -or [string]$Row.MachineId -eq $ThisMachine); OpenSummary = $SummaryExists }
 }
 
 # The ticked sessions split into what can be done now and what is left out with the reason. Uses the guard of lane A1.
@@ -138,8 +161,9 @@ function Get-StorageArchivedActionState {
 function Get-StorageActionPlan {
     param([array]$Rows, [Parameter(Mandatory)][string]$Action, $Running = @{}, [string[]]$CliCwds = @(), [hashtable]$Include = @{}, [scriptblock]$LockProbe)
     $safe = New-Object Collections.Generic.List[object]; $blocked = New-Object Collections.Generic.List[object]
+    $ctx = Get-StorageActionContext
     foreach ($r in @($Rows | Where-Object { $null -ne $_ })) {
-        $why = Get-StorageActionBlock -Session $r.Session -Action $Action
+        $why = Get-StorageActionBlock -Session $r.Session -Action $Action -Context $ctx
         if (-not $why) {
             $g = @{ Session = $r.Session; Running = $Running; CliCwds = $CliCwds }
             if ($Include[[string]$r.Key]) { $g.IncludeRecent = $true }
@@ -201,6 +225,7 @@ function Get-StorageConfirmContent {
         }
     }
     $body = $t.Body
+    if ($Action -eq 'Restore' -and @($rows | Where-Object { $_.Restored }).Count) { $body += "`n`nThe current files of a session that is live again are kept as .bak." }
     if ($Action -in 'Archive', 'Delete' -and @($rows | Where-Object { $_.Session -and $_.Session.Harness -eq 'claude' }).Count) { $body += "`n`nClose any Claude Code terminal still working in these folders first; it cannot be detected." }
     if ($Action -in 'Archive', 'Delete' -and (Get-Command Get-StorageHarnessRemovalNotice -ErrorAction SilentlyContinue)) {
         foreach ($h in @($rows | Where-Object { $_.Session } | ForEach-Object { $_.Session.Harness } | Sort-Object -Unique)) { $note = Get-StorageHarnessRemovalNotice -Harness $h; if ($note) { $body += "`n`n$note" } }
@@ -240,6 +265,7 @@ function New-StorageJobRunspace {
 # hashtables. An error in the job ends in Progress.Error; it is never thrown at the caller.
 function Start-StorageJob {
     param([Parameter(Mandatory)][string]$Script, [hashtable]$Arguments = @{}, [int]$Total = 0)
+    Clear-StoragePendingClose
     $rs = New-StorageJobRunspace
     $progress = [hashtable]::Synchronized(@{ Phase = 'working'; Done = 0; Total = $Total; Finished = $false; Cancelled = $false; Error = $null; Result = $null; Warnings = @() })
     $cancel = [hashtable]::Synchronized(@{ Cancel = $false })
@@ -439,11 +465,16 @@ function Start-StorageLiveAction {
         $target = Resolve-StorageTarget
     }
     $sessions = @($plan.Safe | ForEach-Object { $_.Session })
-    $mode = 'ReadOnlyCopy'
-    if ($Name -eq 'Trim' -and $script:StorageTrimInPlace -and -not @($sessions | Where-Object { -not $script:StorageTrimInPlace[[string]$_.Harness] }).Count) { $mode = 'InPlace' }
+    $mode = 'ReadOnlyCopy'; $modeText = $mode
+    if ($Name -eq 'Trim') {   # the mode is stated per session: a sub-agent rollout or a harness that cannot be cut in place gets a copy
+        $in = @($sessions | Where-Object { (Get-StorageTrimModeOf -Session $_) -eq 'InPlace' }).Count
+        if ($in) { $mode = 'InPlace' }
+        $modeText = $(if ($in -eq $sessions.Count) { 'InPlace' } elseif (-not $in) { 'ReadOnlyCopy' } else { "InPlace for $in, ReadOnlyCopy for $($sessions.Count - $in) (sub-agents and harnesses that cannot be cut in place)" })
+    }
     $sumPlan = $(if ($Name -eq 'Summarize') { @(Get-StorageSummaryPlan -Sessions $sessions) } else { @() })
-    $content = Get-StorageConfirmContent -Action $Name -Rows $plan.Safe -Blocked $plan.Blocked -Plan $sumPlan -TargetText (Get-StorageTargetText) -Mode $mode
+    $content = Get-StorageConfirmContent -Action $Name -Rows $plan.Safe -Blocked $plan.Blocked -Plan $sumPlan -TargetText (Get-StorageTargetText) -Mode $modeText
     if (-not (Show-StorageConfirm -Content $content)) { return }
+    $running = Get-StorageRunningIds -Roots $roots   # taken again after the confirmation: the box may have been open for minutes (the job runspace cannot read it)
     $a = @{ Sessions = $sessions; Target = $target; Roots = $roots; MachineId = (Get-StorageThisMachine); Running = $running; IncludeRecent = @($Ctx.Include.Keys); Mode = $mode
             NeedCodex = [bool]@($sessions | Where-Object { $_.Harness -eq 'codex' }).Count }
     $Ctx.Job = Start-StorageJob -Script (Get-StorageJobScript -Action $Name) -Arguments $a -Total $sessions.Count
@@ -464,7 +495,7 @@ function Start-StorageArchivedAction {
     if ($sel.Source -eq 'drive' -and $sel.MachineId -ne $target.MachineId) { $target.PathMap = Get-StorageDrivePathMap -SyncRoot $target.SyncRoot -MachineId $sel.MachineId }
     $roots = Get-StorageRootsFromConfig -Config $null
     $Ctx.JobRows = @($sel); $Ctx.JobBlocked = @()
-    $a = @{ Entries = @($sel.Row); Target = $target; Roots = $roots; Running = (Get-StorageRunningIds -Roots $roots); NeedCodex = ($sel.Harness -eq 'codex') }
+    $a = @{ Entries = @($sel.Row); Target = $target; Roots = $roots; Running = (Get-StorageRunningIds -Roots $roots); NeedCodex = ($sel.Harness -eq 'codex') }   # after the confirmation
     $Ctx.Job = Start-StorageJob -Script (Get-StorageJobScript -Action 'Restore') -Arguments $a -Total 1
     Start-StorageJobTimer -Ctx $Ctx -Kind 'Restore' -Label 'Restoring'
 }
@@ -475,7 +506,7 @@ function Remove-StorageArchiveRow {
     if ($Row.Source -eq 'drive') { Remove-StorageDriveArchive -Entry $Row.Row -SyncRoot $Target.SyncRoot -MachineId $Target.MachineId; return }
     $zip = Join-Path $Target.Path (([string]$Row.Row.entry) -replace '/', '\')
     if (-not (Test-StoragePathAllowed -Path $zip -Roots @($Target.Path))) { throw 'The index row points outside the archive folder.' }
-    Remove-StorageArchiveIndex -Target $Target -Key $Row.Key
+    Remove-StorageArchiveIndex -Target $Target -Key $Row.Key -Entry ([string]$Row.Row.entry)   # one archive of the key, not all of them
     if ([IO.File]::Exists($zip)) { Remove-Item -LiteralPath $zip -Force }
 }
 
@@ -489,9 +520,10 @@ function Complete-StorageJob {
         $Ctx.Inventory = $p['Result']; $Ctx.Stats = Get-StorageStats -Inventory $Ctx.Inventory
         $have = @($Ctx.Inventory.Sessions | ForEach-Object { [string]$_.Key })
         foreach ($k in @($Ctx.Checked.Keys)) { if ($have -notcontains $k) { $Ctx.Checked.Remove($k) } }
-        $Ctx.Status.Text = 'Scan finished.'
+        $Ctx.Status.Text = 'Scan finished.'; $Ctx.Stale = $false
         return
     }
+    if ($p['HardStopped']) { $Ctx.Stale = $true; if ($Ctx.Mode -eq 'Archived') { Read-StorageArchivedList -Ctx $Ctx }; $Ctx.Status.Text = "$kind was stopped in the middle of a session. The list may be out of date: Scan again."; return }
     $results = @($p['Result'])
     $rows = @(Get-StorageResultRows -Results $results -Rows $Ctx.JobRows) + @($Ctx.JobBlocked)
     $done = @($results | Where-Object { $_ -and $_.Ok } | ForEach-Object { [string]$_.Key })
@@ -501,6 +533,7 @@ function Complete-StorageJob {
         foreach ($k in $done) { $Ctx.Checked.Remove($k) }
     }
     if ($Ctx.Mode -eq 'Archived' -or $kind -eq 'Restore') { Read-StorageArchivedList -Ctx $Ctx }
-    $Ctx.Status.Text = '{0}: {1} done, {2} skipped, {3} failed.{4}' -f $kind, $done.Count, @($rows | Where-Object { $_.Status -eq 'Skipped' }).Count, @($rows | Where-Object { $_.Status -eq 'Failed' }).Count, $(if ($p['Cancelled']) { ' Stopped before the end.' } else { ' Scan again to refresh the sizes.' })
+    if ($kind -eq 'Restore') { foreach ($r in @($Ctx.ArchivedRows | Where-Object { $a = $_; $done -contains [string]$a.Key -and @($Ctx.JobRows | Where-Object { $_.Source -eq $a.Source -and [string]$_.MachineId -eq [string]$a.MachineId -and [string]$_.Row.entry -eq [string]$a.Row.entry }).Count })) { $r.StatusText = 'Restored - scan again' } }
+    $Ctx.Status.Text = '{0}: {1} done, {2} skipped, {3} failed.{4}' -f $kind, $done.Count, @($rows | Where-Object { $_.Status -eq 'Skipped' }).Count, @($rows | Where-Object { $_.Status -eq 'Failed' }).Count, $(if ($p['Cancelled']) { ' Stopped before the end.' } elseif ($kind -eq 'Restore') { ' Scan again to see the restored sessions.' } else { ' Scan again to refresh the sizes.' })
     Show-StorageResults -Rows $rows -Title "$kind result"
 }

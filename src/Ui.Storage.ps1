@@ -137,7 +137,7 @@ function Get-StorageArchivedRows {
             ZipBytes = [long]$r.zipBytes; SavedText = (Format-StorageSize ([Math]::Max(0, [long]$r.bytes - [long]$r.zipBytes))); ArchivedAt = [string]$r.archivedAt
             ArchivedText = $(try { ([datetime]::Parse([string]$r.archivedAt, [Globalization.CultureInfo]::InvariantCulture, 'AdjustToUniversal,AssumeUniversal')).ToLocalTime().ToString('yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture) } catch { '' })
             Source = $source; SourceText = $sourceText; MachineId = [string]$r.machineId; Restored = ($InventoryKeys -contains [string]$r.key)
-            StatusText = $(if ($InventoryKeys -contains [string]$r.key) { 'Restored' } else { 'Archived' }); Row = $r }) }
+            StatusText = $(if ($InventoryKeys -contains [string]$r.key) { 'Live' } else { 'Archived' }); Row = $r }) }
     foreach ($r in @($Local)) { if ($r) { & $add $r 'local' 'Local folder' $r.title } }
     foreach ($r in @($Drive)) {
         if (-not $r) { continue }

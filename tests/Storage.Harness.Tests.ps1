@@ -11,6 +11,7 @@ $root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $root 'src\Harness.Sync.Store.ps1')
 . (Join-Path $root 'src\Storage.Scan.ps1')
 . (Join-Path $root 'src\Storage.Inventory.ps1')
+. (Join-Path $root 'src\Storage.Inventory.Antigravity.ps1')
 . (Join-Path $root 'src\Storage.DriveArchive.ps1')
 . (Join-Path $root 'src\Storage.Guard.ps1')
 . (Join-Path $root 'src\Storage.Archive.ps1')
