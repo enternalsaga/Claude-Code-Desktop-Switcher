@@ -43,15 +43,17 @@ Script: `tools\spikes\Spike-S15-CodexTrimmedRollout.ps1 -SourceRollout <rollout 
 - Hai điều kiện suýt làm spike hỏng, spec/C1 cần biết: (1) resume bị từ chối `modelProviderNotConfigured` nếu `model_provider`/`model_provider_id` trong rollout trỏ tới provider không có trong `config.toml` đang chạy; (2) resume bị từ chối cho rollout của sub-agent ("resume the parent first"). Với rollout đã cắt, giữ nguyên hai trường này là đúng, không đụng tới.
 - **Hệ quả:** spec §5.3 cho Codex đứng vững: một rollout đã cắt vẫn là rollout hợp lệ. Chỉ cần chỉnh một dòng: dòng cắt phải được JSON-serialize lại (đã làm trong prototype) nên **thứ tự khóa và khoảng trắng của riêng dòng bị cắt có thể đổi** so với bản gốc; các dòng khác giữ nguyên byte.
 
-## S19: gọi tóm tắt headless qua `claude -p` / `codex exec` — **BỊ CHẶN bởi môi trường, chưa có số**
+## S19: gọi tóm tắt headless qua `claude -p` / `codex exec` — **Claude ĐẠT; Codex BỊ CHẶN bởi môi trường**
+
+**Kết quả Claude (sau khi người dùng đăng nhập lại CLI):** một lần gọi thật với lệnh dưới đây, transcript giả ~20 000 ký tự (~5 000 token), model mặc định: **22 giây, exit 0, 811 ký tự output**, bản tóm tắt **có nhắc** yêu cầu cuối ("rename to Download"). Không có stderr. Một lần gọi trước đó lúc phiên đăng nhập hết hạn thất bại sau 5 giây với "OAuth session expired" (exit 1, 73 ký tự), nên UI phải coi "CLI chưa đăng nhập" là lỗi thường gặp và hiện thông báo rõ. Dùng 1 trong 2 lần gọi thật cho phép với Claude (lần lỗi đăng nhập không tới model).
 
 Script: `tools\spikes\Spike-S19-HeadlessSummarize.ps1 -Tool claude|codex [-Chars] [-TimeoutSec] [-Model] [-Run]` (không có `-Run` thì chỉ in lệnh). Transcript giả ~20 000 ký tự (~5 000 token), chạy trong thư mục tạm rỗng, prompt qua stdin, timeout tự giết cả cây process.
 
 - Lệnh Claude đã chọn: `claude -p --tools "" --output-format text --no-session-persistence --disable-slash-commands --max-turns 1` (prompt từ stdin; **không** dùng `--bare` vì nó tắt OAuth/keychain, hỏng với đăng nhập gói thuê bao).
 - Lệnh Codex đã chọn: `codex exec --skip-git-repo-check --ephemeral -s read-only --color never -C <thư mục rỗng> -o <file> -` (prompt từ stdin).
-- **Claude:** phiên đăng nhập OAuth của CLI đã hết hạn trên máy này; cần người dùng chạy `claude` để đăng nhập lại. Chưa gọi model.
+- **Claude:** lần đầu phiên OAuth hết hạn nên chưa gọi được; sau khi người dùng đăng nhập lại đã đo được (xem đầu mục).
 - **Codex:** `codex exec` chạy 601 giây không ra kết quả (exit: bị giết do timeout, 0 ký tự output): stderr dừng ở banner rồi kẹt vòng thử lại "waiting for network"; cổng model cục bộ mà cấu hình Codex đang dùng không tới được lúc này (cùng nguyên nhân với `failed to connect to Responses WebSocket` ở S15). 1 lần gọi thật đã tiêu, không có token đầu ra.
-- **Chưa biết:** thời gian thật, kích thước output, và tóm tắt có nhắc yêu cầu cuối của người dùng hay không. **Chưa nên chốt tính năng tóm tắt headless** trong spec; nếu cần số, người dùng đăng nhập `claude` rồi chạy lại `-Tool claude -Run` (tối đa 2 lần gọi thật mỗi CLI theo plan).
+- **Chưa biết:** số đo cho Codex. Tính năng tóm tắt headless đã khả thi với Claude (22 s cho ~5 000 token); với Codex chờ cổng model chạy lại rồi chạy `-Tool codex -Run`.
 - Quan sát có ích dù bị chặn: tóm tắt headless phụ thuộc đăng nhập/mạng của chính CLI, nên UI phải xử lý "CLI chưa đăng nhập / không có mạng" như lỗi bình thường (hết giờ, thông báo rõ, không treo), và phải có timeout cứng + giết cả cây process (script đã dùng `taskkill /T /F`).
 
 
