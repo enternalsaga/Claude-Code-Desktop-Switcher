@@ -94,7 +94,7 @@ Mọi thao tác ghi (archive, trim, summarize với archive trước, delete, re
 | Có file của phiên đang bị khóa: mở thử với `FileShare.None` thất bại | `live` | Chặn mọi thao tác |
 | `LastActivity` hoặc mtime của bất kỳ mảnh nào mới hơn 30 phút (đổi được, Q2) | `recent` | Chặn, có nút "Include anyway" cho từng phiên. Không bao giờ áp hàng loạt |
 | Claude: profile có tham chiếu đang chạy (`Get-RunningProfileMap`) và thao tác cần sửa `local_*.json` của profile đó | `protected` | Chặn, nhắc đóng profile |
-| Codex: app của `CODEX_HOME` đó đang chạy (`Get-CodexRunningMap`), và thao tác cần ghi `state_5.sqlite` mà không qua app-server | `protected` | Chặn, hoặc đi qua app-server nếu spike S16 cho phép |
+| Codex: app của `CODEX_HOME` đó đang chạy (`Get-CodexRunningMap`), và thao tác cần ghi `state_5.sqlite` mà không qua app-server | `protected` | Theo S16, mọi thao tác đều đi qua app-server (`thread/delete`, `thread/archive`, `thread/read`) nên không còn bước nào ghi thẳng DB. Điều kiện này chỉ áp cho đường dự phòng `Register-CodexThread` |
 | Antigravity: app của thư mục dữ liệu đó đang chạy (`Find-AgyMainProcessId`) | `protected` | Chặn |
 | Phiên Claude có `claude.exe` CLI đang chạy với cwd trùng cwd của phiên (đọc command line và cwd của process nếu được) | `live` | Chặn |
 
@@ -116,7 +116,7 @@ Mọi thao tác ghi (archive, trim, summarize với archive trước, delete, re
 4. Chuyển zip vào kho lưu trữ (§6) bằng tmp + rename, kiểm lại sha của cả file.
 5. Gỡ bản gốc khỏi app:
    - **Claude:** xóa jsonl, `<cli>\` và các `local_*.json` ở mọi profile tham chiếu. Profile tham chiếu đang chạy thì chặn từ bước 1.
-   - **Codex:** theo kết quả S16. Phương án A: gọi `thread/archive` qua app-server để Codex tự chuyển rollout sang `archived_sessions` và đặt `archived=1`, sau đó xóa file đó. Phương án B: app đã đóng thì xóa rollout và đặt `archived=1` cho dòng `threads` bằng SQLite ghi trực tiếp, kèm backup DB trước.
+   - **Codex (chốt theo S16, 2026-11-15):** zip lấy rollout từ `rollout_path` hiện tại của dòng `threads`. Chỉ sau khi bước 3 và 4 đạt mới gọi `thread/delete` qua app-server. Lệnh này xóa hẳn cả dòng `threads` lẫn file, và đúng là cái ta cần, vì zip đã kiểm sha là bản sao lưu. Không dùng `thread/archive` để giải phóng dung lượng: lệnh đó chỉ chuyển file sang `archived_sessions\`, file vẫn nằm trên đĩa. Không ghi thẳng vào `state_5.sqlite`.
    - **Antigravity:** app đóng. Xóa `.db`, `-wal`, `-shm`, `brain\<id>`. Dòng trong `conversation_summaries.db` xử lý theo S17.
 6. Bản gốc bị xóa hẳn hay qua Recycle Bin: theo Q1, mặc định xóa hẳn sau khi bước 3 và 4 đạt. Có hộp xác nhận.
 7. Ghi một dòng vào `archive-index.jsonl` của kho: `{ key, harness, title, bytes, zipBytes, archivedAt, machineId, entry }`.
@@ -129,7 +129,7 @@ Mọi thao tác ghi (archive, trim, summarize với archive trước, delete, re
    - File đã tồn tại và khác sha thì đổi tên file đang có thành `.bak-<ts>` trước.
    - Profile Claude không còn thì ghi vào Default và cảnh báo (Q6).
 4. Đăng ký lại:
-   - **Codex:** `thread/unarchive` (S16), hoặc chép rollout vào `sessions\` rồi `Register-CodexThread` như GĐ2.
+   - **Codex (chốt theo S16):** chép rollout về đúng `sessions\yyyy\mm\dd\<tên gốc>`, rồi gọi `thread/read` qua app-server. Codex tự đăng ký lại phiên, mọi cột giống bản gốc trừ `recency_at_ms`. Nếu `thread/read` không đăng ký lại được thì dùng `Register-CodexThread` như GĐ2.
    - **Antigravity:** theo S17.
    - **Claude:** chỉ cần ghi file. Desktop đọc `local_*.json` khi khởi động.
 5. Xóa dòng khỏi `archive-index.jsonl` và giữ zip lại. Chỉ xóa zip khi user chọn "Delete archive".
@@ -161,11 +161,15 @@ Mọi thao tác ghi (archive, trim, summarize với archive trước, delete, re
 ### 5.5 Delete (xóa vào Recycle Bin)
 
 - Dùng `Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile` / `DeleteDirectory` với `RecycleOption.SendToRecycleBin` và `UIOption.OnlyErrorDialogs`.
-- **Chặn trước** những trường hợp Windows sẽ xóa hẳn mà không vào thùng rác. Spike S18 xác nhận hành vi thật:
-  - ổ không có Recycle Bin (ổ mạng, ổ DriveFS);
-  - file lớn hơn dung lượng tối đa của thùng rác trên ổ đó (đọc qua `SHQueryRecycleBin` hoặc registry `BitBucket`).
-  - Gặp một trong hai trường hợp trên thì báo "cannot go to the Recycle Bin, archive it instead", và không xóa.
-- Phần dữ liệu trong DB (dòng `threads` của Codex, dòng summary của Antigravity) xử lý giống bước gỡ bản gốc ở §5.1, nhưng không archive.
+- **Chặn trước** mọi trường hợp Windows sẽ xóa hẳn mà không vào thùng rác. Theo S18 (2026-11-15), file lớn hơn hạn mức thùng rác bị xóa hẳn **im lặng**: không có ngoại lệ, không có hộp thoại. Chỉ cho xóa khi **mọi** mảnh của phiên thỏa cả bốn điều kiện:
+  1. Ổ đĩa kiểu `Fixed` (ổ mạng thì luôn chặn).
+  2. Ổ không phải ổ Drive for desktop. Ổ này có `$Recycle.Bin` riêng nhưng không có khóa hạn mức, và từng có mục bị tự mất, nên luôn chặn.
+  3. Có khóa `HKCU\...\BitBucket\Volume\<id>` với `NukeOnDelete = 0` và `MaxCapacity` (MB). Không đọc được khóa thì chặn.
+  4. Tổng dung lượng phiên trên ổ đó nhỏ hơn `MaxCapacity`.
+  
+  Không thỏa thì báo "cannot go to the Recycle Bin, archive it instead", và không xóa gì.
+- **Codex:** không dùng `thread/delete`, vì lệnh này xóa hẳn. Thay vào đó gọi `thread/archive` để app tự chuyển rollout sang `archived_sessions\` và đặt `archived=1`, rồi đưa file ở đó vào Recycle Bin. Dòng `archived=1` còn lại thành mồ côi. S16 đã thử: vô hại, app-server không lỗi, và phiên không hiện trong danh sách vì danh sách lọc `archived = 0`. Cách này không cần ghi DB, kể cả khi app đang mở.
+- **Antigravity:** dòng summary xử lý giống bước gỡ bản gốc ở §5.1 (theo S17), nhưng không archive.
 - **Hộp xác nhận** ghi số phiên, tổng dung lượng, danh sách profile bị ảnh hưởng, và câu "Recoverable from the Recycle Bin until it is emptied".
 
 ## 6. Kho lưu trữ
