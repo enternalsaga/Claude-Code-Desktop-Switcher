@@ -143,6 +143,7 @@ Mọi thao tác ghi (archive, trim, summarize với archive trước, delete, re
 - **Luôn archive trước** (§5.1, bước 1 đến 4, nhưng không gỡ bản gốc). Sau đó thay bản gốc bằng bản đã cắt.
 - **Claude jsonl:** với mỗi `tool_result` có nội dung text lớn hơn 16 KB (Q3), giữ 2 KB đầu và 1 KB cuối, ở giữa chèn `[... N KB trimmed; full output in archive <key> ...]`. Mọi trường khác (`uuid`, `parentUuid`, `sessionId`, `cwd`, `timestamp`) giữ nguyên byte. Ảnh base64 trong `tool_result` được thay bằng `[image trimmed]`. Các file trong `<cli>\tool-results\` lớn hơn ngưỡng được rút gọn theo cùng quy tắc.
 - **Codex rollout (`.jsonl`):** dòng `response_item` loại `function_call_output` hoặc `custom_tool_call_output` có `output` lớn hơn ngưỡng thì cắt như trên. `.zst` thì không cắt được (`Trimmable=$false`).
+  - **S14 đạt (2026-11-15, user xem trực tiếp):** jsonl Claude đã cắt vẫn hiện, mở được và nhận tin mới, nên Claude được **cắt tại chỗ**. Bản thử của S14 cắt cả `toolUseResult` (stdout và bản sao của khối text); cắt ít hơn mức đó cũng an toàn. Cắt thêm `toolUseResult` để giải phóng nhiều hơn là việc tiếp theo.
   - **S15 đạt (2026-11-15):** rollout đã cắt vẫn `thread/read` và `thread/resume` y như bản gốc, nên Codex được **cắt tại chỗ**. Chỉ dòng bị cắt được phép đổi thứ tự khóa hoặc khoảng trắng; mọi dòng khác phải giữ nguyên từng byte.
   - Không cắt rollout của sub-agent (`Flags.Subagent`), vì resume loại này bị từ chối ngay từ bản gốc.
 - **Antigravity:** không hỗ trợ.
