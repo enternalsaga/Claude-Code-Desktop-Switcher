@@ -110,7 +110,7 @@ function Get-StorageActionBlock {
         if (-not (Get-Command Invoke-StorageTrim -CommandType Function -ErrorAction SilentlyContinue)) { return 'Trim is not available yet.' }
         if ($Session.Harness -eq 'antigravity' -or -not $Session.Flags.Trimmable -or $Session.Flags.HasZst) { return 'This session cannot be trimmed.' }
     }
-    if ($Action -eq 'Summarize' -and -not (Get-Command Invoke-StorageSummarize -CommandType Function -ErrorAction SilentlyContinue)) { return 'Summarize is not available yet.' }
+    if ($Action -eq 'Summarize' -and -not ((Get-Command Invoke-StorageSummarize -CommandType Function -ErrorAction SilentlyContinue) -and (Get-Command Test-StorageSummarizeReady -CommandType Function -ErrorAction SilentlyContinue) -and (Test-StorageSummarizeReady))) { return 'Summarize is not available yet.' }
     return ''
 }
 
@@ -164,6 +164,7 @@ function Get-StorageRunningIds {
     try {
         $ids.antigravity = @(Find-AntigravityInstall | Where-Object { Find-AgyMainProcessId -Exe $_.Exe } | ForEach-Object { [string]$_.Id })
     } catch { Write-HarnessLog "Storage: could not tell whether Antigravity runs: $($_.Exception.Message)" }
+    try { $ids.codex = @(Get-CodexProfiles | Where-Object { $_.Pid } | ForEach-Object { [string]$_.Id }) } catch { Write-HarnessLog "Storage: could not tell whether Codex runs: $($_.Exception.Message)" }
     return $ids
 }
 
@@ -263,8 +264,8 @@ function Get-StorageJobScript {
         'Archive' { '@(Invoke-StorageArchive -Sessions $A.Sessions -Target $A.Target -Roots $A.Roots -MachineId $A.MachineId -Running $A.Running -IncludeRecent $A.IncludeRecent -Progress $Progress -CancelToken $Cancel @rpcArg)' }
         'Delete' { '@(Invoke-StorageDeleteBatch -Sessions $A.Sessions -Roots $A.Roots -Running $A.Running -IncludeRecent $A.IncludeRecent -Progress $Progress -CancelToken $Cancel @rpcArg)' }
         'Restore' { '@(Invoke-StorageRestore -Entries $A.Entries -Target $A.Target -Roots $A.Roots -Running $A.Running -CancelToken $Cancel @rpcArg)' }
-        'Trim' { '@(Invoke-StorageTrim -Sessions $A.Sessions -Target $A.Target -Mode $A.Mode)' }
-        'Summarize' { '@(Invoke-StorageSummarize -Sessions $A.Sessions -Target $A.Target -Confirmed:$true)' }
+        'Trim' { '@(Invoke-StorageTrim -Sessions $A.Sessions -Target $A.Target -Mode $A.Mode -MachineId $A.MachineId -Running $A.Running -IncludeRecent $A.IncludeRecent -Progress $Progress -CancelToken $Cancel)' }
+        'Summarize' { '@(Invoke-StorageSummarize -Sessions $A.Sessions -Target $A.Target -Confirmed:$true -MachineId $A.MachineId -Running $A.Running -IncludeRecent $A.IncludeRecent -Progress $Progress -CancelToken $Cancel)' }
     }
     return @"
 param(`$A, `$Progress, `$Cancel)

@@ -56,11 +56,18 @@ Assert ((Get-StorageActionState -Rows @((Row 'antigravity:g1.aabbccdd'), (Row 'c
 function Invoke-StorageTrim { param($Sessions, $Target, $Mode) }
 function Invoke-StorageSummarize { param($Sessions, $Target, [switch]$Confirmed) }
 $st = Get-StorageActionState -Rows @((Row 'claude:c1'))
-Assert ($st.Trim -and $st.Summarize) 'C1 present: Trim and Summarize come on without a change to the window'
+Assert ($st.Trim -and -not $st.Summarize) 'C1 present: Trim comes on; Summarize stays off until its gate (Test-StorageSummarizeReady) exists and is open'
+$script:GateOpen = $false; function Test-StorageSummarizeReady { return $script:GateOpen }
+Assert (-not (Get-StorageActionState -Rows @((Row 'claude:c1'))).Summarize) 'a closed gate keeps Summarize off'
+$script:GateOpen = $true
+$st = Get-StorageActionState -Rows @((Row 'claude:c1'))
+Assert ($st.Trim -and $st.Summarize) 'an open gate turns Summarize on without a change to the window'
 $st = Get-StorageActionState -Rows @((Row 'antigravity:g1.aabbccdd'))
 Assert (-not $st.Trim -and $st.Summarize) 'Antigravity cannot be trimmed but can be summarized'
 Assert (-not (Get-StorageActionState -Rows @((Row 'codex:z.11223344'))).Trim) 'a .zst rollout cannot be trimmed'
-Remove-Item Function:\Invoke-StorageTrim, Function:\Invoke-StorageSummarize
+$jobTrim = Get-StorageJobScript -Action 'Trim'; $jobSum = Get-StorageJobScript -Action 'Summarize'
+Assert ($jobTrim -like '*Invoke-StorageTrim*-Running $A.Running*-Progress $Progress -CancelToken $Cancel*' -and $jobSum -like '*Invoke-StorageSummarize*-Confirmed:$true*-Running $A.Running*-CancelToken $Cancel*') 'the Trim and Summarize jobs pass the running apps, the machine, Progress and Cancel'
+Remove-Item Function:\Invoke-StorageTrim, Function:\Invoke-StorageSummarize, Function:\Test-StorageSummarizeReady
 
 $a = Get-StorageArchivedActionState -Row ([pscustomobject]@{ Restored = $false; Source = 'local'; MachineId = 'm1' }) -ThisMachine 'm1'
 Assert ($a.Restore -and $a.DeleteArchive -and -not $a.OpenSummary) 'archived view: Restore and Delete archive on a local row'
