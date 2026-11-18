@@ -145,7 +145,22 @@ try {
     Stop-StorageScan -Scan $scan
     Assert ($sw.ElapsedMilliseconds -lt 1000) "Stop-StorageScan returns within a second ($($sw.ElapsedMilliseconds) ms)"
     Assert ($scan.Progress.Finished -and $scan.Progress.Cancelled) 'a stopped scan is finished and marked cancelled'
-    Assert (-not (Test-Path -LiteralPath (Join-Path $tmp 'bg\cache-stop.json'))) 'a cancelled scan does not write a half cache'
+    Assert (Test-Path -LiteralPath (Join-Path $tmp 'bg\cache-stop.json')) 'a cancelled scan still saves the entries it read'
+    $stopN = @((Get-Content -LiteralPath (Join-Path $tmp 'bg\cache-stop.json') -Raw | ConvertFrom-Json).entries.PSObject.Properties).Count
+    Assert ($stopN -ge 1 -and $stopN -lt 8) "the saved cache holds the files read before Stop ($stopN of 8)"
+    Close-StorageScan -Scan $scan
+    $scan = Start-StorageScan -Roots $roots -CachePath (Join-Path $tmp 'bg\cache-stop.json')
+    $deadline = [DateTime]::UtcNow.AddSeconds(30); while (-not $scan.Progress.Finished -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 20 }
+    Assert ($scan.Progress.Result.Reads -eq (8 - $stopN) -and $scan.Progress.Result.Sessions.Count -eq 8) "the next scan reads only what the stopped one did not: $($scan.Progress.Result.Reads) reads"
+    Close-StorageScan -Scan $scan
+    # old entries of files the stopped scan did not reach stay: every file changed, full cache from before, Stop early
+    Copy-Item -LiteralPath $cacheFile -Destination (Join-Path $tmp 'bg\cache-stale.json')
+    foreach ($f in Get-ChildItem -LiteralPath $proj -Recurse -Filter *.jsonl) { [IO.File]::AppendAllText($f.FullName, ' ') }
+    $scan = Start-StorageScan -Roots $roots -CachePath (Join-Path $tmp 'bg\cache-stale.json') -ItemDelayMs 400
+    Start-Sleep -Milliseconds 500
+    Stop-StorageScan -Scan $scan
+    $staleN = @((Get-Content -LiteralPath (Join-Path $tmp 'bg\cache-stale.json') -Raw | ConvertFrom-Json).entries.PSObject.Properties).Count
+    Assert ($scan.Progress.Cancelled -and $staleN -eq 8) "old entries of files the stopped scan did not reach are kept ($staleN of 8)"
     Close-StorageScan -Scan $scan
 
     # R3-2: a job that hangs for 30 s and has a child process: Stop and Close return at once, the child is killed, the runspace is freed later

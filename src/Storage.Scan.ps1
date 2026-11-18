@@ -178,8 +178,9 @@ function Get-StorageScanFunctionNames {
 }
 
 # Starts the inventory in a runspace and returns at once. Progress (Phase, Done, Total, Finished, Cancelled, Error, Result)
-# is a synchronized hashtable the UI timer reads. The cache is loaded and saved inside the runspace; a cancelled scan does
-# not save it. An error in the runspace ends up in Progress.Error and is never thrown at the caller.
+# is a synchronized hashtable the UI timer reads. The cache is loaded and saved inside the runspace; a cancelled scan saves it
+# too: what it read is kept and the entries it did not reach stay (Remove-StorageCacheUnseen does not run on a cancel). An error does not
+# save it. An error in the runspace ends up in Progress.Error and is never thrown at the caller.
 # -ItemDelayMs is only raised by tests, to make a small fixture last long enough to watch.
 function Start-StorageScan {
     param([Parameter(Mandatory)][hashtable]$Roots, [string]$CachePath, [int]$ItemDelayMs = 0, [int]$RecentMinutes = 30)
@@ -201,7 +202,8 @@ try {
     $cache = $(if ($CachePath) { Read-StorageCache -Path $CachePath } else { New-StorageCache })
     $inv = Get-StorageInventory -Roots $Roots -Cache $cache -Progress $Progress -CancelToken $Cancel -ItemDelayMs $Delay -RecentMinutes $Recent
     $Progress.Result = $inv
-    if ($inv.Cancelled) { $Progress.Cancelled = $true } elseif ($CachePath) { Write-StorageCache -Cache $cache -Path $CachePath }
+    if ($inv.Cancelled) { $Progress.Cancelled = $true }
+    if ($CachePath) { Write-StorageCache -Cache $cache -Path $CachePath }
 } catch { $Progress.Error = $_.Exception.Message } finally { $Progress.Finished = $true }
 '@
     [void]$ps.AddScript($body).AddArgument($Roots).AddArgument($progress).AddArgument($cancel).AddArgument($CachePath).AddArgument($ItemDelayMs).AddArgument($RecentMinutes)
