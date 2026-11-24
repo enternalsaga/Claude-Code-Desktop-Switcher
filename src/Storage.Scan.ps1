@@ -265,15 +265,41 @@ function Test-StorageCloudPlaceholder {
     return (([int]$Attributes -band (0x1000 -bor 0x40000 -bor 0x400000)) -ne 0)
 }
 
-# Reads meta for cache-missed Claude transcripts in a bounded RunspacePool. Workers only parse and enqueue results;
-# only the caller's scan thread writes into $Cache and increments Progress.Done.
+# Collects uncached, non-placeholder, distinct file entries for parallel metadata pre-read.
+function Get-StorageCacheMisses {
+    param([array]$Files = @(), [Parameter(Mandatory)]$Cache)
+    $misses = New-Object Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($f in $Files) {
+        if (-not $f -or (Test-StorageCloudPlaceholder $f.Attributes) -or $seen.ContainsKey($f.FullName)) { continue }
+        $e = $Cache.Entries[$f.FullName]
+        if ($e -and [long]$e['size'] -eq $f.Length -and [long]$e['mtimeTicks'] -eq $f.LastWriteTimeUtc.Ticks) { continue }
+        $seen[$f.FullName] = $true
+        $misses.Add(@{ Key = $f.FullName; Size = [long]$f.Length; Ticks = $f.LastWriteTimeUtc.Ticks })
+    }
+    return $misses.ToArray()
+}
+
+# Reads meta for cache-missed Claude files in a bounded RunspacePool using $ReaderName. Workers only parse and
+# enqueue results; only the caller's scan thread writes into $Cache and increments Progress.Done.
 function Read-StorageClaudeMetaParallel {
-    param([Parameter(Mandatory)][array]$Misses, [Parameter(Mandatory)]$Cache, $Cancel, $Progress, [hashtable]$Counted, [int]$MaxThreads = 0)
+    param(
+        [Parameter(Mandatory)][array]$Misses,
+        [Parameter(Mandatory)]$Cache,
+        $Cancel,
+        $Progress,
+        [hashtable]$Counted,
+        [int]$MaxThreads = 0,
+        [string]$ReaderName = 'Read-StorageClaudeJsonlMeta',
+        [string[]]$HelperNames = @('Read-StorageBytes', 'Split-StorageLines', 'Read-JsonlHeadTail', 'Test-StorageCloudPlaceholder', 'ConvertTo-StorageMs', 'Get-StorageFirstString', 'Get-StorageTitleLine', 'Get-StorageClaudeWindowMeta')
+    )
     $cap = $(if ($MaxThreads -gt 0) { $MaxThreads } else { [Math]::Min(8, [Environment]::ProcessorCount) })
     $threads = [Math]::Min($Misses.Count, $cap)
     if ($threads -le 1 -or (Test-StorageCancel $Cancel)) { return }
     $iss = [Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-    foreach ($n in 'Read-StorageBytes', 'Split-StorageLines', 'Read-JsonlHeadTail', 'Test-StorageCloudPlaceholder', 'ConvertTo-StorageMs', 'Get-StorageFirstString', 'Get-StorageTitleLine', 'Get-StorageClaudeWindowMeta', 'Read-StorageClaudeJsonlMeta') {
+    $shipped = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($n in (@($HelperNames) + @($ReaderName))) {
+        if (-not $n -or -not $shipped.Add($n)) { continue }
         $c = Get-Command -Name $n -CommandType Function -ErrorAction Stop
         $iss.Commands.Add((New-Object Management.Automation.Runspaces.SessionStateFunctionEntry($n, $c.Definition)))
     }
@@ -284,11 +310,11 @@ function Read-StorageClaudeMetaParallel {
     $ready = New-Object Threading.AutoResetEvent($false)
     foreach ($m in $Misses) { $work.Enqueue($m) }
     $workerScript = @'
-param($Work, $Results, $Ready, $Cancel)
+param($Work, $Results, $Ready, $Cancel, $ReaderName)
 $item = $null
 while (-not ($Cancel -and $Cancel['Cancel']) -and $Work.TryDequeue([ref]$item)) {
     $meta = $null; $ok = $false
-    try { $meta = Read-StorageClaudeJsonlMeta -Path $item.Key; $ok = ($meta -is [Collections.IDictionary]) } catch { $ok = $false }
+    try { $meta = & $ReaderName -Path $item.Key; $ok = ($meta -is [Collections.IDictionary]) } catch { $ok = $false }
     $Results.Enqueue(@{ Item = $item; Meta = $meta; Ok = $ok })
     try { [void]$Ready.Set() } catch { }
 }
@@ -310,7 +336,7 @@ try { [void]$Ready.Set() } catch { }
     $workers = New-Object Collections.Generic.List[object]
     for ($i = 0; $i -lt $threads; $i++) {
         $ps = [powershell]::Create(); $ps.RunspacePool = $pool
-        [void]$ps.AddScript($workerScript).AddArgument($work).AddArgument($results).AddArgument($ready).AddArgument($Cancel)
+        [void]$ps.AddScript($workerScript).AddArgument($work).AddArgument($results).AddArgument($ready).AddArgument($Cancel).AddArgument($ReaderName)
         $workers.Add(@{ PowerShell = $ps; Handle = $ps.BeginInvoke() })
     }
     try {
@@ -355,7 +381,7 @@ function Get-StorageScanFunctionNames {
     return @(
         'Read-StorageBytes', 'Split-StorageLines', 'Read-JsonlHeadTail', 'New-StorageCache', 'Read-StorageCache', 'Write-StorageCache',
         'Get-StorageCachedMeta', 'Remove-StorageCacheUnseen', 'Test-StorageCancel', 'Get-StorageEntries', 'Measure-StorageDirPs', 'Initialize-StorageDirMeasure', 'Measure-StorageDir',
-        'Get-StorageFilesRecursive', 'Test-StorageCloudPlaceholder', 'Read-StorageClaudeMetaParallel',
+        'Get-StorageFilesRecursive', 'Test-StorageCloudPlaceholder', 'Get-StorageCacheMisses', 'Read-StorageClaudeMetaParallel',
         'ConvertTo-StorageMs', 'Set-StorageProgress', 'Set-StorageActivityFromParts', 'Add-StoragePart', 'Get-StorageFirstString', 'Read-StorageLocalMeta',
         'Get-StorageTitleLine', 'Read-StorageClaudeJsonlMeta', 'Get-ClaudeProfileRefs', 'Get-ClaudeTranscripts',
         'New-StorageSessionBuilder', 'ConvertTo-StorageSession', 'Get-ClaudeStorageSessions',

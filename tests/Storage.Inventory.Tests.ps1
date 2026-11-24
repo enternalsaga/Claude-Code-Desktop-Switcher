@@ -379,6 +379,186 @@ try {
     }
     Assert (-not $errCache.Entries.ContainsKey($phPath)) 'failed transcript read is not cached'
 
+    # ---------------------------------------------------------------- fast Read-StorageLocalMeta & parallel Get-ClaudeProfileRefs
+    function Read-TestOldLocalMeta {
+        param([Parameter(Mandatory)][string]$Path)
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        try { $text = (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd() } finally { $fs.Dispose() }
+        $o = $text | ConvertFrom-Json
+        if ($o -isnot [pscustomobject]) { throw 'the file is not a JSON object' }
+        $firstStr = {
+            param($obj, [string[]]$names)
+            foreach ($n in $names) {
+                $p = $obj.PSObject.Properties[$n]
+                if ($p -and $p.Value -is [string] -and $p.Value.Trim()) { return $p.Value.Trim() }
+            }
+            return $null
+        }
+        $act = $null; $created = $null
+        if ($o -and $o.PSObject.Properties['lastActivityAt'] -and $o.lastActivityAt -is [ValueType]) { $act = [long]$o.lastActivityAt }
+        if ($o -and $o.PSObject.Properties['createdAt'] -and $o.createdAt -is [ValueType]) { $created = [long]$o.createdAt }
+        return @{ cli = (& $firstStr $o @('cliSessionId')); title = (& $firstStr $o @('title', 'name', 'summary', 'customTitle', 'displayName'))
+            cwd = (& $firstStr $o @('cwd', 'originCwd', 'workingDirectory')); activity = $act; created = $created }
+    }
+    function Assert-SameLocalMeta($actual, $expected, $label) {
+        Assert ($null -ne $actual -and $null -ne $expected) "${label}: null meta"
+        foreach ($k in 'cli', 'title', 'cwd') {
+            $av = $actual[$k]; $ev = $expected[$k]
+            Assert (($null -eq $av) -eq ($null -eq $ev)) "${label}: $k nullness mismatch ($av vs $ev)"
+            if ($null -ne $ev) { Assert ($av -is [string] -and $av -ceq $ev) "${label}: $k value mismatch ('$av' vs '$ev')" }
+        }
+        foreach ($k in 'activity', 'created') {
+            $av = $actual[$k]; $ev = $expected[$k]
+            Assert (($null -eq $av) -eq ($null -eq $ev)) "${label}: $k nullness mismatch ($av vs $ev)"
+            if ($null -ne $ev) { Assert ($av -is [long] -and [long]$av -eq [long]$ev) "${label}: $k numeric mismatch ($av vs $ev)" }
+        }
+    }
+
+    Assert ((Get-StorageFirstString ([pscustomobject]@{ title = '  '; name = 'PSName' }) @('title', 'name')) -eq 'PSName') 'Get-StorageFirstString works on PSCustomObject'
+    Assert ((Get-StorageFirstString @{ title = '  '; name = 'HashName' } @('title', 'name')) -eq 'HashName') 'Get-StorageFirstString works on Hashtable'
+    $dictSample = New-Object 'Collections.Generic.Dictionary[string,object]'
+    $dictSample['title'] = 123
+    $dictSample['summary'] = '  DictSum  '
+    Assert ((Get-StorageFirstString $dictSample @('title', 'summary')) -eq 'DictSum') 'Get-StorageFirstString works on Dictionary[string,object]'
+
+    $metaDir = Join-Path $rt 'local-meta-fixtures'
+    $uniTitle = ([char]0x0110) + ([char]0x1EC1) + ' ' + ([char]0x65E5) + ([char]0x672C) + ([char]0x8A9E)
+    $uniCwd = 'C:\work\' + ([char]0x00E9) + ([char]0x00FC)
+    $metaCases = @(
+        @{ name = 'all-title-keys'; json = '{"cliSessionId":"  c1  ","title":" T1 ","name":"N1","summary":"S1","customTitle":"CT1","displayName":"DN1","cwd":" C:\\a ","originCwd":"C:\\b","workingDirectory":"C:\\c","lastActivityAt":1762800000000,"createdAt":1762700000000}' },
+        @{ name = 'key-name'; json = '{"name":"N2","summary":"S2","customTitle":"CT2","displayName":"DN2","originCwd":"C:\\orig","workingDirectory":"C:\\wd"}' },
+        @{ name = 'key-summary'; json = '{"summary":"S3","customTitle":"CT3","displayName":"DN3","workingDirectory":"C:\\wd3"}' },
+        @{ name = 'key-customTitle'; json = '{"customTitle":"CT4","displayName":"DN4"}' },
+        @{ name = 'key-displayName'; json = '{"displayName":"  DN5  "}' },
+        @{ name = 'blank-whitespace-title'; json = '{"cliSessionId":"   ","title":"","name":" \t\n ","summary":"AfterBlank","cwd":"\t  "}' },
+        @{ name = 'all-blank'; json = '{"title":"   ","name":"","summary":null,"cwd":""}' },
+        @{ name = 'nonstring-number-title'; json = '{"title":123,"name":"FromNumFallback"}' },
+        @{ name = 'nonstring-bool-title'; json = '{"title":true,"name":"FromBoolFallback"}' },
+        @{ name = 'nonstring-obj-title'; json = '{"title":{"nested":"x"},"name":["arr"],"summary":"FromObjArrFallback"}' },
+        @{ name = 'activity-string'; json = '{"title":"StrAct","lastActivityAt":"1762800000000","createdAt":"1762700000000"}' },
+        @{ name = 'activity-numeric-variants'; json = '{"title":"NumAct","lastActivityAt":42,"createdAt":123.0}' },
+        @{ name = 'nested-no-leak'; json = '{"outer":{"cliSessionId":"leak","title":"LeakTitle","cwd":"C:\\leak","lastActivityAt":999,"createdAt":888},"arr":[{"title":"ArrLeak"}]}' },
+        @{ name = 'unicode-raw-and-escaped'; json = ('{"title":"  ' + $uniTitle + '  ","cwd":"' + $uniCwd.Replace('\', '\\') + '","originCwd":"\\u0041\\u0042"}') },
+        @{ name = 'unicode-escape'; json = '{"title":"Caf\u00e9 \u65e5\u672c","cwd":"C:\\\\work\\\\\u0111\u1ed3"}' }
+    )
+    foreach ($mc in $metaCases) {
+        $mp = Join-Path $metaDir ($mc.name + '.json')
+        Write-Text $mp $mc.json
+        $actual = Read-StorageLocalMeta -Path $mp
+        $expected = Read-TestOldLocalMeta -Path $mp
+        Assert-SameLocalMeta $actual $expected $mc.name
+    }
+    $boolNumPath = Join-Path $metaDir 'activity-bool.json'
+    Write-Text $boolNumPath '{"title":"BoolAct","lastActivityAt":true,"createdAt":false}'
+    $boolMeta = Read-StorageLocalMeta -Path $boolNumPath
+    Assert ($boolMeta.title -eq 'BoolAct' -and $null -eq $boolMeta.activity -and $null -eq $boolMeta.created) 'boolean lastActivityAt/createdAt gives $null'
+
+    foreach ($badCase in @(
+        @{ name = 'bad-json.json'; body = '{ not json' },
+        @{ name = 'bad-empty.json'; body = '' },
+        @{ name = 'bad-ws.json'; body = "  `r`n " },
+        @{ name = 'bad-array.json'; body = '[{"title":"x"}]' }
+    )) {
+        $bp = Join-Path $metaDir $badCase.name
+        Write-Text $bp $badCase.body
+        Assert-Throws { [void](Read-StorageLocalMeta -Path $bp) } "Read-StorageLocalMeta throws on $($badCase.name)"
+    }
+
+    # Parallel pre-read in Get-ClaudeProfileRefs: cache parity, unreadable warning, -ItemDelayMs, placeholder skip, cancel, progress
+    $prRoot = Join-Path $rt 'par-refs'
+    $prP1 = Join-Path $prRoot 'p1'; $prP2 = Join-Path $prRoot 'p2'
+    $prProj = Join-Path $prRoot 'projects'
+    $prFiles = New-Object Collections.Generic.List[string]
+    for ($i = 1; $i -le 8; $i++) {
+        $cid = 'cccc0000-0000-4000-8000-0000000000{0:00}' -f $i
+        $profDir = $(if ($i -le 4) { $prP1 } else { $prP2 })
+        $sub = $(if ($i -le 4) { 'acct1\org1' } else { 'acct2\org2' })
+        $lp = Join-Path $profDir "claude-code-sessions\$sub\local_r$i.json"
+        Write-Text $lp (& $localJson $cid "Ref Title $i" (1762800000000 + $i * 1000))
+        $prFiles.Add($lp)
+        Write-Text (Join-Path $prProj "slug\$cid.jsonl") ((& $line $cid '2026-11-10T08:00:00.000Z') + "`n")
+    }
+    $prBad = Join-Path $prP2 'claude-code-sessions\acct2\org2\local_bad.json'
+    Write-Text $prBad '{ bad json'
+    $prProfiles = @(
+        @{ Id = 'PR1'; Name = 'PR1'; SessionRoot = (Join-Path $prP1 'claude-code-sessions'); DataDir = $prP1; IsDefault = $true },
+        @{ Id = 'PR2'; Name = 'PR2'; SessionRoot = (Join-Path $prP2 'claude-code-sessions'); DataDir = $prP2; IsDefault = $false }
+    )
+    $serCache = New-StorageCache; $serWarn = New-Object Collections.Generic.List[string]
+    $serRefs = @(Get-ClaudeProfileRefs -Profiles $prProfiles -Cache $serCache -Warnings $serWarn -ItemDelayMs 1)
+    $parCache = New-StorageCache; $parWarn = New-Object Collections.Generic.List[string]
+    $parRefs = @(Get-ClaudeProfileRefs -Profiles $prProfiles -Cache $parCache -Warnings $parWarn)
+    Assert ($parRefs.Count -eq 9 -and $serRefs.Count -eq 9) "both serial and parallel return 9 refs, got par=$($parRefs.Count) ser=$($serRefs.Count)"
+    Assert ($parCache.Reads -eq $serCache.Reads -and $parCache.Reads -eq 9) "parallel and serial read counts match ($($parCache.Reads) vs $($serCache.Reads))"
+    Assert (-not $parCache.Entries.ContainsKey($prBad) -and -not $serCache.Entries.ContainsKey($prBad)) 'unreadable local_bad.json is not cached'
+    Assert (@($parWarn | Where-Object { $_ -like '*local_bad.json*' }).Count -eq 1) "parallel warning names local_bad.json: $($parWarn -join '|')"
+    $badRef = @($parRefs | Where-Object { $_.Path -eq $prBad })[0]
+    Assert ($badRef -and $badRef.Unreadable -eq $true) 'local_bad.json ref is marked Unreadable'
+    foreach ($fp in $prFiles) {
+        Assert ($parCache.Entries.ContainsKey($fp) -and $serCache.Entries.ContainsKey($fp)) "cache entry present for $fp"
+        Assert-SameLocalMeta $parCache.Entries[$fp]['meta'] $serCache.Entries[$fp]['meta'] "par-vs-ser $fp"
+    }
+
+    # -ItemDelayMs must not invoke Read-StorageClaudeMetaParallel
+    $origParFn = (Get-Command Read-StorageClaudeMetaParallel -CommandType Function).ScriptBlock
+    try {
+        function Read-StorageClaudeMetaParallel { throw 'parallel pool should not run when -ItemDelayMs is set' }
+        $delayRefs = @(Get-ClaudeProfileRefs -Profiles $prProfiles -Cache (New-StorageCache) -Warnings (New-Object Collections.Generic.List[string]) -ItemDelayMs 1)
+        Assert ($delayRefs.Count -eq 9) '-ItemDelayMs 1 skips parallel pre-read and still returns all refs'
+    } finally {
+        Set-Item -Path Function:\Read-StorageClaudeMetaParallel -Value $origParFn
+    }
+
+    # Cloud-placeholder local_*.json is skipped by Get-StorageCacheMisses
+    $phLocal = Join-Path $prP1 'claude-code-sessions\acct1\org1\local_placeholder.json'
+    Write-Text $phLocal (& $localJson 'cccc0000-0000-4000-8000-000000000099' 'Cloud Ref' 1762899000000)
+    [IO.File]::SetAttributes($phLocal, ([IO.File]::GetAttributes($phLocal) -bor [IO.FileAttributes]::Offline))
+    try {
+        $phLocalInfo = New-Object IO.FileInfo $phLocal
+        $missList = @(Get-StorageCacheMisses -Files @($phLocalInfo, (New-Object IO.FileInfo $prFiles[0])) -Cache (New-StorageCache))
+        Assert ($missList.Count -eq 1 -and $missList[0].Key -eq $prFiles[0]) 'Get-StorageCacheMisses skips cloud-placeholder local_*.json'
+    } finally {
+        [IO.File]::SetAttributes($phLocal, ([IO.File]::GetAttributes($phLocal) -band (-bnot [int][IO.FileAttributes]::Offline)))
+        Remove-Item -LiteralPath $phLocal -Force
+    }
+
+    # Speedup test on 4+ cores and immediate cancel before call
+    $origLocalReader = (Get-Command Read-StorageLocalMeta -CommandType Function).ScriptBlock
+    try {
+        function Read-StorageLocalMeta { param([Parameter(Mandatory)][string]$Path) Start-Sleep -Milliseconds 250; return @{ cli = $null; title = 'SlowLocal'; cwd = 'C:\p'; activity = [long]1000; created = [long]500 } }
+        $cancelEarly = @{ Cancel = $true }
+        $cSkip = New-StorageCache
+        $swCancel = [Diagnostics.Stopwatch]::StartNew()
+        $rCancelled = @(Get-ClaudeProfileRefs -Profiles $prProfiles -Cache $cSkip -Cancel $cancelEarly)
+        $swCancel.Stop()
+        Assert ($rCancelled.Count -eq 0 -and $cSkip.Reads -eq 0 -and $swCancel.ElapsedMilliseconds -lt 300) "pre-set Cancel returns at once ($($swCancel.ElapsedMilliseconds) ms, reads=$($cSkip.Reads))"
+        if ([Environment]::ProcessorCount -ge 4) {
+            # 8 valid files without bad file so parallel pool speeds up all 8 reads
+            $prValidOnly = Join-Path $rt 'par-refs-valid'
+            for ($i = 1; $i -le 8; $i++) {
+                $vp = Join-Path $prValidOnly "a\b\local_v$i.json"
+                Write-Text $vp '{"title":"v"}'
+            }
+            $swFast8 = [Diagnostics.Stopwatch]::StartNew()
+            $fast8 = @(Get-ClaudeProfileRefs -Profiles @(@{ Id = 'V'; Name = 'V'; SessionRoot = $prValidOnly; DataDir = $prValidOnly; IsDefault = $false }) -Cache (New-StorageCache))
+            $swFast8.Stop()
+            Assert ($fast8.Count -eq 8 -and $swFast8.ElapsedMilliseconds -lt 1500) "parallel pool speeds up 8 x 250 ms local_*.json reads ($($swFast8.ElapsedMilliseconds) ms)"
+        }
+    } finally {
+        Set-Item -Path Function:\Read-StorageLocalMeta -Value $origLocalReader
+    }
+
+    # Progress counts in Get-ClaudeStorageSessions: Total = refs + transcripts and Done == Total (counted once)
+    $prCleanDir = Join-Path $rt 'par-refs-prog'
+    for ($i = 1; $i -le 4; $i++) {
+        $cid = 'dddd0000-0000-4000-8000-0000000000{0:00}' -f $i
+        Write-Text (Join-Path $prCleanDir "sess\a\b\local_p$i.json") (& $localJson $cid "Prog $i" 1762800000000)
+        Write-Text (Join-Path $prCleanDir "proj\slug\$cid.jsonl") ((& $line $cid '2026-11-10T08:00:00.000Z') + "`n")
+    }
+    $prog = @{ Phase = 'starting'; Done = 0; Total = 0 }
+    $sessProg = @(Get-ClaudeStorageSessions -ProjectsDir (Join-Path $prCleanDir 'proj') -Profiles @(@{ Id = 'PG'; Name = 'PG'; SessionRoot = (Join-Path $prCleanDir 'sess'); DataDir = $prCleanDir; IsDefault = $false }) -Cache (New-StorageCache) -Progress $prog)
+    Assert ($sessProg.Count -eq 4 -and $prog.Total -eq 8 -and $prog.Done -eq 8) "progress counts each ref and transcript once: Total=$($prog.Total) Done=$($prog.Done)"
+
     # roots built from a config: only the shape is checked here, never real paths
     Assert ($null -ne (Get-Command Get-StorageRootsFromConfig -CommandType Function)) 'the real-roots builder exists'
 } finally {

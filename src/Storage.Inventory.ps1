@@ -46,6 +46,13 @@ function Set-StorageActivityFromParts {
 function Get-StorageFirstString {
     param($Object, [string[]]$Names)
     if (-not $Object) { return $null }
+    if ($Object -is [Collections.IDictionary]) {
+        foreach ($n in $Names) {
+            $v = $Object[$n]
+            if ($v -is [string] -and $v.Trim()) { return $v.Trim() }
+        }
+        return $null
+    }
     foreach ($n in $Names) {
         $p = $Object.PSObject.Properties[$n]
         if ($p -and $p.Value -is [string] -and $p.Value.Trim()) { return $p.Value.Trim() }
@@ -62,11 +69,16 @@ function Read-StorageLocalMeta {
     # and would make the session look CLI-only. The caller turns the error into a warning and does not cache it.
     $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
     try { $text = (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd() } finally { $fs.Dispose() }
-    $o = $text | ConvertFrom-Json
-    if ($o -isnot [pscustomobject]) { throw 'the file is not a JSON object' }
+    if (-not $script:StorageLocalJson) {
+        Add-Type -AssemblyName System.Web.Extensions
+        $script:StorageLocalJson = New-Object Web.Script.Serialization.JavaScriptSerializer
+        $script:StorageLocalJson.MaxJsonLength = [int]::MaxValue
+    }
+    $o = $script:StorageLocalJson.DeserializeObject($text)
+    if ($o -isnot [Collections.IDictionary]) { throw 'the file is not a JSON object' }
     $act = $null; $created = $null
-    if ($o -and $o.PSObject.Properties['lastActivityAt'] -and $o.lastActivityAt -is [ValueType]) { $act = [long]$o.lastActivityAt }
-    if ($o -and $o.PSObject.Properties['createdAt'] -and $o.createdAt -is [ValueType]) { $created = [long]$o.createdAt }
+    $v = $o['lastActivityAt']; if ($v -is [ValueType] -and $v -isnot [bool] -and $v -isnot [datetime]) { $act = [long]$v }
+    $v = $o['createdAt']; if ($v -is [ValueType] -and $v -isnot [bool] -and $v -isnot [datetime]) { $created = [long]$v }
     return @{ cli = (Get-StorageFirstString $o @('cliSessionId')); title = (Get-StorageFirstString $o @('title', 'name', 'summary', 'customTitle', 'displayName'))
         cwd = (Get-StorageFirstString $o @('cwd', 'originCwd', 'workingDirectory')); activity = $act; created = $created }
 }
@@ -135,25 +147,45 @@ function Get-StorageClaudeWindowMeta {
 
 # Every local_*.json of every profile (account and organisation folders in between), with the cached meta.
 function Get-ClaudeProfileRefs {
-    param([array]$Profiles = @(), $Cache, $Cancel, $Warnings)
+    param([array]$Profiles = @(), $Cache, $Cancel, $Warnings, [int]$ItemDelayMs = 0)
     $refs = New-Object Collections.Generic.List[object]
+    if (Test-StorageCancel $Cancel) { return $refs.ToArray() }
+    $found = New-Object Collections.Generic.List[object]
+    $files = New-Object Collections.Generic.List[object]
     foreach ($p in $Profiles) {
+        if (Test-StorageCancel $Cancel) { return $refs.ToArray() }
         $root = [string]$p.SessionRoot
         if (-not $root -or -not [IO.Directory]::Exists($root)) { continue }
         foreach ($acct in @(Get-StorageEntries -Dir $root | Where-Object { $_ -is [IO.DirectoryInfo] })) {
+            if (Test-StorageCancel $Cancel) { return $refs.ToArray() }
             foreach ($org in @(Get-StorageEntries -Dir $acct.FullName | Where-Object { $_ -is [IO.DirectoryInfo] })) {
+                if (Test-StorageCancel $Cancel) { return $refs.ToArray() }
                 foreach ($f in @(Get-StorageEntries -Dir $org.FullName | Where-Object { $_ -is [IO.FileInfo] -and $_.Name -like 'local_*.json' })) {
-                    if (Test-StorageCancel $Cancel) { return $refs.ToArray() }
-                    $unreadable = $false
-                    try { $meta = Get-StorageCachedMeta -Cache $Cache -Key $f.FullName -Size $f.Length -Ticks $f.LastWriteTimeUtc.Ticks -Reader { param($k) Read-StorageLocalMeta -Path $k } }
-                    catch {
-                        $unreadable = $true; $meta = @{ cli = $null; title = $null; cwd = $null; activity = $null; created = $null }
-                        if ($null -ne $Warnings) { $Warnings.Add("Could not read $($f.FullName): $($_.Exception.Message) The sessions of this profile are marked unreadable until the next scan can read it.") }
-                    }
-                    $refs.Add(@{ ProfileId = [string]$p.Id; ProfileName = [string]$p.Name; Path = $f.FullName; Bytes = [long]$f.Length; Ticks = $f.LastWriteTimeUtc.Ticks; Name = $f.BaseName; Meta = $meta; Unreadable = $unreadable })
+                    $found.Add(@{ Profile = $p; File = $f })
+                    $files.Add($f)
                 }
             }
         }
+    }
+    if ($found.Count -eq 0 -or (Test-StorageCancel $Cancel)) { return $refs.ToArray() }
+    $workCache = $(if ($Cache) { $Cache } else { New-StorageCache })
+    if (-not $ItemDelayMs -and $found.Count -gt 1) {
+        $misses = @(Get-StorageCacheMisses -Files $files.ToArray() -Cache $workCache)
+        if ($misses.Count -gt 1) {
+            Read-StorageClaudeMetaParallel -Misses $misses -Cache $workCache -Cancel $Cancel -MaxThreads ([Math]::Min(4, [Environment]::ProcessorCount)) -ReaderName 'Read-StorageLocalMeta' -HelperNames @('Get-StorageFirstString')
+        }
+    }
+    foreach ($item in $found) {
+        if (Test-StorageCancel $Cancel) { return $refs.ToArray() }
+        if ($ItemDelayMs) { Start-Sleep -Milliseconds $ItemDelayMs }
+        $p = $item.Profile; $f = $item.File
+        $unreadable = $false
+        try { $meta = Get-StorageCachedMeta -Cache $workCache -Key $f.FullName -Size $f.Length -Ticks $f.LastWriteTimeUtc.Ticks -Reader { param($k) Read-StorageLocalMeta -Path $k } }
+        catch {
+            $unreadable = $true; $meta = @{ cli = $null; title = $null; cwd = $null; activity = $null; created = $null }
+            if ($null -ne $Warnings) { $Warnings.Add("Could not read $($f.FullName): $($_.Exception.Message) The sessions of this profile are marked unreadable until the next scan can read it.") }
+        }
+        $refs.Add(@{ ProfileId = [string]$p.Id; ProfileName = [string]$p.Name; Path = $f.FullName; Bytes = [long]$f.Length; Ticks = $f.LastWriteTimeUtc.Ticks; Name = $f.BaseName; Meta = $meta; Unreadable = $unreadable })
     }
     return $refs.ToArray()
 }
@@ -221,26 +253,17 @@ function ConvertTo-StorageSession {
 # with no local file at all is CLI-only. Sessions come back in no particular order.
 function Get-ClaudeStorageSessions {
     param([string]$ProjectsDir, [array]$Profiles = @(), $Cache, $Cancel, $Progress, $Warnings, [int]$ItemDelayMs = 0, [datetime]$Now = [DateTime]::UtcNow, [int]$RecentMinutes = 30)
-    $refs = @(Get-ClaudeProfileRefs -Profiles $Profiles -Cache $Cache -Cancel $Cancel -Warnings $Warnings)
+    $refs = @(Get-ClaudeProfileRefs -Profiles $Profiles -Cache $Cache -Cancel $Cancel -Warnings $Warnings -ItemDelayMs $ItemDelayMs)
     $transcripts = @(Get-ClaudeTranscripts -ProjectsDir $ProjectsDir -Cancel $Cancel)
     Set-StorageProgress -Progress $Progress -Phase 'claude' -Total ($refs.Count + $transcripts.Count)
     $workCache = $(if ($Cache) { $Cache } else { New-StorageCache })
     $counted = @{}
     # -ItemDelayMs is only raised by tests to pace the loop one item at a time.
     if (-not $ItemDelayMs -and -not (Test-StorageCancel $Cancel)) {
-        $misses = New-Object Collections.Generic.List[object]
-        $seenMiss = @{}
-        foreach ($t in $transcripts) {
-            if (-not $t.File) { continue }
-            $f = $t.File
-            if ((Test-StorageCloudPlaceholder $f.Attributes) -or $seenMiss.ContainsKey($f.FullName)) { continue }
-            $e = $workCache.Entries[$f.FullName]
-            if ($e -and [long]$e['size'] -eq $f.Length -and [long]$e['mtimeTicks'] -eq $f.LastWriteTimeUtc.Ticks) { continue }
-            $seenMiss[$f.FullName] = $true
-            $misses.Add(@{ Key = $f.FullName; Size = [long]$f.Length; Ticks = $f.LastWriteTimeUtc.Ticks })
-        }
+        $tFiles = @($transcripts | Where-Object { $_.File } | ForEach-Object { $_.File })
+        $misses = @(Get-StorageCacheMisses -Files $tFiles -Cache $workCache)
         if ($misses.Count -gt 1) {
-            Read-StorageClaudeMetaParallel -Misses $misses.ToArray() -Cache $workCache -Cancel $Cancel -Progress $Progress -Counted $counted
+            Read-StorageClaudeMetaParallel -Misses $misses -Cache $workCache -Cancel $Cancel -Progress $Progress -Counted $counted
         }
     }
     $by = @{}

@@ -313,6 +313,56 @@ try {
         Set-Item -Path Function:\Read-StorageClaudeJsonlMeta -Value $origReadMeta
     }
 
+    # Get-StorageCacheMisses and generalized Read-StorageClaudeMetaParallel with Read-StorageLocalMeta
+    $missDir = Join-Path $tmp 'misses'
+    New-Item -ItemType Directory -Path $missDir -Force | Out-Null
+    $mf1 = Join-Path $missDir 'local_1.json'; [IO.File]::WriteAllText($mf1, '{"title":"One","cliSessionId":"c1"}')
+    $mf2 = Join-Path $missDir 'local_2.json'; [IO.File]::WriteAllText($mf2, '{"title":"Two","cliSessionId":"c2"}')
+    $mfBad = Join-Path $missDir 'local_bad.json'; [IO.File]::WriteAllText($mfBad, '{ not json')
+    $mfPh = Join-Path $missDir 'local_ph.json'; [IO.File]::WriteAllText($mfPh, '{"title":"Cloud"}')
+    [IO.File]::SetAttributes($mfPh, ([IO.File]::GetAttributes($mfPh) -bor [IO.FileAttributes]::Offline))
+    try {
+        $fi1 = New-Object IO.FileInfo $mf1; $fi2 = New-Object IO.FileInfo $mf2; $fiPh = New-Object IO.FileInfo $mfPh
+        $mc = New-StorageCache
+        $mc.Entries[$mf1] = @{ size = [long]$fi1.Length; mtimeTicks = $fi1.LastWriteTimeUtc.Ticks; meta = @{ title = 'One' } }
+        $misses = @(Get-StorageCacheMisses -Files @($fi1, $fi2, $fi2, $fiPh) -Cache $mc)
+        Assert ($misses.Count -eq 1 -and $misses[0].Key -eq $mf2) "Get-StorageCacheMisses skips hit, duplicate, and placeholder (got $($misses.Count))"
+    } finally {
+        [IO.File]::SetAttributes($mfPh, ([IO.File]::GetAttributes($mfPh) -band (-bnot [int][IO.FileAttributes]::Offline)))
+    }
+    $localParCache = New-StorageCache
+    $localMisses = @(Get-StorageCacheMisses -Files @((New-Object IO.FileInfo $mf1), (New-Object IO.FileInfo $mf2), (New-Object IO.FileInfo $mfBad)) -Cache $localParCache)
+    Read-StorageClaudeMetaParallel -Misses $localMisses -Cache $localParCache -ReaderName 'Read-StorageLocalMeta' -HelperNames @('Get-StorageFirstString')
+    Assert ($localParCache.Entries.ContainsKey($mf1) -and $localParCache.Entries[$mf1]['meta']['title'] -eq 'One') 'generalized pool caches local_1.json'
+    Assert ($localParCache.Entries.ContainsKey($mf2) -and $localParCache.Entries[$mf2]['meta']['title'] -eq 'Two') 'generalized pool caches local_2.json'
+    Assert (-not $localParCache.Entries.ContainsKey($mfBad)) 'generalized pool skips caching invalid JSON'
+
+    $cancelLocalCache = New-StorageCache
+    Read-StorageClaudeMetaParallel -Misses $localMisses -Cache $cancelLocalCache -Cancel @{ Cancel = $true } -ReaderName 'Read-StorageLocalMeta' -HelperNames @('Get-StorageFirstString')
+    Assert ($cancelLocalCache.Entries.Count -eq 0 -and $cancelLocalCache.Reads -eq 0) 'generalized pool returns at once on pre-set Cancel'
+
+    $parLocalRoot = Join-Path $tmp 'bg-par-local\sess'
+    $parLocalAcct = Join-Path $parLocalRoot 'acct\org'
+    New-Item -ItemType Directory -Path $parLocalAcct -Force | Out-Null
+    foreach ($s in 1..16) {
+        [IO.File]::WriteAllText((Join-Path $parLocalAcct ("local_s{0:00}.json" -f $s)), ('{"title":"L' + $s + '"}'))
+    }
+    $parLocalRoots = @{ ClaudeProjects = ''; ClaudeProfiles = @(@{ Id = 'L'; Name = 'L'; SessionRoot = $parLocalRoot; DataDir = $parLocalRoot; IsDefault = $false }); CodexHomes = @(); AgyDirs = @() }
+    $origLocalMeta = (Get-Command Read-StorageLocalMeta -CommandType Function).ScriptBlock
+    try {
+        function Read-StorageLocalMeta { param([Parameter(Mandatory)][string]$Path) Start-Sleep -Milliseconds 250; return @{ cli = $null; title = 'Slow'; cwd = $null; activity = [long]1000; created = $null } }
+        $scan = Start-StorageScan -Roots $parLocalRoots -CachePath (Join-Path $tmp 'bg-par-local\cache.json')
+        Start-Sleep -Milliseconds 300
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        Stop-StorageScan -Scan $scan
+        $localStopMs = $sw.ElapsedMilliseconds
+        Assert ($localStopMs -lt 1000) "Stop-StorageScan interrupts parallel Read-StorageLocalMeta pool within 1 s ($localStopMs ms)"
+        Assert ($scan.Progress.Finished -and $scan.Progress.Cancelled -and -not $scan.Progress.HardStopped) 'parallel local_*.json pool stops cleanly without HardStopped'
+        Close-StorageScan -Scan $scan
+    } finally {
+        Set-Item -Path Function:\Read-StorageLocalMeta -Value $origLocalMeta
+    }
+
     # an error inside the runspace comes back through Progress.Error and is never thrown at the caller
     $blocker = Join-Path $tmp 'blocker'; [IO.File]::WriteAllText($blocker, 'a file where a folder is needed')
     $scan = Start-StorageScan -Roots $roots -CachePath (Join-Path $blocker 'cache.json')
