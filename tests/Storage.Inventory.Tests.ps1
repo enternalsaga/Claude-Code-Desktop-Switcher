@@ -306,6 +306,79 @@ try {
     } finally { $env:TEMP = $oldTmp; $env:TMP = $oldTmp2 }
     Assert ($threw -and @(Get-ChildItem -LiteralPath $snapTmp -Filter 'sqlite-snap-*').Count -eq 0) 'R3-7: when the backup copy fails the error is thrown and no sqlite-snap folder is left'
 
+    # ---------------------------------------------------------------- parallel scan parity, speedup, and cloud placeholder skip
+    $parProj = Join-Path $rt 'par-proj'
+    $parCases = @(
+        @{ id = 'bbbb0000-0000-4000-8000-000000000001'; body = ((& $line 'bbbb0000-0000-4000-8000-000000000001' '2026-11-10T08:00:00.000Z') + "`n" + (& $tl 'custom-title' 'customTitle' 'First') + "`n" + (& $tl 'custom-title' 'customTitle' 'Second') + "`n" + (& $line 'bbbb0000-0000-4000-8000-000000000001' '2026-11-10T09:00:00.000Z') + "`n") },
+        @{ id = 'bbbb0000-0000-4000-8000-000000000002'; body = ((& $line 'bbbb0000-0000-4000-8000-000000000002' '2026-11-11T08:00:00.000Z') + "`n" + (& $tl 'ai-title' 'aiTitle' 'AI Name') + "`n") },
+        @{ id = 'bbbb0000-0000-4000-8000-000000000003'; body = ((& $line 'bbbb0000-0000-4000-8000-000000000003' '2026-11-12T08:00:00.000Z') + "`n" + (& $tl 'summary' 'summary' 'Sum Name') + "`n") },
+        @{ id = 'bbbb0000-0000-4000-8000-000000000004'; body = (('{"type":"assistant","cwd":"C:\\work\\beyond8k","timestamp":"2026-11-12T01:00:00.000Z","message":{"content":"' + ('a' * 12000) + '"}}') + "`n" + '{"type":"user","timestamp":"2026-11-12T02:00:00.000Z","message":{"role":"user","content":"User beyond 8KB"}}' + "`n") },
+        @{ id = 'bbbb0000-0000-4000-8000-000000000005'; body = ('{"type":"user","cwd":"C:\\work\\big","timestamp":"2026-11-13T08:00:00.000Z","message":{"role":"user","content":"' + ('y' * 150000) + '"}}' + "`n" + $filler + "`n" + '{"type":"assistant","timestamp":"2026-11-13T10:00:00.000Z","message":{"content":"' + ('z' * 150000) + '"}}' + "`n") },
+        @{ id = 'bbbb0000-0000-4000-8000-000000000006'; body = ((& $line 'bbbb0000-0000-4000-8000-000000000006' '2026-11-14T08:00:00.000Z') + "`n") },
+        @{ id = 'bbbb0000-0000-4000-8000-000000000007'; body = ((& $line 'bbbb0000-0000-4000-8000-000000000007' '2026-11-15T08:00:00.000Z') + "`n") },
+        @{ id = 'bbbb0000-0000-4000-8000-000000000008'; body = ((& $line 'bbbb0000-0000-4000-8000-000000000008' '2026-11-16T08:00:00.000Z') + "`n") }
+    )
+    $seqMeta = @{}
+    foreach ($c in $parCases) {
+        $p = Join-Path $parProj ("slug\" + $c.id + '.jsonl')
+        Write-Text $p $c.body
+        $seqMeta[$p] = Read-StorageClaudeJsonlMeta -Path $p
+    }
+    $parRoots = @{ ClaudeProjects = $parProj; ClaudeProfiles = @(); CodexHomes = @(); AgyDirs = @() }
+    $parCache = New-StorageCache
+    $parInv = Get-StorageInventory -Roots $parRoots -Cache $parCache
+    Assert ($parCache.Reads -eq $parCases.Count) "parallel first scan reads all $($parCases.Count) transcripts: $($parCache.Reads)"
+    foreach ($p in $seqMeta.Keys) {
+        $cm = $parCache.Entries[$p]['meta']
+        $sm = $seqMeta[$p]
+        Assert ($cm['title'] -eq $sm['title'] -and $cm['cwd'] -eq $sm['cwd'] -and $cm['first'] -eq $sm['first'] -and $cm['last'] -eq $sm['last']) "parallel meta matches sequential for ${p}"
+    }
+    $sBeyond = Get-Session $parInv 'claude:bbbb0000-0000-4000-8000-000000000004'
+    Assert ($sBeyond.Title -eq 'User beyond 8KB' -and $sBeyond.Cwd -eq 'C:\work\beyond8k') '64 KB window still finds fallback user message beyond 8 KB'
+    if ([Environment]::ProcessorCount -ge 4) {
+        $origReadMeta = (Get-Command Read-StorageClaudeJsonlMeta -CommandType Function).ScriptBlock
+        try {
+            function Read-StorageClaudeJsonlMeta { param([Parameter(Mandatory)][string]$Path) Start-Sleep -Milliseconds 250; return @{ title = 'Par'; cwd = 'C:\p'; first = [long]1000; last = [long]2000 } }
+            $swPar = [Diagnostics.Stopwatch]::StartNew()
+            $fastInv = Get-StorageInventory -Roots $parRoots -Cache (New-StorageCache)
+            $swPar.Stop()
+            Assert ($fastInv.Sessions.Count -eq 8 -and $swPar.ElapsedMilliseconds -lt 1500) "parallel pool speeds up 8 x 250 ms reads ($($swPar.ElapsedMilliseconds) ms)"
+        } finally {
+            Set-Item -Path Function:\Read-StorageClaudeJsonlMeta -Value $origReadMeta
+        }
+    }
+
+    Assert (Test-StorageCloudPlaceholder 0x1000) 'OFFLINE (0x1000) is a cloud placeholder'
+    Assert (Test-StorageCloudPlaceholder 0x40000) 'RECALL_ON_OPEN (0x40000) is a cloud placeholder'
+    Assert (Test-StorageCloudPlaceholder 0x400000) 'RECALL_ON_DATA_ACCESS (0x400000) is a cloud placeholder'
+    Assert (Test-StorageCloudPlaceholder (0x20 -bor 0x40000)) 'Archive + RECALL_ON_OPEN is a cloud placeholder'
+    Assert (-not (Test-StorageCloudPlaceholder 0x20)) 'normal Archive file is not a cloud placeholder'
+    $phId = 'bbbb0000-0000-4000-8000-000000000099'
+    $phPath = Join-Path $parProj "slug\$phId.jsonl"
+    Write-Text $phPath ((& $line $phId '2026-11-17T08:00:00.000Z') + "`n")
+    [IO.File]::SetAttributes($phPath, ([IO.File]::GetAttributes($phPath) -bor [IO.FileAttributes]::Offline))
+    $phCache = New-StorageCache
+    $phLock = [IO.File]::Open($phPath, 'Open', 'ReadWrite', 'None')
+    try {
+        $directPh = Read-StorageClaudeJsonlMeta -Path $phPath
+        Assert ($null -eq $directPh['title'] -and $null -eq $directPh['cwd'] -and $null -eq $directPh['first'] -and $null -eq $directPh['last']) 'Read-StorageClaudeJsonlMeta skips placeholder without opening'
+        $phInv = Get-StorageInventory -Roots $parRoots -Cache $phCache
+    } finally {
+        $phLock.Dispose()
+        [IO.File]::SetAttributes($phPath, ([IO.File]::GetAttributes($phPath) -band (-bnot [int][IO.FileAttributes]::Offline)))
+    }
+    Assert ($phCache.Reads -eq $parCases.Count -and -not $phCache.Entries.ContainsKey($phPath)) 'placeholder file is skipped without being opened or cached'
+    $phSess = Get-Session $phInv "claude:$phId"
+    Assert ($phSess -and $null -eq $phSess.Cwd -and $null -eq $phSess.LastActivity -and $phSess.Title -eq ('Chat ' + $phId.Substring(0, 8))) 'placeholder session keeps empty meta'
+    $errCache = New-StorageCache
+    $errLock = [IO.File]::Open($phPath, 'Open', 'ReadWrite', 'None')
+    try {
+        Assert-Throws { [void](Get-StorageInventory -Roots $parRoots -Cache $errCache) } 'locked non-placeholder transcript still fails like sequential'
+    } finally {
+        $errLock.Dispose()
+    }
+    Assert (-not $errCache.Entries.ContainsKey($phPath)) 'failed transcript read is not cached'
+
     # roots built from a config: only the shape is checked here, never real paths
     Assert ($null -ne (Get-Command Get-StorageRootsFromConfig -CommandType Function)) 'the real-roots builder exists'
 } finally {

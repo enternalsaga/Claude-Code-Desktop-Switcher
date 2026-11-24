@@ -184,6 +184,53 @@ try {
     Stop-StorageChildProcesses -Progress @{ ChildPids = @(2147480000, $null) }
     Assert $true 'killing a process that does not exist is not an error'
 
+    # parallel pool: Stop cancels quickly, keeps read entries, and skips the rest
+    $parCancelProj = Join-Path $tmp 'bg-par-cancel\projects'
+    foreach ($s in 1..32) {
+        $d = Join-Path $parCancelProj "slug$s"; New-Item -ItemType Directory -Path $d -Force | Out-Null
+        $id = '20000000-0000-4000-8000-0000000000{0:00}' -f $s
+        [IO.File]::WriteAllText((Join-Path $d "$id.jsonl"), ('{"type":"user","cwd":"C:\\work\\p","timestamp":"2026-11-15T10:00:00.000Z","message":{"role":"user","content":"hello ' + $s + '"}}' + "`n"))
+    }
+    $parCancelRoots = @{ ClaudeProjects = $parCancelProj; ClaudeProfiles = @(); CodexHomes = @(); AgyDirs = @() }
+    $parCancelCache = Join-Path $tmp 'bg-par-cancel\cache.json'
+    $origReadMeta = (Get-Command Read-StorageClaudeJsonlMeta -CommandType Function).ScriptBlock
+    try {
+        function Read-StorageClaudeJsonlMeta { param([Parameter(Mandatory)][string]$Path) Start-Sleep -Milliseconds 250; return @{ title = 'Slow'; cwd = 'C:\w'; first = [long]1000; last = [long]2000 } }
+        $scan = Start-StorageScan -Roots $parCancelRoots -CachePath $parCancelCache
+        $waitDone = [DateTime]::UtcNow.AddSeconds(10)
+        while ($scan.Progress.Done -lt 1 -and -not $scan.Progress.Finished -and [DateTime]::UtcNow -lt $waitDone) { Start-Sleep -Milliseconds 15 }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        Stop-StorageScan -Scan $scan
+        $stopElapsed = $sw.ElapsedMilliseconds
+        Assert ($stopElapsed -lt 1000) "parallel Stop-StorageScan returns within a second ($stopElapsed ms)"
+        Assert ($scan.Progress.Finished -and $scan.Progress.Cancelled -and -not $scan.Progress.HardStopped) 'parallel pool stops cleanly on cancel without HardStopped'
+        Assert (Test-Path -LiteralPath $parCancelCache) 'cancelled parallel scan saves partial cache'
+        $parStopN = @((Get-Content -LiteralPath $parCancelCache -Raw | ConvertFrom-Json).entries.PSObject.Properties).Count
+        Assert ($parStopN -ge 1 -and $parStopN -lt 32) "cancelled parallel scan saved completed entries before stop ($parStopN of 32)"
+        Close-StorageScan -Scan $scan
+    } finally {
+        Set-Item -Path Function:\Read-StorageClaudeJsonlMeta -Value $origReadMeta
+    }
+    $scan = Start-StorageScan -Roots $parCancelRoots -CachePath $parCancelCache
+    $deadline = [DateTime]::UtcNow.AddSeconds(30); while (-not $scan.Progress.Finished -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 20 }
+    Assert ($scan.Progress.Result.Reads -eq (32 - $parStopN) -and $scan.Progress.Result.Sessions.Count -eq 32 -and $scan.Progress.Done -eq $scan.Progress.Total) "parallel resume reads only remaining ($($scan.Progress.Result.Reads)) and Done equals Total"
+    Close-StorageScan -Scan $scan
+
+    $parHangCache = Join-Path $tmp 'bg-par-cancel\cache-hang.json'
+    try {
+        function Read-StorageClaudeJsonlMeta { param([Parameter(Mandatory)][string]$Path) Start-Sleep -Milliseconds 5000; return @{ title = 'Hang'; cwd = 'C:\w'; first = [long]1000; last = [long]2000 } }
+        $scan = Start-StorageScan -Roots $parCancelRoots -CachePath $parHangCache
+        Start-Sleep -Milliseconds 300
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        Stop-StorageScan -Scan $scan
+        $hangStopMs = $sw.ElapsedMilliseconds
+        Assert ($hangStopMs -lt 1000) "parallel pool interrupts slow workers within a second ($hangStopMs ms)"
+        Assert ($scan.Progress.Finished -and $scan.Progress.Cancelled -and -not $scan.Progress.HardStopped) 'parallel pool stops slow workers cleanly without HardStopped'
+        Close-StorageScan -Scan $scan
+    } finally {
+        Set-Item -Path Function:\Read-StorageClaudeJsonlMeta -Value $origReadMeta
+    }
+
     # an error inside the runspace comes back through Progress.Error and is never thrown at the caller
     $blocker = Join-Path $tmp 'blocker'; [IO.File]::WriteAllText($blocker, 'a file where a folder is needed')
     $scan = Start-StorageScan -Roots $roots -CachePath (Join-Path $blocker 'cache.json')

@@ -158,6 +158,95 @@ function Get-StorageFilesRecursive {
     return $list.ToArray()
 }
 
+# True when file attributes mark a cloud placeholder: OFFLINE (0x1000), RECALL_ON_OPEN (0x40000) or RECALL_ON_DATA_ACCESS (0x400000).
+function Test-StorageCloudPlaceholder {
+    param($Attributes)
+    if ($null -eq $Attributes) { return $false }
+    return (([int]$Attributes -band (0x1000 -bor 0x40000 -bor 0x400000)) -ne 0)
+}
+
+# Reads meta for cache-missed Claude transcripts in a bounded RunspacePool. Workers only parse and enqueue results;
+# only the caller's scan thread writes into $Cache and increments Progress.Done.
+function Read-StorageClaudeMetaParallel {
+    param([Parameter(Mandatory)][array]$Misses, [Parameter(Mandatory)]$Cache, $Cancel, $Progress, [hashtable]$Counted, [int]$MaxThreads = 0)
+    $cap = $(if ($MaxThreads -gt 0) { $MaxThreads } else { [Math]::Min(8, [Environment]::ProcessorCount) })
+    $threads = [Math]::Min($Misses.Count, $cap)
+    if ($threads -le 1 -or (Test-StorageCancel $Cancel)) { return }
+    $iss = [Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    foreach ($n in 'Read-StorageBytes', 'Split-StorageLines', 'Read-JsonlHeadTail', 'Test-StorageCloudPlaceholder', 'ConvertTo-StorageMs', 'Get-StorageFirstString', 'Get-StorageTitleLine', 'Get-StorageClaudeWindowMeta', 'Read-StorageClaudeJsonlMeta') {
+        $c = Get-Command -Name $n -CommandType Function -ErrorAction Stop
+        $iss.Commands.Add((New-Object Management.Automation.Runspaces.SessionStateFunctionEntry($n, $c.Definition)))
+    }
+    $pool = [runspacefactory]::CreateRunspacePool($iss)
+    [void]$pool.SetMinRunspaces(1); [void]$pool.SetMaxRunspaces($threads); $pool.Open()
+    $work = New-Object Collections.Concurrent.ConcurrentQueue[object]
+    $results = New-Object Collections.Concurrent.ConcurrentQueue[object]
+    $ready = New-Object Threading.AutoResetEvent($false)
+    foreach ($m in $Misses) { $work.Enqueue($m) }
+    $workerScript = @'
+param($Work, $Results, $Ready, $Cancel)
+$item = $null
+while (-not ($Cancel -and $Cancel['Cancel']) -and $Work.TryDequeue([ref]$item)) {
+    $meta = $null; $ok = $false
+    try { $meta = Read-StorageClaudeJsonlMeta -Path $item.Key; $ok = ($meta -is [Collections.IDictionary]) } catch { $ok = $false }
+    $Results.Enqueue(@{ Item = $item; Meta = $meta; Ok = $ok })
+    try { [void]$Ready.Set() } catch { }
+}
+try { [void]$Ready.Set() } catch { }
+'@
+    $drain = {
+        $res = $null
+        while ($results.TryDequeue([ref]$res)) {
+            if ($res.Ok) {
+                $it = $res.Item
+                $Cache.Entries[$it.Key] = @{ size = $it.Size; mtimeTicks = $it.Ticks; meta = $res.Meta }
+                $Cache.Seen[$it.Key] = $true
+                $Cache.Reads++
+                if ($Counted) { $Counted[$it.Key] = $true }
+                Set-StorageProgress -Progress $Progress -Done 1
+            }
+        }
+    }
+    $workers = New-Object Collections.Generic.List[object]
+    for ($i = 0; $i -lt $threads; $i++) {
+        $ps = [powershell]::Create(); $ps.RunspacePool = $pool
+        [void]$ps.AddScript($workerScript).AddArgument($work).AddArgument($results).AddArgument($ready).AddArgument($Cancel)
+        $workers.Add(@{ PowerShell = $ps; Handle = $ps.BeginInvoke() })
+    }
+    try {
+        while ($true) {
+            . $drain
+            if (Test-StorageCancel $Cancel) { break }
+            $running = $false
+            foreach ($w in $workers) { if (-not $w.Handle.IsCompleted) { $running = $true; break } }
+            if (-not $running) { break }
+            [void]$ready.WaitOne(25)
+        }
+        . $drain
+    } finally {
+        $stops = New-Object Collections.Generic.List[object]
+        foreach ($w in $workers) { if (-not $w.Handle.IsCompleted) { try { $stops.Add($w.PowerShell.BeginStop($null, $null)) } catch { } } }
+        if ($stops.Count -gt 0) {
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            foreach ($s in $stops) {
+                $left = [int][Math]::Max(0, 400 - $sw.ElapsedMilliseconds)
+                if ($left -gt 0) { try { [void]$s.AsyncWaitHandle.WaitOne($left) } catch { } }
+            }
+        }
+        . $drain
+        $allDone = $true
+        foreach ($w in $workers) {
+            if ($w.Handle.IsCompleted) {
+                try { [void]$w.PowerShell.EndInvoke($w.Handle) } catch { }
+                try { $w.PowerShell.Dispose() } catch { }
+            } else { $allDone = $false }
+        }
+        if ($allDone) { try { $pool.Close(); $pool.Dispose() } catch { } }
+        else { try { [void]$pool.BeginClose($null, $null) } catch { } }
+        try { $ready.Dispose() } catch { }
+    }
+}
+
 # ---- the background scan -----------------------------------------------------------------------------------------------
 
 # Every function the runspace needs. Tests check that this list covers both scan files and that each name resolves, so a
@@ -166,7 +255,7 @@ function Get-StorageScanFunctionNames {
     return @(
         'Read-StorageBytes', 'Split-StorageLines', 'Read-JsonlHeadTail', 'New-StorageCache', 'Read-StorageCache', 'Write-StorageCache',
         'Get-StorageCachedMeta', 'Remove-StorageCacheUnseen', 'Test-StorageCancel', 'Get-StorageEntries', 'Measure-StorageDir',
-        'Get-StorageFilesRecursive',
+        'Get-StorageFilesRecursive', 'Test-StorageCloudPlaceholder', 'Read-StorageClaudeMetaParallel',
         'ConvertTo-StorageMs', 'Set-StorageProgress', 'Set-StorageActivityFromParts', 'Add-StoragePart', 'Get-StorageFirstString', 'Read-StorageLocalMeta',
         'Get-StorageTitleLine', 'Read-StorageClaudeJsonlMeta', 'Get-ClaudeProfileRefs', 'Get-ClaudeTranscripts',
         'New-StorageSessionBuilder', 'ConvertTo-StorageSession', 'Get-ClaudeStorageSessions',

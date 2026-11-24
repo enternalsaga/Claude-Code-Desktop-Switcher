@@ -86,6 +86,9 @@ function Get-StorageTitleLine {
 # expressions avoid parsing the big lines; only title lines and the first user message are parsed as JSON.
 function Read-StorageClaudeJsonlMeta {
     param([Parameter(Mandatory)][string]$Path)
+    if (Test-StorageCloudPlaceholder ([IO.File]::GetAttributes($Path))) {
+        return @{ title = $null; cwd = $null; first = $null; last = $null }
+    }
     # A line longer than the window is cut at its edge and dropped, so a folder or a time can be missing: read again with a
     # window twice as big, up to 1 MB, until the folder and both times are found or the whole file has been read.
     $window = 65536
@@ -221,6 +224,25 @@ function Get-ClaudeStorageSessions {
     $refs = @(Get-ClaudeProfileRefs -Profiles $Profiles -Cache $Cache -Cancel $Cancel -Warnings $Warnings)
     $transcripts = @(Get-ClaudeTranscripts -ProjectsDir $ProjectsDir -Cancel $Cancel)
     Set-StorageProgress -Progress $Progress -Phase 'claude' -Total ($refs.Count + $transcripts.Count)
+    $workCache = $(if ($Cache) { $Cache } else { New-StorageCache })
+    $counted = @{}
+    # -ItemDelayMs is only raised by tests to pace the loop one item at a time.
+    if (-not $ItemDelayMs -and -not (Test-StorageCancel $Cancel)) {
+        $misses = New-Object Collections.Generic.List[object]
+        $seenMiss = @{}
+        foreach ($t in $transcripts) {
+            if (-not $t.File) { continue }
+            $f = $t.File
+            if ((Test-StorageCloudPlaceholder $f.Attributes) -or $seenMiss.ContainsKey($f.FullName)) { continue }
+            $e = $workCache.Entries[$f.FullName]
+            if ($e -and [long]$e['size'] -eq $f.Length -and [long]$e['mtimeTicks'] -eq $f.LastWriteTimeUtc.Ticks) { continue }
+            $seenMiss[$f.FullName] = $true
+            $misses.Add(@{ Key = $f.FullName; Size = [long]$f.Length; Ticks = $f.LastWriteTimeUtc.Ticks })
+        }
+        if ($misses.Count -gt 1) {
+            Read-StorageClaudeMetaParallel -Misses $misses.ToArray() -Cache $workCache -Cancel $Cancel -Progress $Progress -Counted $counted
+        }
+    }
     $by = @{}
     foreach ($t in $transcripts) {
         if (Test-StorageCancel $Cancel) { break }
@@ -230,17 +252,19 @@ function Get-ClaudeStorageSessions {
         if ($t.File) {
             $f = $t.File
             Add-StoragePart -List $b.Parts -Role 'transcript' -Path $f.FullName -Bytes $f.Length -Ticks $f.LastWriteTimeUtc.Ticks
-            $m = Get-StorageCachedMeta -Cache $Cache -Key $f.FullName -Size $f.Length -Ticks $f.LastWriteTimeUtc.Ticks -Reader { param($k) Read-StorageClaudeJsonlMeta -Path $k }
-            if (-not $b.AltTitle) { $b.AltTitle = $m['title'] }
-            if (-not $b.Cwd) { $b.Cwd = $m['cwd'] }
-            if ($m['last'] -and [long]$m['last'] -gt $b.Activity) { $b.Activity = [long]$m['last'] }
-            if ($m['first'] -and -not $b.Created) { $b.Created = [long]$m['first'] }
+            if (-not (Test-StorageCloudPlaceholder $f.Attributes)) {
+                $m = Get-StorageCachedMeta -Cache $workCache -Key $f.FullName -Size $f.Length -Ticks $f.LastWriteTimeUtc.Ticks -Reader { param($k) Read-StorageClaudeJsonlMeta -Path $k }
+                if (-not $b.AltTitle) { $b.AltTitle = $m['title'] }
+                if (-not $b.Cwd) { $b.Cwd = $m['cwd'] }
+                if ($m['last'] -and [long]$m['last'] -gt $b.Activity) { $b.Activity = [long]$m['last'] }
+                if ($m['first'] -and -not $b.Created) { $b.Created = [long]$m['first'] }
+            }
         } else { $b.Flags['NoTranscript'] = $true }
         if ($t.Dir) {
             $d = Measure-StorageDir -Path $t.Dir.FullName -Cancel $Cancel
             Add-StoragePart -List $b.Parts -Role 'cli-dir' -Path $t.Dir.FullName -Bytes $d.Bytes -Kind 'dir' -Files $d.Files -Ticks $d.NewestTicks
         }
-        Set-StorageProgress -Progress $Progress -Done 1
+        if (-not ($t.File -and $counted.ContainsKey($t.File.FullName))) { Set-StorageProgress -Progress $Progress -Done 1 }
     }
     foreach ($r in $refs) {
         $id = $(if ($r.Meta['cli']) { [string]$r.Meta['cli'] } else { [string]$r.Name })
