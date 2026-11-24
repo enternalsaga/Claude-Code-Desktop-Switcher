@@ -127,8 +127,8 @@ function Get-StorageEntries {
     return $out.ToArray()
 }
 
-# Bytes, file count and the newest mtime (ticks) under a folder, without following links.
-function Measure-StorageDir {
+# Pure-PowerShell fallback for Measure-StorageDir when Add-Type cannot compile C#.
+function Measure-StorageDirPs {
     param([Parameter(Mandatory)][string]$Path, $Cancel)
     $bytes = [long]0; $files = 0; $newest = [long]0
     $stack = New-Object Collections.Generic.Stack[string]
@@ -143,6 +143,106 @@ function Measure-StorageDir {
         }
     }
     return [pscustomobject]@{ Bytes = $bytes; Files = $files; NewestTicks = $newest }
+}
+
+function Initialize-StorageDirMeasure {
+    if ('HarnessStorage.DirMeasure' -as [type]) { return $true }
+    if ($script:StorageDirMeasureUnavailable) { return $false }
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+
+namespace HarnessStorage {
+    public static class DirMeasure {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct FindData {
+            public uint Attr;
+            public uint CreateLo, CreateHi, AccessLo, AccessHi, WriteLo, WriteHi;
+            public uint SizeHi, SizeLo, Res0, Res1;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string Name;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)] public string AltName;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        static extern IntPtr FindFirstFileExW(string name, int infoLevel, out FindData data, int searchOp, IntPtr filter, int flags);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        static extern bool FindNextFileW(IntPtr h, out FindData data);
+        [DllImport("kernel32.dll", ExactSpelling = true)]
+        static extern bool FindClose(IntPtr h);
+
+        const int FindExInfoBasic = 1, FindExSearchNameMatch = 0, LargeFetch = 2;
+        const uint AttrDir = 0x10, AttrReparse = 0x400;
+        const long MaxFileTime = 2650467743999999999L;
+        static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+        static string ToExtended(string path) {
+            if (string.IsNullOrEmpty(path)) return null;
+            if (!path.StartsWith(@"\\?\", StringComparison.Ordinal) && !path.StartsWith(@"\\.\", StringComparison.Ordinal)) {
+                try { path = Path.GetFullPath(path); } catch { path = path.Replace('/', '\\'); }
+                path = path.StartsWith(@"\\", StringComparison.Ordinal) ? (@"\\?\UNC\" + path.Substring(2)) : (@"\\?\" + path);
+            }
+            return path.TrimEnd('\\');
+        }
+
+        static bool Cancelled(IDictionary cancel) {
+            if (cancel == null) return false;
+            object v = cancel["Cancel"];
+            if (v == null) return false;
+            if (v is bool) return (bool)v;
+            try { return Convert.ToBoolean(v); } catch { return true; }
+        }
+
+        public static long[] Measure(string path, IDictionary cancel) {
+            long bytes = 0, files = 0, newest = 0;
+            string root = ToExtended(path);
+            if (string.IsNullOrEmpty(root)) return new long[] { 0, 0, 0 };
+            var stack = new Stack<string>();
+            stack.Push(root);
+            while (stack.Count > 0) {
+                if (Cancelled(cancel)) break;
+                string dir = stack.Pop();
+                FindData d;
+                IntPtr h = FindFirstFileExW(dir + @"\*", FindExInfoBasic, out d, FindExSearchNameMatch, IntPtr.Zero, LargeFetch);
+                if (h == InvalidHandle) continue;
+                try {
+                    long seen = 0;
+                    do {
+                        string n = d.Name;
+                        if (n == "." || n == "..") continue;
+                        if ((d.Attr & AttrReparse) != 0) continue;
+                        if ((d.Attr & AttrDir) != 0) { stack.Push(dir + @"\" + n); continue; }
+                        bytes += ((long)d.SizeHi << 32) | (long)d.SizeLo;
+                        files++;
+                        long ft = ((long)d.WriteHi << 32) | (long)d.WriteLo;
+                        if (ft >= 0 && ft <= MaxFileTime) { long t = DateTime.FromFileTimeUtc(ft).Ticks; if (t > newest) newest = t; }
+                        if ((++seen & 255) == 0 && Cancelled(cancel)) break;
+                    } while (FindNextFileW(h, out d));
+                } finally { FindClose(h); }
+            }
+            return new long[] { bytes, files, newest };
+        }
+    }
+}
+'@ -ErrorAction Stop
+        return [bool]('HarnessStorage.DirMeasure' -as [type])
+    } catch {
+        if ('HarnessStorage.DirMeasure' -as [type]) { return $true }
+        $script:StorageDirMeasureUnavailable = $true
+        return $false
+    }
+}
+
+# Bytes, file count and the newest mtime (ticks) under a folder, without following links.
+function Measure-StorageDir {
+    param([Parameter(Mandatory)][string]$Path, $Cancel)
+    if (Initialize-StorageDirMeasure) {
+        $r = [HarnessStorage.DirMeasure]::Measure($Path, $Cancel)
+        return [pscustomobject]@{ Bytes = $r[0]; Files = [int]$r[1]; NewestTicks = $r[2] }
+    }
+    return (Measure-StorageDirPs -Path $Path -Cancel $Cancel)
 }
 
 # Every file under a folder (FileInfo), without following links.
@@ -254,7 +354,7 @@ try { [void]$Ready.Set() } catch { }
 function Get-StorageScanFunctionNames {
     return @(
         'Read-StorageBytes', 'Split-StorageLines', 'Read-JsonlHeadTail', 'New-StorageCache', 'Read-StorageCache', 'Write-StorageCache',
-        'Get-StorageCachedMeta', 'Remove-StorageCacheUnseen', 'Test-StorageCancel', 'Get-StorageEntries', 'Measure-StorageDir',
+        'Get-StorageCachedMeta', 'Remove-StorageCacheUnseen', 'Test-StorageCancel', 'Get-StorageEntries', 'Measure-StorageDirPs', 'Initialize-StorageDirMeasure', 'Measure-StorageDir',
         'Get-StorageFilesRecursive', 'Test-StorageCloudPlaceholder', 'Read-StorageClaudeMetaParallel',
         'ConvertTo-StorageMs', 'Set-StorageProgress', 'Set-StorageActivityFromParts', 'Add-StoragePart', 'Get-StorageFirstString', 'Read-StorageLocalMeta',
         'Get-StorageTitleLine', 'Read-StorageClaudeJsonlMeta', 'Get-ClaudeProfileRefs', 'Get-ClaudeTranscripts',

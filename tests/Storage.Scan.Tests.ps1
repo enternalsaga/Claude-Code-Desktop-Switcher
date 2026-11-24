@@ -104,6 +104,88 @@ try {
         Assert ((Measure-StorageDir -Path $walk -Cancel $cancel).Files -eq 0) 'a cancelled walk stops at once'
     } finally { [IO.Directory]::Delete((Join-Path $walk 'link')) }
 
+    # ---------------------------------------------------------------- fast C# Measure-StorageDir parity, long paths, fallback
+    Assert ((Initialize-StorageDirMeasure) -and ($null -ne ('HarnessStorage.DirMeasure' -as [type]))) 'DirMeasure C# type compiles lazily'
+    $pwalk = Join-Path $tmp 'parity'
+    $jTarget = Join-Path $tmp 'mklink-target'
+    try {
+        $sub1 = Join-Path $pwalk 'nested\sub1'
+        $sub2 = Join-Path $sub1 'sub2'
+        $emptyDir = Join-Path $pwalk 'empty'
+        [void][IO.Directory]::CreateDirectory($sub2)
+        [void][IO.Directory]::CreateDirectory((Join-Path $emptyDir 'inner-empty'))
+        $f1 = Join-Path $pwalk 'root.bin'
+        $f2 = Join-Path $sub1 'mid.bin'
+        $f3 = Join-Path $sub2 'leaf.bin'
+        [IO.File]::WriteAllBytes($f1, (New-Object byte[] 111))
+        [IO.File]::WriteAllBytes($f2, (New-Object byte[] 222))
+        [IO.File]::WriteAllBytes($f3, (New-Object byte[] 333))
+        [IO.File]::SetLastWriteTimeUtc($f1, [datetime]::new(2026, 1, 10, 1, 2, 3, [DateTimeKind]::Utc))
+        [IO.File]::SetLastWriteTimeUtc($f2, [datetime]::new(2026, 2, 20, 4, 5, 6, [DateTimeKind]::Utc))
+        [IO.File]::SetLastWriteTimeUtc($f3, [datetime]::new(2026, 3, 25, 7, 8, 9, [DateTimeKind]::Utc))
+
+        $seg = 'seg_' + ('x' * 52)
+        $deepDir = Join-Path $pwalk ($seg + '\' + $seg + '\' + $seg + '\' + $seg + '\' + $seg)
+        $deepFile = Join-Path $deepDir 'deep.bin'
+        Assert ($deepFile.Length -gt 260) "deep fixture path exceeds MAX_PATH ($($deepFile.Length))"
+        [void][IO.Directory]::CreateDirectory(('\\?\' + $deepDir))
+        [IO.File]::WriteAllBytes(('\\?\' + $deepFile), (New-Object byte[] 444))
+        $newestDt = [datetime]::new(2026, 6, 15, 12, 34, 56, [DateTimeKind]::Utc)
+        [IO.File]::SetLastWriteTimeUtc(('\\?\' + $deepFile), $newestDt)
+
+        $expBytes = [long](111 + 222 + 333 + 444)
+        $expFiles = 4
+        $expTicks = $newestDt.Ticks
+        $fast = Measure-StorageDir -Path $pwalk
+        $slow = Measure-StorageDirPs -Path $pwalk
+        Assert ($fast.Bytes -eq $expBytes -and $fast.Files -eq $expFiles -and $fast.NewestTicks -eq $expTicks) "C# walk exact totals: $($fast | ConvertTo-Json -Compress)"
+        Assert ($fast.Bytes -eq $slow.Bytes -and $fast.Files -eq $slow.Files -and $fast.NewestTicks -eq $slow.NewestTicks) "C# matches PS walk: fast=$($fast | ConvertTo-Json -Compress) slow=$($slow | ConvertTo-Json -Compress)"
+
+        $em = Measure-StorageDir -Path $emptyDir
+        $emPs = Measure-StorageDirPs -Path $emptyDir
+        Assert ($em.Bytes -eq 0 -and $em.Files -eq 0 -and $em.NewestTicks -eq 0) 'empty folder gives 0/0/0'
+        Assert ($emPs.Bytes -eq 0 -and $emPs.Files -eq 0 -and $emPs.NewestTicks -eq 0) 'empty folder PS gives 0/0/0'
+
+        [void][IO.Directory]::CreateDirectory($jTarget)
+        $jFile = Join-Path $jTarget 'ignored.bin'
+        [IO.File]::WriteAllBytes($jFile, (New-Object byte[] 9999))
+        [IO.File]::SetLastWriteTimeUtc($jFile, [datetime]::new(2027, 1, 1, 0, 0, 0, [DateTimeKind]::Utc))
+        $jLink = Join-Path $pwalk 'junc'
+        cmd.exe /c mklink /J "$jLink" "$jTarget" 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $jLink)) {
+            try {
+                $mj = Measure-StorageDir -Path $pwalk
+                $mjPs = Measure-StorageDirPs -Path $pwalk
+                Assert ($mj.Bytes -eq $expBytes -and $mj.Files -eq $expFiles -and $mj.NewestTicks -eq $expTicks) "mklink junction skipped by C#: $($mj | ConvertTo-Json -Compress)"
+                Assert ($mjPs.Bytes -eq $expBytes -and $mjPs.Files -eq $expFiles -and $mjPs.NewestTicks -eq $expTicks) "mklink junction skipped by PS: $($mjPs | ConvertTo-Json -Compress)"
+            } finally { [IO.Directory]::Delete($jLink) }
+        }
+
+        $miss = Measure-StorageDir -Path (Join-Path $tmp 'missing-root-xyz')
+        $missPs = Measure-StorageDirPs -Path (Join-Path $tmp 'missing-root-xyz')
+        Assert ($miss.Bytes -eq 0 -and $miss.Files -eq 0 -and $miss.NewestTicks -eq 0) 'missing root gives 0/0/0'
+        Assert ($missPs.Bytes -eq 0 -and $missPs.Files -eq 0 -and $missPs.NewestTicks -eq 0) 'missing root PS gives 0/0/0'
+
+        $syncCancel = [hashtable]::Synchronized(@{ Cancel = $true })
+        $cm = Measure-StorageDir -Path $pwalk -Cancel $syncCancel
+        Assert ($cm.Bytes -eq 0 -and $cm.Files -eq 0 -and $cm.NewestTicks -eq 0) 'pre-set synchronized Cancel stops immediately'
+        $plainCancel = Measure-StorageDir -Path $pwalk -Cancel @{ Cancel = $true }
+        Assert ($plainCancel.Bytes -eq 0 -and $plainCancel.Files -eq 0 -and $plainCancel.NewestTicks -eq 0) 'pre-set plain Cancel stops immediately'
+
+        $origInit = (Get-Command Initialize-StorageDirMeasure -CommandType Function).ScriptBlock
+        try {
+            function Initialize-StorageDirMeasure { return $false }
+            $fb = Measure-StorageDir -Path $pwalk
+            Assert ($fb.Bytes -eq $fast.Bytes -and $fb.Files -eq $fast.Files -and $fb.NewestTicks -eq $fast.NewestTicks) "fallback matches C#: $($fb | ConvertTo-Json -Compress)"
+            $fbMiss = Measure-StorageDir -Path (Join-Path $tmp 'missing-root-xyz')
+            Assert ($fbMiss.Bytes -eq 0 -and $fbMiss.Files -eq 0 -and $fbMiss.NewestTicks -eq 0) 'fallback missing root gives 0/0/0'
+            $fbCancel = Measure-StorageDir -Path $pwalk -Cancel $syncCancel
+            Assert ($fbCancel.Bytes -eq 0 -and $fbCancel.Files -eq 0 -and $fbCancel.NewestTicks -eq 0) 'fallback Cancel gives 0/0/0'
+        } finally { Set-Item -Path Function:\Initialize-StorageDirMeasure -Value $origInit }
+    } finally {
+        if (Test-Path -LiteralPath ('\\?\' + $pwalk)) { [IO.Directory]::Delete(('\\?\' + $pwalk), $true) }
+    }
+
     # ---------------------------------------------------------------- I1-7: the background scan
     $proj = Join-Path $tmp 'bg\projects'
     $cwdText = 'C:\\work\\p'
