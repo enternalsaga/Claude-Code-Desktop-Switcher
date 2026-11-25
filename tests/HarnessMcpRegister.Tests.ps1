@@ -282,6 +282,24 @@ try {
     Register-McpAgy -Spec $specNode -ConfigPath $cfgPath -Now $t1
     Assert ((Get-McpAgyState -ConfigPath $cfgPath -ServerPath $spacedPath) -ceq 'registered') 'agy state registered'
     Assert ((Get-McpAgyState -ConfigPath $cfgPath -ServerPath 'C:\moved\mcp\harness-transcripts\server.mjs') -ceq 'stale') 'agy state stale'
+
+    # --- 10. default run kills on timeout ---
+    $pidFile = Join-Path $temp 'sleep-pid.txt'
+    $cmdText = "[IO.File]::WriteAllText('$($pidFile.Replace("'", "''"))', [string]`$PID); Start-Sleep 30"
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $tMsg = ''
+    try {
+        [void](Invoke-McpDefaultRun -Exe 'powershell.exe' -ArgList @('-NoProfile', '-Command', $cmdText) -TimeoutMs 1500)
+    } catch {
+        $tMsg = $_.Exception.Message
+    }
+    $sw.Stop()
+    Assert ($tMsg -like 'timeout:*') "expected timeout: error, got: $tMsg"
+    Assert ($sw.Elapsed.TotalSeconds -lt 5) "timeout took too long: $($sw.Elapsed.TotalSeconds) s"
+    Assert (Test-Path -LiteralPath $pidFile -PathType Leaf) 'child process wrote its PID before timeout'
+    $childPid = [int]([IO.File]::ReadAllText($pidFile).Trim())
+    Start-Sleep -Milliseconds 150
+    Assert ($null -eq (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) "timed-out child process $childPid is still alive"
 } finally {
     Remove-TestTempDir $temp
 }

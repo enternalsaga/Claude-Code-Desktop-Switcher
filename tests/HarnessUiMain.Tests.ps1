@@ -203,7 +203,7 @@ Update-ChatPanel -Ctx $ctx -Load
 $items = @($ctx.List.Items)
 Assert ($items.Count -eq 3) "three chats listed, got $($items.Count)"
 $byTitle = @{}; foreach ($i in $items) { $byTitle[$i.Text] = $i }
-Assert (@($ctx.List.Columns | ForEach-Object { $_.Text }) -join '|' -eq ('Title|Folder|Last active ' + [char]0x25BC + '|Drive')) 'columns, newest first by default'
+Assert (@($ctx.List.Columns | ForEach-Object { $_.Text }) -join '|' -eq ('Title|Folder|Last active ' + [char]0x25BC + '|Drive|Mirror')) 'columns, newest first by default'
 Assert ($byTitle['Same'].SubItems[3].Text -like 'On Drive*' -and $byTitle['Same'].ImageKey -eq 'ok') "Same: $($byTitle['Same'].SubItems[3].Text)"
 Assert ($byTitle['Newer'].SubItems[3].Text -eq 'Newer on Drive (from LAPTOP)' -and $byTitle['Newer'].ImageKey -eq 'down') 'Newer'
 Assert ($byTitle['Alone'].SubItems[3].Text -eq 'Not on Drive' -and $byTitle['Alone'].SubItems[1].Text -like '*(not found)') 'Alone: not on Drive, folder missing'

@@ -264,7 +264,7 @@ function New-HarnessChatPanel {
     $list = New-Object System.Windows.Forms.ListView
     $list.View = 'Details'; $list.FullRowSelect = $true; $list.MultiSelect = $false; $list.HideSelection = $false; $list.ShowItemToolTips = $true
     $list.Dock = 'Fill'; $list.BackColor = [System.Drawing.Color]::White; $list.ForeColor = $s.Ink; $list.SmallImageList = (New-ChatStatusImages)
-    foreach ($c in @(@('Title', 300), @('Folder', 150), @('Last active', 90), @('Drive', 280))) { [void]$list.Columns.Add((Get-ChatColumnHeader -Name $c[0] -SortColumn $view.sortColumn -Descending $view.descending), $c[1]) }
+    foreach ($c in @(@('Title', 300), @('Folder', 150), @('Last active', 90), @('Drive', 280), @('Mirror', 180))) { [void]$list.Columns.Add((Get-ChatColumnHeader -Name $c[0] -SortColumn $view.sortColumn -Descending $view.descending), $c[1]) }
     $load = New-MainButton -Text 'Load chats' -X 0 -Width 140; $load.Size = New-Object System.Drawing.Size(140, 36); $load.BackColor = $s.Accent; $load.ForeColor = [System.Drawing.Color]::White
     $list.Controls.Add($load)
     $panel.Controls.Add($list)
@@ -296,7 +296,7 @@ function New-HarnessChatPanel {
     Set-MainRightEdge -Control $refresh -Margin 12; Set-MainRightEdge -Control $search -Margin 100
     $panel.Controls.Add($head)
 
-    $ctx = @{ Harness = $Harness; GetProfile = $GetProfile; Panel = $panel; List = $list; Search = $search; Status = $status; Title = $title; Buttons = $buttons; Refresh = $refresh
+    $ctx = @{ Harness = $Harness; GetProfile = $GetProfile; Panel = $panel; List = $list; Search = $search; Status = $status; Title = $title; Buttons = $buttons; ButtonBar = $bar; Refresh = $refresh
               LoadButton = $load; ShowBox = $showBox; View = $view; Profile = $null; Views = @(); Busy = $false }
     $list.Add_SelectedIndexChanged({ Update-ChatButtons -Ctx $ctx }.GetNewClosure())
     $list.Add_DoubleClick({ Invoke-ChatPanelAction -Ctx $ctx -Name 'Continue' }.GetNewClosure())
@@ -309,6 +309,7 @@ function New-HarnessChatPanel {
     }.GetNewClosure())
     foreach ($b in $refresh, $load) { $b.Tag = 'Load'; $b.Add_Click({ Invoke-ChatPanelAction -Ctx $ctx -Name 'Load' }.GetNewClosure()) }
     foreach ($n in $buttons.Keys) { $buttons[$n].Tag = $n; $buttons[$n].Add_Click({ Invoke-ChatPanelAction -Ctx $ctx -Name $this.Tag }.GetNewClosure()) }
+    if (Get-Command Add-MirrorChatContextMenu -ErrorAction SilentlyContinue) { Add-MirrorChatContextMenu -Ctx $ctx }
     return $ctx
 }
 
@@ -367,13 +368,14 @@ function Update-ChatPanel {
     foreach ($v in $rows) {
         $it = New-Object System.Windows.Forms.ListViewItem($v.Title)
         $it.ImageKey = $v.ImageKey; $it.Tag = $v; $it.UseItemStyleForSubItems = $false
-        foreach ($t in $v.Folder, $v.When, $v.DriveText) { [void]$it.SubItems.Add($t) }
+        $mirrorText = $(if (Get-Command Get-MirrorChatStatusText -ErrorAction SilentlyContinue) { Get-MirrorChatStatusText -Harness $Ctx.Harness.Name -Chat $v.Chat } else { '' })
+        foreach ($t in $v.Folder, $v.When, $v.DriveText, $mirrorText) { [void]$it.SubItems.Add($t) }
         if ($v.CwdMissing) { $it.SubItems[1].ForeColor = [System.Drawing.Color]::FromArgb(200, 100, 10); $it.ToolTipText = $v.Tooltip }
         [void]$Ctx.List.Items.Add($it)
         if ($keep -and [string]$v.Chat.ChatId -eq $keep) { $it.Selected = $true }
     }
     $i = 0
-    foreach ($n in 'Title', 'Folder', 'Last active', 'Drive') { $Ctx.List.Columns[$i].Text = Get-ChatColumnHeader -Name $n -SortColumn $Ctx.View.sortColumn -Descending $Ctx.View.descending; $i++ }
+    foreach ($n in 'Title', 'Folder', 'Last active', 'Drive', 'Mirror') { $Ctx.List.Columns[$i].Text = Get-ChatColumnHeader -Name $n -SortColumn $Ctx.View.sortColumn -Descending $Ctx.View.descending; $i++ }
     $Ctx.List.EndUpdate()
     Update-ChatButtons -Ctx $Ctx
 }

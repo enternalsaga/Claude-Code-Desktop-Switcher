@@ -106,7 +106,8 @@ function Format-McpProcessArguments {
 function Invoke-McpDefaultRun {
     param(
         [Parameter(Mandatory)][string]$Exe,
-        [string[]]$ArgList = @()
+        [string[]]$ArgList = @(),
+        [int]$TimeoutMs = 60000
     )
     $resolved = $null
     if ([IO.Path]::IsPathRooted($Exe) -and (Test-Path -LiteralPath $Exe -PathType Leaf)) {
@@ -138,8 +139,12 @@ function Invoke-McpDefaultRun {
     try {
         $outTask = $proc.StandardOutput.ReadToEndAsync()
         $errTask = $proc.StandardError.ReadToEndAsync()
-        $proc.WaitForExit()
-        [Threading.Tasks.Task]::WaitAll(@([Threading.Tasks.Task]$outTask, [Threading.Tasks.Task]$errTask))
+        if (-not $proc.WaitForExit($TimeoutMs)) {
+            try { & taskkill.exe /T /F /PID $proc.Id 2>$null | Out-Null } catch { }
+            try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+            throw "timeout: $Exe"
+        }
+        [void][Threading.Tasks.Task]::WaitAll(@([Threading.Tasks.Task]$outTask, [Threading.Tasks.Task]$errTask), 5000)
         return @{ ExitCode = [int]$proc.ExitCode; StdOut = [string]$outTask.Result; StdErr = [string]$errTask.Result }
     } finally {
         $proc.Dispose()
@@ -228,6 +233,7 @@ function Resolve-McpCliState {
     try {
         $res = & $Run $Exe $ArgList
     } catch {
+        if ($_.Exception.Message -like 'timeout:*') { throw }
         return 'no-cli'
     }
     if ($null -eq $res -or [int]$res.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$res.StdOut)) {

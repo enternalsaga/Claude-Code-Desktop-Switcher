@@ -208,6 +208,16 @@ function New-MainTabPage {
     return $p
 }
 
+function Add-McpBridgeButton {
+    param([Parameter(Mandatory)]$ChatCtx)
+    if (-not $ChatCtx.ButtonBar) { return }
+    $b = New-MainButton -Text 'MCP bridge...' -X 624 -Width 112
+    $ChatCtx.ButtonBar.Controls.Add($b)
+    Set-MainRightEdge -Control $b -Margin 12
+    $b.Add_Click({ if (Get-Command Show-McpBridgeDialog -ErrorAction SilentlyContinue) { Show-McpBridgeDialog -Owner (Get-MainState).Form } })
+    $ChatCtx.McpButton = $b
+}
+
 # Fills the Codex or Antigravity tab: profiles on top, chats below, or a note when the harness is not installed.
 function Add-HarnessTabContent {
     param([Parameter(Mandatory)][string]$Key, [Parameter(Mandatory)]$Page)
@@ -219,6 +229,7 @@ function Add-HarnessTabContent {
     $profiles = New-HarnessProfilePanel -Harness $h
     $getProfile = { Get-HarnessProfileSelection -Ctx $profiles }.GetNewClosure()
     $chats = New-HarnessChatPanel -Harness $h -GetProfile $getProfile
+    Add-McpBridgeButton -ChatCtx $chats
     $Page.Controls.Add($chats.Panel); $Page.Controls.Add($profiles.Panel)
     $st.Panels[$Key] = $chats; $st.Profiles[$Key] = $profiles
     $reload = New-MainDebounce -Action { if ((& $getProfile) -and [string](& $getProfile).Id -ne [string]$chats.Profile.Id) { Update-ChatPanel -Ctx $chats } }.GetNewClosure()
@@ -239,6 +250,7 @@ function Add-ClaudeTabContent {
     $lv = $Controls | Where-Object { $_ -is [System.Windows.Forms.ListView] } | Select-Object -First 1
     $getProfile = { if ($lv -and $lv.SelectedItems.Count) { $lv.SelectedItems[0].Tag } else { $null } }.GetNewClosure()
     $chats = New-HarnessChatPanel -Harness $h -GetProfile $getProfile
+    Add-McpBridgeButton -ChatCtx $chats
     $Page.Controls.Add($chats.Panel); $Page.Controls.Add($legacy)
     $st.Panels['claude'] = $chats
     if ($lv) {
@@ -291,6 +303,9 @@ function Convert-SwitcherToTabs {
         }.GetNewClosure())
         $Form.ResumeLayout($true)
         try { Update-MainTab } catch { Write-HarnessLog "Main window: first draw failed: $($_.Exception.Message)" }
+        if (Get-Command Start-MirrorService -ErrorAction SilentlyContinue) {
+            try { Start-MirrorService -Form $Form } catch { Write-HarnessLog "Main window: live mirror failed: $($_.Exception.Message)" }
+        }
     } catch {
         try { Write-HarnessLog "Tabbed main window failed, the old window stays: $($_.Exception.Message)" } catch { }
         try { Restore-SwitcherForm -Form $Form -Snapshot $snap } catch { }
