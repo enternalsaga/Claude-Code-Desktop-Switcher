@@ -169,7 +169,8 @@ Tên server: `harness-transcripts`. Lệnh: `node <đường dẫn tuyệt đố
 - **Nghiệm thu thủ công (owner)**:
   - A1: đăng ký MCP, mở phiên mới trong Antigravity, hỏi "đọc 5 lượt cuối phiên Claude đang mở ở repo này". Kết quả phải đúng nội dung vừa chat bên Claude, cập nhật sau mỗi lượt.
   - A2: ghim một phiên Claude, chat thêm, file mirror cập nhật trong vòng khoảng 3 giây; "Reflect sang Codex" mở thread mới với prompt trỏ tới file.
-  - A3: bật "Đồng bộ sang Codex", chat thêm bên Claude, sau khoảng 60 giây Codex có lượt mới. Rồi mở thread đó trong Codex, chat thêm bên Claude, dòng ghim hiện `skipped` kèm hướng dẫn.
+  - A3: bật "Đồng bộ sang Codex", chat thêm bên Claude, sau khoảng 60 giây Codex có lượt mới. Rồi **trả lời một lượt ngay trong thread đã import ở Codex**, chat thêm bên Claude, chờ 60 giây: dòng ghim hiện `Codex skipped: ...`.
+    - Sửa ngày 2026-11-26, sau lần nghiệm thu đầu: chỉ **mở** thread trong Codex desktop thì không gây `skipped`. `append_existing_session` của Codex chỉ coi là "active" những thread nằm trong ThreadManager của chính app-server đó, mà switcher import qua một tiến trình `codex app-server` riêng. Khi đó Codex vẫn nối thêm, và cột hiện `Synced to Codex HH:mm`. `skipped` chỉ xảy ra khi thread đích đã lệch trên đĩa (có người trả lời trong Codex) hoặc đã bị lưu trữ. Nguồn: `docs/reports/261125-2200-xreflect-lane-accept-fix-agy.md` mục 3(d).
 
 ## 8. Spike cần chạy trước khi viết plan chi tiết
 
