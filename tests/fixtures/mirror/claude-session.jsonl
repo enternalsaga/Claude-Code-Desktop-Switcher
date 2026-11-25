@@ -1,0 +1,6 @@
+{"type":"queue-operation","operation":"enqueue"}
+{"type":"user","timestamp":"2026-11-25T10:00:00Z","message":{"role":"user","content":"Check config with sk-FakeClaudeSecretValueXYZ please."}}
+{"type":"assistant","timestamp":"2026-11-25T10:00:01Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"internal thought"},{"type":"text","text":"Running check."},{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"echo ok"}}]}}
+{"type":"user","timestamp":"2026-11-25T10:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"ok"}]}}
+{"type":"user","timestamp":"2026-11-25T10:00:03Z","message":{"role":"user","content":"Summarize status."}}
+{"type":"assistant","timestamp":"2026-11-25T10:00:04Z","message":{"role":"assistant","content":[{"type":"text","text":"Claude final answer."}]}}
