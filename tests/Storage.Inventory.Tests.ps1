@@ -439,7 +439,8 @@ try {
         @{ name = 'activity-numeric-variants'; json = '{"title":"NumAct","lastActivityAt":42,"createdAt":123.0}' },
         @{ name = 'nested-no-leak'; json = '{"outer":{"cliSessionId":"leak","title":"LeakTitle","cwd":"C:\\leak","lastActivityAt":999,"createdAt":888},"arr":[{"title":"ArrLeak"}]}' },
         @{ name = 'unicode-raw-and-escaped'; json = ('{"title":"  ' + $uniTitle + '  ","cwd":"' + $uniCwd.Replace('\', '\\') + '","originCwd":"\\u0041\\u0042"}') },
-        @{ name = 'unicode-escape'; json = '{"title":"Caf\u00e9 \u65e5\u672c","cwd":"C:\\\\work\\\\\u0111\u1ed3"}' }
+        @{ name = 'unicode-escape'; json = '{"title":"Caf\u00e9 \u65e5\u672c","cwd":"C:\\\\work\\\\\u0111\u1ed3"}' },
+        @{ name = 'key-case-insensitive'; json = '{"CliSessionId":"c9","Title":"CaseTitle","CWD":"C:\\case","LastActivityAt":5,"CREATEDAT":4}' }
     )
     foreach ($mc in $metaCases) {
         $mp = Join-Path $metaDir ($mc.name + '.json')
@@ -457,7 +458,8 @@ try {
         @{ name = 'bad-json.json'; body = '{ not json' },
         @{ name = 'bad-empty.json'; body = '' },
         @{ name = 'bad-ws.json'; body = "  `r`n " },
-        @{ name = 'bad-array.json'; body = '[{"title":"x"}]' }
+        @{ name = 'bad-array.json'; body = '[{"title":"x"}]' },
+        @{ name = 'bad-dup-case.json'; body = '{"title":"a","Title":"b"}' }
     )) {
         $bp = Join-Path $metaDir $badCase.name
         Write-Text $bp $badCase.body

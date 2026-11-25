@@ -74,8 +74,10 @@ function Read-StorageLocalMeta {
         $script:StorageLocalJson = New-Object Web.Script.Serialization.JavaScriptSerializer
         $script:StorageLocalJson.MaxJsonLength = [int]::MaxValue
     }
-    $o = $script:StorageLocalJson.DeserializeObject($text)
-    if ($o -isnot [Collections.IDictionary]) { throw 'the file is not a JSON object' }
+    $d = $script:StorageLocalJson.DeserializeObject($text)
+    if ($d -isnot [Collections.IDictionary]) { throw 'the file is not a JSON object' }
+    $o = @{}   # case-insensitive keys, like ConvertFrom-Json, which also rejects keys that differ only in case
+    foreach ($k in $d.Keys) { if ($o.ContainsKey($k)) { throw "duplicated key '$k'" }; $o[$k] = $d[$k] }
     $act = $null; $created = $null
     $v = $o['lastActivityAt']; if ($v -is [ValueType] -and $v -isnot [bool] -and $v -isnot [datetime]) { $act = [long]$v }
     $v = $o['createdAt']; if ($v -is [ValueType] -and $v -isnot [bool] -and $v -isnot [datetime]) { $created = [long]$v }
