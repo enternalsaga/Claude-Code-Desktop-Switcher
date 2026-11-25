@@ -48,6 +48,12 @@ function validateHarness(harness, required = false) {
 
 function validateUuid(id) {
   if (typeof id !== 'string' || !UUID_RE.test(id)) {
+    if (typeof id === 'string' && id.startsWith('local_')) {
+      throw makeError(
+        'invalid-id',
+        `Invalid session id "${id}": Claude Desktop "local_" ids are not MCP session ids. Call list_sessions and use its id.`,
+      );
+    }
     throw makeError('invalid-id', `Invalid session id: ${id}`);
   }
 }

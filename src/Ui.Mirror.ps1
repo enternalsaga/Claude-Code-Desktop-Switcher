@@ -5,18 +5,23 @@ function Get-MirrorField {
     param($Obj, [string]$Name, $Default = $null)
     if ($null -eq $Obj) { return $Default }
     if ($Obj -is [System.Collections.IDictionary]) { if ($Obj.Contains($Name)) { return $Obj[$Name] }; return $Default }
-    $p = $Obj.PSObject.Properties[$Name]
-    if ($p) { return $p.Value }
-    return $Default
+    $p = $Obj.PSObject.Properties[$Name]; if ($p) { return $p.Value }; return $Default
 }
 
 function Format-MirrorTimeHHmm {
     param($Value)
     if ($null -eq $Value) { return '' }
     if ($Value -is [datetime]) { return $(if ($Value.Kind -eq [DateTimeKind]::Utc) { $Value.ToLocalTime() } else { $Value }).ToString('HH:mm') }
-    $dto = [datetimeoffset]::MinValue
-    if ([datetimeoffset]::TryParse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$dto)) { return $dto.ToLocalTime().ToString('HH:mm') }
+    $dto = [datetimeoffset]::MinValue; if ([datetimeoffset]::TryParse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$dto)) { return $dto.ToLocalTime().ToString('HH:mm') }
     return ''
+}
+
+function ConvertTo-MirrorUtcDateTime {
+    param($Value)
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
+    if ($Value -is [datetime]) { return $(if ($Value.Kind -eq [DateTimeKind]::Utc) { $Value } else { $Value.ToUniversalTime() }) }
+    $dto = [datetimeoffset]::MinValue; if ([datetimeoffset]::TryParse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$dto)) { return $dto.UtcDateTime }
+    return $null
 }
 
 function Get-MirrorStatusText {
@@ -28,11 +33,17 @@ function Get-MirrorStatusText {
     $syncOn = [bool](Get-MirrorField $Pin 'codexSync' $false)
     $syncStatus = [string](Get-MirrorField $Pin 'codexSyncStatus' '')
     if ($syncOn -and $syncStatus) {
-        switch ($syncStatus) {
-            { $_ -in 'imported', 'exists' } { $t = Format-MirrorTimeHHmm (Get-MirrorField $Pin 'codexSyncAt'); return $(if ($t) { "Synced to Codex $t" } else { 'Synced to Codex' }) }
-            'skipped'      { return 'Codex skipped: close the thread in Codex or stop chatting there, then retry' }
-            'not-detected' { return 'Codex did not detect the session (folder gone?)' }
-            'error'        { $se = [string](Get-MirrorField $Pin 'codexSyncError' ''); return $(if ($se) { $se } else { 'Codex sync error' }) }
+        if ($syncStatus -eq 'error') { $se = [string](Get-MirrorField $Pin 'codexSyncError' ''); return $(if ($se) { $se } else { 'Codex sync error' }) }
+        $base = switch ($syncStatus) {
+            { $_ -in 'imported', 'exists' } { $t = Format-MirrorTimeHHmm (Get-MirrorField $Pin 'codexSyncAt'); $(if ($t) { "Synced to Codex $t" } else { 'Synced to Codex' }) }
+            'skipped'      { 'Codex skipped: close the thread in Codex or stop chatting there, then retry' }
+            'not-detected' { 'Codex did not detect the session (folder gone?)' }
+            default        { '' }
+        }
+        if ($base) {
+            $uDt = ConvertTo-MirrorUtcDateTime (Get-MirrorField $Pin 'updatedAt'); $sDt = ConvertTo-MirrorUtcDateTime (Get-MirrorField $Pin 'codexSyncAt')
+            $pend = [bool](Get-MirrorField $Pin 'codexSyncPending' $false) -or ($null -ne $uDt -and $null -ne $sDt -and $uDt -gt $sDt)
+            return $(if ($pend) { "$base (pending)" } else { $base })
         }
     }
     $u = Format-MirrorTimeHHmm (Get-MirrorField $Pin 'updatedAt')
@@ -47,24 +58,15 @@ function Get-ReflectTargets {
 function Test-CodexSyncDue {
     param($Pin, $LastEventAt = $null, $LastErrorAt = $null, [datetime]$Now = [datetime]::UtcNow, [int]$QuietSec = 60, [int]$ErrorBackoffSec = 300, [bool]$Busy = $false)
     if ($Busy -or $null -eq $Pin -or $null -eq $LastEventAt) { return $false }
-    if ([string](Get-MirrorField $Pin 'harness' '') -ine 'claude') { return $false }
-    if (-not [bool](Get-MirrorField $Pin 'codexSync' $false)) { return $false }
-    if ([string](Get-MirrorField $Pin 'state' 'ok') -ne 'ok') { return $false }
+    if ([string](Get-MirrorField $Pin 'harness' '') -ine 'claude' -or -not [bool](Get-MirrorField $Pin 'codexSync' $false) -or [string](Get-MirrorField $Pin 'state' 'ok') -ne 'ok') { return $false }
     $utcNow = $Now.ToUniversalTime()
     $ev = $(if ($LastEventAt -is [datetime]) { $LastEventAt.ToUniversalTime() } else { ([datetime]$LastEventAt).ToUniversalTime() })
     if (($utcNow - $ev).TotalSeconds -lt $QuietSec) { return $false }
-    if ($null -ne $LastErrorAt) {
-        $er = $(if ($LastErrorAt -is [datetime]) { $LastErrorAt.ToUniversalTime() } else { ([datetime]$LastErrorAt).ToUniversalTime() })
-        if (($utcNow - $er).TotalSeconds -lt $ErrorBackoffSec) { return $false }
-    }
+    if ($null -ne $LastErrorAt) { $er = $(if ($LastErrorAt -is [datetime]) { $LastErrorAt.ToUniversalTime() } else { ([datetime]$LastErrorAt).ToUniversalTime() }); if (($utcNow - $er).TotalSeconds -lt $ErrorBackoffSec) { return $false } }
     return $true
 }
 
-function Test-McpCodexPathSafe {
-    param([AllowNull()][string]$Path)
-    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
-    return ($Path -notmatch '[&%\^!"<>|]')
-}
+function Test-McpCodexPathSafe { param([AllowNull()][string]$Path) if ([string]::IsNullOrWhiteSpace($Path)) { return $false }; return ($Path -notmatch '[&%\^!"<>|]') }
 
 function Get-McpDialogRows {
     param([AllowNull()][AllowEmptyCollection()][array]$States = @(), $NodeCheck = $null, [AllowNull()][string]$ServerPath = '')
@@ -113,11 +115,7 @@ function Invoke-McpTargetAction {
             'antigravity' { Register-McpAgy -Spec $Spec -Now $Now @cfgArg }
         }
     } else {
-        switch ($Row.Harness) {
-            'claude'      { Unregister-McpClaude @runArg }
-            'codex'       { Unregister-McpCodex -Profile $Row.Profile @runArg }
-            'antigravity' { Unregister-McpAgy -Now $Now @cfgArg }
-        }
+        switch ($Row.Harness) { 'claude' { Unregister-McpClaude @runArg }; 'codex' { Unregister-McpCodex -Profile $Row.Profile @runArg }; 'antigravity' { Unregister-McpAgy -Now $Now @cfgArg } }
     }
 }
 
@@ -166,14 +164,16 @@ function Get-MirrorRuntime {
 
 function Get-MirrorChatStatusText {
     param([Parameter(Mandatory)][string]$Harness, [Parameter(Mandatory)]$Chat)
-    $svc = Get-MirrorServiceState; $id = [string](Get-MirrorField $Chat 'ChatId' '')
-    if (-not $id) { return '' }
-    $k = Get-MirrorKey -Harness $Harness -Id $id
-    $pin = $svc.Pins | Where-Object { (Get-MirrorKey $_.harness $_.id) -eq $k } | Select-Object -First 1
+    $svc = Get-MirrorServiceState; $id = [string](Get-MirrorField $Chat 'ChatId' ''); if (-not $id) { return '' }
+    $k = Get-MirrorKey -Harness $Harness -Id $id; $pin = $svc.Pins | Where-Object { (Get-MirrorKey $_.harness $_.id) -eq $k } | Select-Object -First 1
     if (-not $pin) { return '' }
     $rt = Get-MirrorRuntime -Svc $svc -Key $k
+    $pSt = [string](Get-MirrorField $pin 'codexSyncStatus' ''); $pAt = Get-MirrorField $pin 'codexSyncAt'; $pErr = [string](Get-MirrorField $pin 'codexSyncError' '')
+    $pDt = ConvertTo-MirrorUtcDateTime $pAt; $rDt = ConvertTo-MirrorUtcDateTime $rt.codexSyncAt
+    $useRt = [bool]($rt.codexSyncStatus -and ((-not $pSt) -or ($null -eq $pDt) -or ($null -ne $rDt -and $rDt -ge $pDt)))
     return (Get-MirrorStatusText -Pin ([pscustomobject]@{ state = $pin.state; updatedAt = $rt.updatedAt; error = $rt.error; codexSync = $pin.codexSync
-        codexSyncStatus = $rt.codexSyncStatus; codexSyncAt = $rt.codexSyncAt; codexSyncError = $rt.codexSyncError }))
+        codexSyncStatus = $(if ($useRt) { $rt.codexSyncStatus } else { $pSt }); codexSyncAt = $(if ($useRt) { $rt.codexSyncAt } else { $pAt })
+        codexSyncError = $(if ($useRt) { $rt.codexSyncError } else { $pErr }); codexSyncPending = [bool]$rt.needsCodexSync }))
 }
 
 function New-MirrorRunspace {
@@ -206,18 +206,21 @@ function Start-MirrorCodexSyncJob {
 }
 
 function Complete-MirrorCodexJobs {
-    param([Parameter(Mandatory)]$Svc)
+    param([Parameter(Mandatory)]$Svc, [datetime]$Now = [datetime]::UtcNow)
+    $nowUtc = $Now.ToUniversalTime(); $dirty = $false
     foreach ($pk in @($Svc.CodexJobs.Keys)) {
         $job = $Svc.CodexJobs[$pk]; if (-not $job.Handle.IsCompleted) { continue }
         $Svc.CodexJobs.Remove($pk); $rt = Get-MirrorRuntime -Svc $Svc -Key $job.PinKey
         try {
             $res = @($job.PowerShell.EndInvoke($job.Handle)) | Select-Object -Last 1
-            $rt.codexSyncStatus = [string](Get-MirrorField $res 'Status' 'error')
-            $rt.codexSyncAt = [datetime]::UtcNow; $rt.codexSyncError = ''
+            $rt.codexSyncStatus = [string](Get-MirrorField $res 'Status' 'error'); $rt.codexSyncAt = $nowUtc; $rt.codexSyncError = ''
         } catch {
-            $rt.codexSyncStatus = 'error'; $rt.codexSyncError = $_.Exception.Message; $rt.lastErrorAt = [datetime]::UtcNow; $rt.needsCodexSync = $true
+            $rt.codexSyncStatus = 'error'; $rt.codexSyncAt = $nowUtc; $rt.codexSyncError = $_.Exception.Message; $rt.lastErrorAt = $nowUtc; $rt.needsCodexSync = $true
         } finally { try { if ($job.PowerShell) { $job.PowerShell.Dispose() } } catch { }; try { if ($job.Runspace) { $job.Runspace.Dispose() } } catch { } }
+        $pin = $Svc.Pins | Where-Object { (Get-MirrorKey $_.harness $_.id) -eq $job.PinKey } | Select-Object -First 1
+        if ($pin) { $pin.codexSyncStatus = $rt.codexSyncStatus; $pin.codexSyncAt = $nowUtc.ToString('o'); $pin.codexSyncError = $rt.codexSyncError; $dirty = $true }
     }
+    if ($dirty -and $Svc.Dir) { Write-MirrorPins -Pins $Svc.Pins -Dir $Svc.Dir }
 }
 
 function Stop-MirrorWatchers { param($Svc) foreach ($w in @($Svc.Watchers)) { try { $w.EnableRaisingEvents = $false; $w.Dispose() } catch { } }; $Svc.Watchers = @() }
@@ -261,25 +264,25 @@ function Export-MirrorAllPins {
 }
 
 function Invoke-MirrorServiceTick {
-    $svc = Get-MirrorServiceState
-    if (-not $svc.Started -or $svc.Exporting) { return }
-    $svc.Exporting = $true
+    param([datetime]$Now = [datetime]::UtcNow)
+    $svc = Get-MirrorServiceState; if (-not $svc.Started -or $svc.Exporting) { return }
+    $svc.Exporting = $true; $nowUtc = $Now.ToUniversalTime()
     try {
-        Complete-MirrorCodexJobs -Svc $svc
+        Complete-MirrorCodexJobs -Svc $svc -Now $nowUtc
         if ($svc.ErrorFlag) { $svc.ErrorFlag = $false; Export-MirrorAllPins -Svc $svc }
         $due = @(); [Threading.Monitor]::Enter($svc.SyncLock)
-        try { $due = @(Invoke-MirrorDue -Queue $svc.Queue -Pins $svc.Pins) } finally { [Threading.Monitor]::Exit($svc.SyncLock) }
+        try { $due = @(Invoke-MirrorDue -Queue $svc.Queue -Pins $svc.Pins -Now $nowUtc) } finally { [Threading.Monitor]::Exit($svc.SyncLock) }
         $dirty = $false
         foreach ($d in $due) {
-            $rt = Get-MirrorRuntime -Svc $svc -Key ([string]$d.Key).ToLowerInvariant()
-            if ($d.Result -eq 'written') { $rt.updatedAt = [datetime]::UtcNow; $rt.error = ''; $rt.needsCodexSync = $true; $dirty = $true }
+            $dk = ([string]$d.Key).ToLowerInvariant(); $rt = Get-MirrorRuntime -Svc $svc -Key $dk
+            $dp = $svc.Pins | Where-Object { (Get-MirrorKey $_.harness $_.id) -eq $dk } | Select-Object -First 1
+            if ($d.Result -eq 'written') { $rt.updatedAt = $nowUtc; $rt.error = ''; $dirty = $true; if ($dp -and $dp.codexSync) { $rt.needsCodexSync = $true; if (-not $rt.lastEventAt) { $rt.lastEventAt = $nowUtc } } }
             elseif ($d.Result -eq 'missing') { $dirty = $true }
             elseif ($d.Result -eq 'error') { $rt.error = [string]$d.Error; $dirty = $true }
         }
         if ($dirty -and $svc.Dir) { Write-MirrorPins -Pins $svc.Pins -Dir $svc.Dir }
-        $needSync = @($svc.Pins | Where-Object { (Get-MirrorRuntime -Svc $svc -Key (Get-MirrorKey $_.harness $_.id)).needsCodexSync })
+        $needSync = @($svc.Pins | Where-Object { $_.codexSync -and (Get-MirrorRuntime -Svc $svc -Key (Get-MirrorKey $_.harness $_.id)).needsCodexSync })
         if ($needSync.Count -gt 0) {
-            $nowUtc = [datetime]::UtcNow
             if ($null -eq $svc.CodexProfilesAt -or ($nowUtc - $svc.CodexProfilesAt).TotalSeconds -ge 30) {
                 $getter = $(if ($svc.GetCodexProfiles) { $svc.GetCodexProfiles } elseif (Get-Command Get-CodexProfiles -ErrorAction SilentlyContinue) { { Get-CodexProfiles } } else { $null })
                 $svc.CodexProfiles = $(if ($getter) { @(& $getter) } else { @() }); $svc.CodexProfilesAt = $nowUtc
@@ -288,7 +291,7 @@ function Invoke-MirrorServiceTick {
                 $rt = Get-MirrorRuntime -Svc $svc -Key (Get-MirrorKey $pin.harness $pin.id)
                 $cp = $svc.CodexProfiles | Where-Object { $_.Id -eq $pin.codexProfileId } | Select-Object -First 1
                 if (-not $cp) { $cp = $svc.CodexProfiles | Where-Object { $_.IsDefault } | Select-Object -First 1 }
-                if ($cp -and (Test-CodexSyncDue -Pin $pin -LastEventAt $rt.lastEventAt -LastErrorAt $rt.lastErrorAt -Busy ($svc.CodexJobs.ContainsKey([string]$cp.Id)))) {
+                if ($cp -and (Test-CodexSyncDue -Pin $pin -LastEventAt $rt.lastEventAt -LastErrorAt $rt.lastErrorAt -Now $nowUtc -Busy ($svc.CodexJobs.ContainsKey([string]$cp.Id)))) {
                     Start-MirrorCodexSyncJob -Svc $svc -Pin $pin -CodexProfile $cp; $rt.needsCodexSync = $false
                 }
             }
@@ -364,14 +367,14 @@ function Add-MirrorChatContextMenu {
         $miReflect.DropDownItems.Clear(); $miReflect.Enabled = [bool]$pin
         if ($pin) {
             foreach ($t in @(Get-ReflectTargets -SourceHarness $Ctx.Harness.Name -Targets @(Get-HarnessTransferTargets))) {
-                $item = New-Object System.Windows.Forms.ToolStripMenuItem(('{0} / {1}' -f $t.Harness, $t.Name)); $item.Tag = @{ Pin = $pin; Target = $t }
+                $item = New-Object System.Windows.Forms.ToolStripMenuItem(('{0} / {1}' -f $t.Harness, $t.Name)); $item.Tag = @{ Pin = $pin; Target = $t; Ctx = $Ctx }
                 $item.Add_Click({
                     $tag = $this.Tag; try {
-                        if ((Export-MirrorPin -Pin $tag.Pin) -eq 'written') { (Get-MirrorRuntime -Svc (Get-MirrorServiceState) -Key (Get-MirrorKey $tag.Pin.harness $tag.Pin.id)).updatedAt = [datetime]::UtcNow; Update-MirrorPanelColumns }
+                        if ((Export-MirrorPin -Pin $tag.Pin) -eq 'written') { $nowUtc = [datetime]::UtcNow; $rt = Get-MirrorRuntime -Svc (Get-MirrorServiceState) -Key (Get-MirrorKey $tag.Pin.harness $tag.Pin.id); $rt.updatedAt = $nowUtc; $rt.error = ''; if ($tag.Pin.codexSync) { $rt.needsCodexSync = $true; $rt.lastEventAt = $nowUtc }; Update-MirrorPanelColumns }
                         $r = Invoke-MirrorReflect -Pin $tag.Pin -Target $tag.Target
-                        Show-ChatPanelResult -Ctx $Ctx -Result @{ Kind = 'message'; Text = "Reflected via $($r.Mode) to $($tag.Target.Harness) / $($tag.Target.Name)." }
-                    } catch { Show-ChatPanelResult -Ctx $Ctx -Result @{ Kind = 'error'; Text = $_.Exception.Message } }
-                }.GetNewClosure())
+                        Show-ChatPanelResult -Ctx $tag.Ctx -Result @{ Kind = 'message'; Text = "Reflected via $($r.Mode) to $($tag.Target.Harness) / $($tag.Target.Name)." }
+                    } catch { Show-ChatPanelResult -Ctx $tag.Ctx -Result @{ Kind = 'error'; Text = $_.Exception.Message } }
+                })
                 [void]$miReflect.DropDownItems.Add($item)
             }
         }
@@ -393,7 +396,10 @@ function Add-MirrorChatContextMenu {
             $profs = @(Get-CodexProfiles); $picked = $(if ($profs.Count -gt 1) { Show-CodexProfilePicker -Profiles $profs -Owner (Get-MainState).Form } else { $profs | Select-Object -First 1 })
             if (-not $picked) { return }; $pin.codexSync = $true; $pin.codexProfileId = [string]$picked.Id
             $rt = Get-MirrorRuntime -Svc $svc -Key $k; $rt.needsCodexSync = $true; if (-not $rt.lastEventAt) { $rt.lastEventAt = [datetime]::UtcNow }
-        } else { $pin.codexSync = $false; $pin.codexProfileId = $null }
+        } else {
+            $pin.codexSync = $false; $pin.codexProfileId = $null; $pin.codexSyncStatus = ''; $pin.codexSyncAt = $null; $pin.codexSyncError = ''
+            $rt = Get-MirrorRuntime -Svc $svc -Key $k; $rt.codexSyncStatus = ''; $rt.codexSyncAt = $null; $rt.codexSyncError = ''; $rt.needsCodexSync = $false
+        }
         Write-MirrorPins -Pins $pins -Dir $dir; Update-MirrorWatchers -Dir $dir; Update-MirrorPanelColumns
     }.GetNewClosure())
     $miOpen.Add_Click({ $v = Get-ChatPanelSelection -Ctx $Ctx; if ($v) { $p = & $getPin $v.Chat; if ($p -and $p.mirrorPath -and (Test-Path -LiteralPath $p.mirrorPath -PathType Leaf)) { Start-Process -FilePath $p.mirrorPath } } }.GetNewClosure())
@@ -414,18 +420,13 @@ function Get-McpBackgroundFunctionNames {
 function Invoke-McpStepWithTimeout {
     param([Parameter(Mandatory)][scriptblock]$Script, [hashtable]$Arguments = @{}, [string[]]$FunctionNames = @(), [int]$TimeoutMs = 60000)
     $rs = New-MirrorRunspace -FunctionNames $FunctionNames; $ps = [powershell]::Create(); $ps.Runspace = $rs
-    [void]$ps.AddScript($Script.ToString()).AddArgument($Arguments)
-    $handle = $ps.BeginInvoke()
+    [void]$ps.AddScript($Script.ToString()).AddArgument($Arguments); $handle = $ps.BeginInvoke()
     if (-not $handle.AsyncWaitHandle.WaitOne($TimeoutMs)) {
-        try { $ps.Stop() } catch { }
-        try { $ps.Dispose() } catch { }; try { $rs.Dispose() } catch { }
+        try { $ps.Stop() } catch { }; try { $ps.Dispose() } catch { }; try { $rs.Dispose() } catch { }
         return @{ TimedOut = $true; Result = $null; Error = 'Timed out' }
     }
     try { return @{ TimedOut = $false; Result = (@($ps.EndInvoke($handle)) | Select-Object -Last 1); Error = $null } }
-    catch {
-        if ($_.Exception.Message -like 'timeout:*') { return @{ TimedOut = $true; Result = $null; Error = 'Timed out' } }
-        return @{ TimedOut = $false; Result = $null; Error = $_.Exception.Message }
-    }
+    catch { if ($_.Exception.Message -like 'timeout:*') { return @{ TimedOut = $true; Result = $null; Error = 'Timed out' } }; return @{ TimedOut = $false; Result = $null; Error = $_.Exception.Message } }
     finally { try { $ps.Dispose() } catch { }; try { $rs.Dispose() } catch { } }
 }
 
@@ -459,27 +460,33 @@ function Start-McpDialogJob {
     return [pscustomobject]@{ Mode = $Mode; PowerShell = $ps; Runspace = $rs; Handle = $ps.BeginInvoke() }
 }
 
+function Get-McpPostActionStatus {
+    param([string]$Action = '', $Outcomes = $null)
+    if ($Action -eq 'register' -and $Outcomes -and $Outcomes.ContainsKey('antigravity') -and $Outcomes['antigravity'].State -eq 'ok') { return (Get-McpRegisterNote -Target 'antigravity') }
+    return 'Ready.'
+}
+
 function New-McpBridgeForm {
     param($Owner = $null, [scriptblock]$ProbeRunner = $null)
     $s = Get-MainUiStyle; $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = 'MCP bridge (harness-transcripts)'; $dlg.Size = New-Object System.Drawing.Size(780, 420)
     $dlg.StartPosition = 'CenterParent'; $dlg.FormBorderStyle = 'FixedDialog'; $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false; $dlg.BackColor = $s.Bg
-    $list = New-Object System.Windows.Forms.ListView; $list.View = 'Details'; $list.CheckBoxes = $true; $list.FullRowSelect = $true
+    $list = New-Object System.Windows.Forms.ListView; $list.View = 'Details'; $list.CheckBoxes = $true; $list.FullRowSelect = $true; $list.ShowItemToolTips = $true
     $list.Location = New-Object System.Drawing.Point(12, 12); $list.Size = New-Object System.Drawing.Size(740, 270)
-    foreach ($c in @(@('Target', 140), @('State', 90), @('Changes', 210), @('Note', 160), @('Reason', 130))) { [void]$list.Columns.Add($c[0], $c[1]) }
+    foreach ($c in @(@('Target', 140), @('State', 80), @('Changes', 180), @('Note', 230), @('Reason', 110))) { [void]$list.Columns.Add($c[0], $c[1]) }
     $status = New-Object System.Windows.Forms.Label; $status.Location = New-Object System.Drawing.Point(12, 290); $status.Size = New-Object System.Drawing.Size(740, 24); $status.ForeColor = $s.Muted; $status.Text = 'Working...'
     $btnReg = New-MainButton -Text 'Register selected' -X 12 -Width 140; $btnReg.Location = New-Object System.Drawing.Point(12, 326); $btnReg.Enabled = $false
     $btnRem = New-MainButton -Text 'Remove selected' -X 162 -Width 140; $btnRem.Location = New-Object System.Drawing.Point(162, 326); $btnRem.Enabled = $false
     $btnClose = New-MainButton -Text 'Close' -X 642 -Width 110; $btnClose.Location = New-Object System.Drawing.Point(642, 326); $btnClose.DialogResult = 'Cancel'
     foreach ($c in $list, $status, $btnReg, $btnRem, $btnClose) { $dlg.Controls.Add($c) }; $dlg.CancelButton = $btnClose
-    $ctx = @{ Form = $dlg; List = $list; Status = $status; RegisterButton = $btnReg; RemoveButton = $btnRem; Job = $null; Rows = @(); Spec = $null; ServerPath = (Get-McpServerPath); Timer = $null; LastOutcomes = $null }
+    $ctx = @{ Form = $dlg; List = $list; Status = $status; RegisterButton = $btnReg; RemoveButton = $btnRem; Job = $null; Rows = @(); Spec = $null; ServerPath = (Get-McpServerPath); Timer = $null; LastOutcomes = $null; LastAction = '' }
     $fill = {
         param($rows, $outcomes)
         $list.BeginUpdate(); $list.Items.Clear()
         foreach ($r in @($rows)) {
             if ($outcomes -and $outcomes.ContainsKey($r.Key) -and $outcomes[$r.Key].State -eq 'timeout') { $r.State = 'timeout'; $r.Reason = 'Timed out' }
             elseif ($outcomes -and $outcomes.ContainsKey($r.Key) -and $outcomes[$r.Key].Reason) { $r.Reason = $outcomes[$r.Key].Reason }
-            $it = New-Object System.Windows.Forms.ListViewItem([string]$r.Name); $it.Tag = $r; $it.Checked = [bool]$r.Checked
+            $it = New-Object System.Windows.Forms.ListViewItem([string]$r.Name); $it.Tag = $r; $it.Checked = [bool]$r.Checked; $it.ToolTipText = [string]$r.Note
             foreach ($v in $r.State, $r.Changes, $r.Note, $r.Reason) { [void]$it.SubItems.Add([string]$v) }; [void]$list.Items.Add($it)
         }
         $list.EndUpdate(); $btnReg.Enabled = [bool](@($rows | Where-Object { $_.CanRegister }).Count); $btnRem.Enabled = [bool](@($rows | Where-Object { $_.CanRemove }).Count)
@@ -496,7 +503,7 @@ function New-McpBridgeForm {
             $res = @($j.PowerShell.EndInvoke($j.Handle)) | Select-Object -Last 1
             if ($j.Mode -eq 'probe') {
                 $ctx.Rows = @($res.Rows); if ($res.NodeCheck -and $res.NodeCheck.Ok -and $ctx.ServerPath) { $ctx.Spec = Get-McpServerSpec -ServerPath $ctx.ServerPath -NodePath 'node' }
-                $out = $ctx.LastOutcomes; $ctx.LastOutcomes = $null; & $fill $ctx.Rows $out; $status.Text = 'Ready.'
+                $out = $ctx.LastOutcomes; $act = $ctx.LastAction; $ctx.LastOutcomes = $null; $ctx.LastAction = ''; & $fill $ctx.Rows $out; $status.Text = Get-McpPostActionStatus -Action $act -Outcomes $out
             } else { $ctx.LastOutcomes = $res.Outcomes; & $startProbe }
         } catch { $status.Text = $_.Exception.Message } finally { try { $j.PowerShell.Dispose() } catch { }; try { $j.Runspace.Dispose() } catch { } }
     }.GetNewClosure())
@@ -505,7 +512,7 @@ function New-McpBridgeForm {
         $picked = @($list.Items | Where-Object { $_.Checked } | ForEach-Object { $_.Tag } | Where-Object { if ($mode -eq 'register') { $_.CanRegister } else { $_.CanRemove } })
         if (-not $picked.Count -or ($mode -eq 'register' -and -not $ctx.Spec)) { return }
         $specArg = $(if ($ctx.Spec) { $ctx.Spec } else { @{ command = 'node'; args = @() } })
-        $ctx.LastOutcomes = $null; $status.Text = 'Working...'; $btnReg.Enabled = $false; $btnRem.Enabled = $false
+        $ctx.LastOutcomes = $null; $ctx.LastAction = $mode; $status.Text = 'Working...'; $btnReg.Enabled = $false; $btnRem.Enabled = $false
         $ctx.Job = Start-McpDialogJob -Mode $mode -Targets $picked -Spec $specArg -ServerPath ([string]$ctx.ServerPath)
     }.GetNewClosure()
     $btnReg.Add_Click({ & $runAction 'register' }.GetNewClosure()); $btnRem.Add_Click({ & $runAction 'remove' }.GetNewClosure())

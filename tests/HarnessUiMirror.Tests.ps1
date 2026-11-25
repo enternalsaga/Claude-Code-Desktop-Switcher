@@ -34,6 +34,13 @@ try {
     Assert ((Get-MirrorStatusText -Pin ([pscustomobject]@{ state = 'ok'; updatedAt = $t1405; codexSync = $true; codexSyncStatus = 'not-detected' })) -eq 'Codex did not detect the session (folder gone?)') 'codex not-detected status'
     Assert ((Get-MirrorStatusText -Pin ([pscustomobject]@{ state = 'ok'; updatedAt = $t1405; codexSync = $true; codexSyncStatus = 'error'; codexSyncError = 'App-server failed' })) -eq 'App-server failed') 'codex error status'
 
+    # ---- display precedence (sync beats Live, pending suffix, error beats both) ----
+    Assert ((Get-MirrorStatusText -Pin ([pscustomobject]@{ state = 'ok'; updatedAt = $t1412; codexSync = $true; codexSyncStatus = 'imported'; codexSyncAt = $t1410 })) -eq 'Synced to Codex 14:10 (pending)') 'newer export appends (pending)'
+    Assert ((Get-MirrorStatusText -Pin ([pscustomobject]@{ state = 'ok'; updatedAt = $t1405; codexSync = $true; codexSyncStatus = 'imported'; codexSyncAt = $t1410; codexSyncPending = $true })) -eq 'Synced to Codex 14:10 (pending)') 'codexSyncPending appends (pending)'
+    Assert ((Get-MirrorStatusText -Pin ([pscustomobject]@{ state = 'ok'; updatedAt = $t1412; codexSync = $true; codexSyncStatus = 'skipped'; codexSyncAt = $t1410 })) -eq 'Codex skipped: close the thread in Codex or stop chatting there, then retry (pending)') 'skipped with newer export appends (pending)'
+    Assert ((Get-MirrorStatusText -Pin ([pscustomobject]@{ state = 'ok'; updatedAt = $t1412; codexSync = $true; codexSyncStatus = 'error'; codexSyncAt = $t1410; codexSyncError = 'App-server failed'; codexSyncPending = $true })) -eq 'App-server failed') 'codex error beats live and pending'
+    Assert ((Get-MirrorStatusText -Pin ([pscustomobject]@{ state = 'error'; error = 'Mirror write failed'; updatedAt = $t1412; codexSync = $true; codexSyncStatus = 'imported'; codexSyncAt = $t1410; codexSyncPending = $true })) -eq 'Mirror write failed') 'pin error beats sync status and pending'
+
     # ---- Get-ReflectTargets ----
     $targets = @(
         [pscustomobject]@{ Harness = 'claude'; Id = 'Default'; Name = 'Default'; IsDefault = $true },
@@ -239,6 +246,140 @@ try {
             }
         }
     }
+
+    # ---- reflect click handler has ctx ----
+    $clickSrc = Join-Path $fixture 'claude-click.jsonl'
+    [IO.File]::WriteAllText($clickSrc, '{"type":"user","timestamp":"t1","message":{"role":"user","content":"Click"}}' + "`n")
+    $clickMirror = Join-Path $mDir 'claude-local_click1.md'
+    $clickPin = ConvertTo-MirrorPinObject -Raw @{
+        harness = 'claude'; id = 'local_click1'; profileId = 'Default'; title = 'Click Test'; cwd = $fixture
+        sourcePath = $clickSrc; mirrorPath = $clickMirror
+    }
+    $svc = Get-MirrorServiceState
+    $svc.Pins = @($clickPin)
+    $clickForm = New-Object System.Windows.Forms.Form
+    $clickList = New-Object System.Windows.Forms.ListView
+    $clickStatus = New-Object System.Windows.Forms.Label
+    $clickForm.Controls.Add($clickList)
+    [void]$clickForm.Handle; [void]$clickList.Handle
+    $clickCtx = @{ Harness = [pscustomobject]@{ Name = 'claude' }; List = $clickList; Status = $clickStatus }
+    Add-MirrorChatContextMenu -Ctx $clickCtx
+    $origReflect = (Get-Command Invoke-MirrorReflect).ScriptBlock
+    $script:reflectCalled = 0; $script:reflectResCtx = $null; $script:reflectRes = $null
+    try {
+        function Get-ChatPanelSelection { param($Ctx) [pscustomobject]@{ Chat = [pscustomobject]@{ ChatId = 'local_click1'; Title = 'Click Test' } } }
+        function Get-HarnessTransferTargets { @([pscustomobject]@{ Harness = 'codex'; Id = 'Default'; Name = 'Default'; IsDefault = $true }) }
+        function Invoke-MirrorReflect { param($Pin, $Target) $script:reflectCalled++; [pscustomobject]@{ Mode = 'deeplink'; Prompt = 'p'; Url = 'codex://threads/new?prompt=p' } }
+        function Show-ChatPanelResult { param([Parameter(Mandatory)]$Ctx, [Parameter(Mandatory)]$Result) $script:reflectResCtx = $Ctx; $script:reflectRes = $Result }
+
+        $ce = [System.ComponentModel.CancelEventArgs]::new()
+        $clickList.ContextMenuStrip.GetType().GetMethod('OnOpening', [Reflection.BindingFlags]'NonPublic,Instance').Invoke($clickList.ContextMenuStrip, [object[]]@($ce))
+        Assert (-not $ce.Cancel) 'context menu Opening did not cancel'
+        $miReflect = $clickList.ContextMenuStrip.Items[1]
+        Assert ($miReflect.DropDownItems.Count -eq 1) "expected 1 Reflect sub-item, got $($miReflect.DropDownItems.Count)"
+        $miReflect.DropDownItems[0].PerformClick()
+        Assert ($script:reflectCalled -eq 1) "Invoke-MirrorReflect should be called once, got $($script:reflectCalled)"
+        Assert ($null -ne $script:reflectResCtx -and [object]::ReferenceEquals($script:reflectResCtx, $clickCtx)) 'Show-ChatPanelResult received non-null matching Ctx'
+        Assert ($script:reflectRes.Kind -eq 'message' -and $script:reflectRes.Text -like 'Reflected via deeplink*') "unexpected reflect result: $($script:reflectRes.Kind) / $($script:reflectRes.Text)"
+    } finally {
+        Set-Item Function:\Invoke-MirrorReflect $origReflect
+        Remove-Item Function:\Get-ChatPanelSelection, Function:\Get-HarnessTransferTargets, Function:\Show-ChatPanelResult -ErrorAction SilentlyContinue
+        (Get-MirrorServiceState).Pins = @()
+        $clickForm.Dispose()
+    }
+
+    # ---- sync status survives restart ----
+    $rstDir = Join-Path $fixture 'mirror-restart'
+    $rstSrc = Join-Path $fixture 'claude-restart.jsonl'
+    [IO.File]::WriteAllText($rstSrc, '{"type":"user","timestamp":"t1","message":{"role":"user","content":"Hello"}}' + "`n")
+    $rstMirror = Join-Path $rstDir 'claude-c-rst.md'
+    New-Item -ItemType Directory -Path $rstDir -Force | Out-Null
+    [IO.File]::WriteAllText($rstMirror, "<!-- live mirror -->`n")
+    $fiRst = Get-Item -LiteralPath $rstSrc
+    $rstPin = ConvertTo-MirrorPinObject -Raw @{
+        harness = 'claude'; id = 'c-rst'; profileId = 'Default'; title = 'Restart'; cwd = $fixture
+        sourcePath = $rstSrc; mirrorPath = $rstMirror; lastSize = [long]$fiRst.Length; lastTicks = [long]$fiRst.LastWriteTimeUtc.Ticks
+        codexSync = $true; codexProfileId = 'Default'; codexSyncStatus = 'imported'; codexSyncAt = $t1410.ToString('o'); codexSyncError = ''
+    }
+    Write-MirrorPins -Pins @($rstPin) -Dir $rstDir
+    $script:MirrorService = $null
+    $rstForm = New-Object System.Windows.Forms.Form
+    [void]$rstForm.Handle
+    try {
+        Start-MirrorService -Form $rstForm -Dir $rstDir
+        $rstText = Get-MirrorChatStatusText -Harness 'claude' -Chat ([pscustomobject]@{ ChatId = 'c-rst' })
+        Assert ($rstText -ceq 'Synced to Codex 14:10') "expected 'Synced to Codex 14:10' after restart, got '$rstText'"
+    } finally {
+        Stop-MirrorService
+        $rstForm.Dispose()
+    }
+
+    # ---- second import runs after a new turn ----
+    $turnDir = Join-Path $fixture 'mirror-turn2'
+    $turnSrc = Join-Path $fixture 'claude-turn2.jsonl'
+    [IO.File]::WriteAllText($turnSrc, '{"type":"user","timestamp":"t1","message":{"role":"user","content":"Turn 1"}}' + "`n")
+    $turnPin = ConvertTo-MirrorPinObject -Raw @{
+        harness = 'claude'; id = 'c-turn2'; profileId = 'Default'; title = 'Turn2'; cwd = $fixture
+        sourcePath = $turnSrc; mirrorPath = (Join-Path $turnDir 'claude-c-turn2.md')
+        codexSync = $true; codexProfileId = 'Default'
+    }
+    Write-MirrorPins -Pins @($turnPin) -Dir $turnDir
+    $script:MirrorService = $null
+    $turnForm = New-Object System.Windows.Forms.Form
+    [void]$turnForm.Handle
+    $origStartSync = (Get-Command Start-MirrorCodexSyncJob).ScriptBlock
+    $script:syncJobNum = 0
+    try {
+        function Start-MirrorCodexSyncJob {
+            param([Parameter(Mandatory)]$Svc, [Parameter(Mandatory)]$Pin, [Parameter(Mandatory)]$CodexProfile)
+            $script:syncJobNum++
+            $code = if ($script:syncJobNum -eq 1) { '@{ Status = "imported"; ThreadId = "t1" }' } else { '@{ Status = "skipped"; ThreadId = $null }' }
+            $ps = [powershell]::Create(); [void]$ps.AddScript($code)
+            $h = $ps.BeginInvoke(); [void]$h.AsyncWaitHandle.WaitOne(5000)
+            $Svc.CodexJobs[[string]$CodexProfile.Id] = [pscustomobject]@{
+                PinKey = (Get-MirrorKey $Pin.harness $Pin.id); ProfileId = [string]$CodexProfile.Id; PowerShell = $ps; Runspace = $null; Handle = $h
+            }
+        }
+        Start-MirrorService -Form $turnForm -Dir $turnDir -GetCodexProfiles { @([pscustomobject]@{ Id = 'Default'; Name = 'Default'; IsDefault = $true; CodexHome = $fixture }) }
+        $svc = Get-MirrorServiceState
+        $k = Get-MirrorKey 'claude' 'c-turn2'
+        $rt = Get-MirrorRuntime -Svc $svc -Key $k
+        $t0 = $rt.lastEventAt
+        Assert ($null -ne $t0 -and $rt.needsCodexSync -eq $true) 'initial startup arms first codex sync'
+
+        Invoke-MirrorServiceTick -Now $t0.AddSeconds(61)
+        Assert ($script:syncJobNum -eq 1) "first import should start after 60s quiet, got $($script:syncJobNum)"
+        Invoke-MirrorServiceTick -Now $t0.AddSeconds(62)
+        $txt1 = Get-MirrorChatStatusText -Harness 'claude' -Chat ([pscustomobject]@{ ChatId = 'c-turn2' })
+        Assert ($txt1 -like 'Synced to Codex *' -and $txt1 -notlike '* (pending)') "after 1st import: '$txt1'"
+
+        [IO.File]::AppendAllText($turnSrc, '{"type":"user","timestamp":"t2","message":{"role":"user","content":"Turn 2"}}' + "`n")
+        $t1 = $t0.AddSeconds(70)
+        Add-MirrorEvent -Queue $svc.Queue -Key $k -Now $t1
+        $rt.lastEventAt = $t1
+        Invoke-MirrorServiceTick -Now $t1.AddSeconds(3)
+        $txtPending = Get-MirrorChatStatusText -Harness 'claude' -Chat ([pscustomobject]@{ ChatId = 'c-turn2' })
+        Assert ($txtPending -like 'Synced to Codex * (pending)') "after new turn export: expected pending, got '$txtPending'"
+
+        Invoke-MirrorServiceTick -Now $t1.AddSeconds(61)
+        Assert ($script:syncJobNum -eq 2) "second import should start after 60s quiet, got $($script:syncJobNum)"
+        Invoke-MirrorServiceTick -Now $t1.AddSeconds(62)
+        $txt2 = Get-MirrorChatStatusText -Harness 'claude' -Chat ([pscustomobject]@{ ChatId = 'c-turn2' })
+        Assert ($txt2 -ceq 'Codex skipped: close the thread in Codex or stop chatting there, then retry') "after 2nd import skipped: '$txt2'"
+        $diskPins = @(Read-MirrorPins -Dir $turnDir)
+        Assert ($diskPins[0].codexSyncStatus -ceq 'skipped') "persisted codexSyncStatus should be skipped, got '$($diskPins[0].codexSyncStatus)'"
+    } finally {
+        Set-Item Function:\Start-MirrorCodexSyncJob $origStartSync
+        Stop-MirrorService
+        $turnForm.Dispose()
+    }
+
+    # ---- MCP post-action status shows Antigravity load instruction ----
+    $agyNote = Get-McpRegisterNote -Target 'antigravity'
+    Assert ((Get-McpPostActionStatus -Action 'register' -Outcomes @{ antigravity = @{ State = 'ok'; Reason = '' } }) -ceq $agyNote) 'register agy ok -> shows agy note'
+    Assert ((Get-McpPostActionStatus -Action 'register' -Outcomes @{ antigravity = @{ State = 'error'; Reason = 'boom' } }) -ceq 'Ready.') 'register agy error -> Ready.'
+    Assert ((Get-McpPostActionStatus -Action 'remove' -Outcomes @{ antigravity = @{ State = 'ok'; Reason = '' } }) -ceq 'Ready.') 'remove agy -> Ready.'
+    Assert ((Get-McpPostActionStatus -Action 'register' -Outcomes @{ claude = @{ State = 'ok'; Reason = '' } }) -ceq 'Ready.') 'register claude only -> Ready.'
 
     Write-Output 'HarnessUiMirror: OK'
 } finally {

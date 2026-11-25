@@ -131,8 +131,9 @@ try {
     }
     Assert ($mdC.Contains('[REDACTED]') -and $mdX.Contains('[REDACTED]') -and $mdA.Contains('[REDACTED]')) 'redaction marker present in all 3 mirrors'
 
-    # prompt text exact match
-    $expectedPrompt = 'Read ' + $pinC.mirrorPath + '. It updates itself after every turn of the claude chat "Claude Demo"; read it again when you need newer context. If the harness-transcripts tool is available, call read_session_tail with harness=claude id=local_c1 instead.'
+    # prompt text exact match (MCP tool route first, uses mcpId)
+    Assert ($pinC.mcpId -ceq $claudeCliId) "claude pin mcpId mismatch: $($pinC.mcpId)"
+    $expectedPrompt = 'If the harness-transcripts tool is available, call read_session_tail with harness=claude id=' + $claudeCliId + '. Otherwise read ' + $pinC.mirrorPath + '. It updates itself after every turn of the claude chat "Claude Demo"; read it again when you need newer context.'
     Assert ((New-MirrorHandoffPrompt -Pin $pinC) -ceq $expectedPrompt) "prompt text mismatch: $(New-MirrorHandoffPrompt -Pin $pinC)"
 
     # unchanged skip
@@ -269,6 +270,46 @@ try {
     $rOk = $res3 | Where-Object { $_.Key -eq 'codex:z-ok' } | Select-Object -First 1
     Assert ($rFail -and $rFail.Result -eq 'error' -and -not [string]::IsNullOrEmpty($rFail.Error) -and $rFail.Error -like '*zst reader boom*' -and $failPin.state -eq 'error') 'failing export returns error result and sets state'
     Assert ($rOk -and $rOk.Result -eq 'written' -and $okPin.state -eq 'ok' -and (Test-Path -LiteralPath $okPin.mirrorPath -PathType Leaf)) 'healthy export still writes after failing pin'
+
+    # local_<uuid> Claude chat uses transcript stem mcpId, and old pins without mcpId derive it on load
+    $mcpIdDir = Join-Path $fixture 'mirror-mcpid'
+    $localUuidChatId = 'local_e503005d-213d-41e4-8cf7-3457de519fa8'
+    $cliUuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    $cliSrc2 = Join-Path $claudeProj "$cliUuid.jsonl"
+    Copy-Item -LiteralPath (Join-Path $fixturesDir 'claude-session.jsonl') -Destination $cliSrc2
+    $claudeMeta2 = Join-Path $fixture 'local_e503005d.json'
+    [IO.File]::WriteAllText($claudeMeta2, ('{"title":"Local Prefix","cwd":"C:\\work\\demo","sessionId":"' + $localUuidChatId + '","cliSessionId":"' + $cliUuid + '"}'))
+    $claudeChat2 = [pscustomobject]@{
+        ChatId = $localUuidChatId; Title = 'Local Prefix'; Cwd = $cwd
+        Profile = [pscustomobject]@{ Id = 'Default'; Name = 'Default' }
+        Session = [pscustomobject]@{ File = (Get-Item -LiteralPath $claudeMeta2) }
+    }
+    $pinLocal = Add-MirrorPin -Harness 'claude' -Chat $claudeChat2 -Dir $mcpIdDir -ClaudeHome $claudeHome
+    Assert ($pinLocal.mcpId -ceq $cliUuid) "expected mcpId $cliUuid, got $($pinLocal.mcpId)"
+    $promptLocal = New-MirrorHandoffPrompt -Pin $pinLocal
+    Assert ($promptLocal.Contains("harness=claude id=$cliUuid")) "prompt missing mcpId: $promptLocal"
+    Assert (-not $promptLocal.Contains('id=local_')) "prompt must not use local_ id: $promptLocal"
+
+    # old pins.json without mcpId derives mcpId on Read-MirrorPins for all 3 harnesses
+    $legacyDir = Join-Path $fixture 'mirror-legacy'
+    New-Item -ItemType Directory -Path $legacyDir -Force | Out-Null
+    $legacyCodexId = 'bbbb1111-2222-3333-4444-555566667777'
+    $legacyCodexSrc = Join-Path $codexSess "rollout-2026-11-25T12-00-00-99999999-9999-9999-9999-999999999999.jsonl"
+    [IO.File]::WriteAllText($legacyCodexSrc, ('{"timestamp":"2026-11-25T12:00:00.000Z","type":"session_meta","payload":{"id":"' + $legacyCodexId + '","cwd":"C:\\work\\demo"}}' + "`n"))
+    $legacyPinsJson = ConvertTo-Json -Depth 5 -InputObject @(
+        @{ harness = 'claude'; id = $localUuidChatId; profileId = 'Default'; title = 'Old Claude'; cwd = $cwd; sourcePath = $cliSrc2; mirrorPath = (Join-Path $legacyDir 'c.md') },
+        @{ harness = 'codex'; id = '99999999-9999-9999-9999-999999999999'; profileId = 'work'; title = 'Old Codex'; cwd = $cwd; sourcePath = $legacyCodexSrc; mirrorPath = (Join-Path $legacyDir 'x.md') },
+        @{ harness = 'antigravity'; id = $agyId; profileId = 'app'; title = 'Old Agy'; cwd = $cwd; sourcePath = $agySrc; mirrorPath = (Join-Path $legacyDir 'a.md') }
+    )
+    [IO.File]::WriteAllText((Join-Path $legacyDir 'pins.json'), $legacyPinsJson, (New-Object Text.UTF8Encoding($false)))
+    $loadedLegacy = @(Read-MirrorPins -Dir $legacyDir)
+    Assert ($loadedLegacy.Count -eq 3) 'loaded 3 legacy pins'
+    Assert ($loadedLegacy[0].mcpId -ceq $cliUuid) "legacy claude mcpId: $($loadedLegacy[0].mcpId)"
+    Assert ($loadedLegacy[1].mcpId -ceq $legacyCodexId) "legacy codex mcpId from session_meta: $($loadedLegacy[1].mcpId)"
+    Assert ($loadedLegacy[2].mcpId -ceq $agyId) "legacy agy mcpId from brain folder: $($loadedLegacy[2].mcpId)"
+    Assert ((New-MirrorHandoffPrompt -Pin $loadedLegacy[0]).Contains("harness=claude id=$cliUuid")) 'legacy claude prompt uses derived mcpId'
+    Assert ((New-MirrorHandoffPrompt -Pin $loadedLegacy[1]).Contains("harness=codex id=$legacyCodexId")) 'legacy codex prompt uses derived mcpId'
+    Assert ((New-MirrorHandoffPrompt -Pin $loadedLegacy[2]).Contains("harness=antigravity id=$agyId")) 'legacy agy prompt uses derived mcpId'
 
     Write-Output 'HarnessMirror: OK'
 } finally {

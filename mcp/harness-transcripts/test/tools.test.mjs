@@ -523,3 +523,17 @@ test('includeTools string false is false', async (t) => {
   });
   assert.ok(asTrue.includes('- tool `Bash`'));
 });
+
+test('local_ id returns invalid-id mentioning list_sessions', async (t) => {
+  const tree = await makeTempTree();
+  t.after(() => fs.promises.rm(tree.base, { recursive: true, force: true }));
+
+  await assert.rejects(
+    () =>
+      readSessionTail(tree.roots, {
+        harness: 'claude',
+        id: 'local_e503005d-213d-41e4-8cf7-3457de519fa8',
+      }),
+    (err) => err.code === 'invalid-id' && err.message.includes('list_sessions'),
+  );
+});

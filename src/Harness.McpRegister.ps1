@@ -45,7 +45,7 @@ function Get-McpRegisterNote {
     $notes = @{
         claude      = 'Open a new chat in Claude to use it.'
         codex       = 'Open a new chat in Codex to use it.'
-        antigravity = 'Open a new chat in Antigravity to use it.'
+        antigravity = 'Restart Antigravity (or press Refresh in its Manage MCP Servers panel) to load it.'
     }
     return $notes[$Target]
 }

@@ -79,7 +79,7 @@ try {
 
     Assert ((Get-McpRegisterNote -Target 'claude') -ceq 'Open a new chat in Claude to use it.') 'claude note'
     Assert ((Get-McpRegisterNote -Target 'codex') -ceq 'Open a new chat in Codex to use it.') 'codex note'
-    Assert ((Get-McpRegisterNote -Target 'antigravity') -ceq 'Open a new chat in Antigravity to use it.') 'agy note'
+    Assert ((Get-McpRegisterNote -Target 'antigravity') -ceq 'Restart Antigravity (or press Refresh in its Manage MCP Servers panel) to load it.') 'agy note'
 
     # --- 4. claude add-json argv & unregister & stderr redaction ---
     $calls = New-Object Collections.ArrayList

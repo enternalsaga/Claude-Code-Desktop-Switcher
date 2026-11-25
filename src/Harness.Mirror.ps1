@@ -28,6 +28,48 @@ function Write-MirrorTextAtomic {
     }
 }
 
+function Resolve-MirrorMcpId {
+    param([string]$Harness, [string]$SourcePath, [string]$FallbackId = '')
+    $h = $(if ($Harness) { $Harness.ToLowerInvariant() } else { '' })
+    if ($SourcePath) {
+        switch ($h) {
+            'claude' {
+                $stem = [IO.Path]::GetFileNameWithoutExtension($SourcePath)
+                if ($stem) { return $stem }
+            }
+            'codex' {
+                if (-not $SourcePath.EndsWith('.zst', [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+                    $sr = $null
+                    try {
+                        $fs = [IO.File]::Open($SourcePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+                        $sr = New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)
+                        for ($i = 0; $i -lt 20 -and -not $sr.EndOfStream; $i++) {
+                            $line = $sr.ReadLine()
+                            if ($i -eq 0 -and $line) { $line = $line.TrimStart([char]0xFEFF) }
+                            if (-not $line -or -not $line.Trim()) { continue }
+                            try { $o = $line | ConvertFrom-Json } catch { continue }
+                            if ($o -and $o.type -eq 'session_meta' -and $o.payload -and $o.payload.id) { return [string]$o.payload.id }
+                        }
+                    } catch { } finally { if ($sr) { $sr.Dispose() } }
+                }
+                $leaf = [IO.Path]::GetFileName($SourcePath)
+                if ($leaf -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') { return $Matches[1] }
+                $base = $leaf -replace '\.jsonl(\.zst)?$', ''
+                if ($base) { return $base }
+            }
+            'antigravity' {
+                $logsDir = Split-Path -Parent $SourcePath
+                $sysDir = $(if ($logsDir) { Split-Path -Parent $logsDir } else { '' })
+                if ($logsDir -and $sysDir -and ((Split-Path -Leaf $logsDir) -ieq 'logs') -and ((Split-Path -Leaf $sysDir) -ieq '.system_generated')) {
+                    $brainDir = Split-Path -Parent $sysDir
+                    if ($brainDir) { return (Split-Path -Leaf $brainDir) }
+                }
+            }
+        }
+    }
+    return $FallbackId
+}
+
 function ConvertTo-MirrorPinObject {
     param([Parameter(Mandatory)]$Raw)
     $get = {
@@ -42,19 +84,32 @@ function ConvertTo-MirrorPinObject {
     }
     $state = [string](& $get 'state' 'ok')
     if (-not $state) { $state = 'ok' }
+    $harness = [string](& $get 'harness' '')
+    $id = [string](& $get 'id' '')
+    $sourcePath = [string](& $get 'sourcePath' '')
+    $mcpId = [string](& $get 'mcpId' '')
+    if (-not $mcpId) { $mcpId = Resolve-MirrorMcpId -Harness $harness -SourcePath $sourcePath -FallbackId $id }
+    $syncAtRaw = & $get 'codexSyncAt' $null
+    $syncAt = $null
+    if ($syncAtRaw -is [datetime]) { $syncAt = $syncAtRaw.ToUniversalTime().ToString('o') }
+    elseif ($null -ne $syncAtRaw -and [string]$syncAtRaw) { $syncAt = [string]$syncAtRaw }
     return [pscustomobject]@{
-        harness        = [string](& $get 'harness' '')
-        id             = [string](& $get 'id' '')
-        profileId      = [string](& $get 'profileId' '')
-        title          = [string](& $get 'title' '')
-        cwd            = [string](& $get 'cwd' '')
-        sourcePath     = [string](& $get 'sourcePath' '')
-        mirrorPath     = [string](& $get 'mirrorPath' '')
-        codexSync      = [bool](& $get 'codexSync' $false)
-        codexProfileId = $(if ($null -ne (& $get 'codexProfileId' $null) -and [string](& $get 'codexProfileId' '')) { [string](& $get 'codexProfileId' '') } else { $null })
-        lastSize       = [long](& $get 'lastSize' 0)
-        lastTicks      = [long](& $get 'lastTicks' 0)
-        state          = $state
+        harness         = $harness
+        id              = $id
+        mcpId           = $mcpId
+        profileId       = [string](& $get 'profileId' '')
+        title           = [string](& $get 'title' '')
+        cwd             = [string](& $get 'cwd' '')
+        sourcePath      = $sourcePath
+        mirrorPath      = [string](& $get 'mirrorPath' '')
+        codexSync       = [bool](& $get 'codexSync' $false)
+        codexProfileId  = $(if ($null -ne (& $get 'codexProfileId' $null) -and [string](& $get 'codexProfileId' '')) { [string](& $get 'codexProfileId' '') } else { $null })
+        codexSyncStatus = [string](& $get 'codexSyncStatus' '')
+        codexSyncAt     = $syncAt
+        codexSyncError  = [string](& $get 'codexSyncError' '')
+        lastSize        = [long](& $get 'lastSize' 0)
+        lastTicks       = [long](& $get 'lastTicks' 0)
+        state           = $state
     }
 }
 
@@ -162,8 +217,9 @@ function Add-MirrorPin {
     $cwd = [string](Get-MirrorProp $Chat 'Cwd')
     $safeId = $id -replace '[^A-Za-z0-9._-]', '_'
     $mirrorPath = Join-Path $Dir ("$h-$safeId.md")
+    $mcpId = Resolve-MirrorMcpId -Harness $h -SourcePath $src -FallbackId $id
     $pin = ConvertTo-MirrorPinObject -Raw @{
-        harness = $h; id = $id; profileId = $profileId; title = $title; cwd = $cwd
+        harness = $h; id = $id; mcpId = $mcpId; profileId = $profileId; title = $title; cwd = $cwd
         sourcePath = $src; mirrorPath = $mirrorPath
         codexSync = $false; codexProfileId = $null; lastSize = [long]0; lastTicks = [long]0; state = 'ok'
     }
@@ -331,5 +387,7 @@ function New-MirrorHandoffPrompt {
     if (Get-Command Protect-TranscriptText -ErrorAction SilentlyContinue) {
         $title = Protect-TranscriptText $title
     }
-    return ('Read {0}. It updates itself after every turn of the {1} chat "{2}"; read it again when you need newer context. If the harness-transcripts tool is available, call read_session_tail with harness={1} id={3} instead.' -f $Pin.mirrorPath, $Pin.harness, $title, $Pin.id)
+    $mcpId = [string](Get-MirrorProp $Pin 'mcpId')
+    if (-not $mcpId) { $mcpId = Resolve-MirrorMcpId -Harness ([string]$Pin.harness) -SourcePath ([string](Get-MirrorProp $Pin 'sourcePath')) -FallbackId ([string]$Pin.id) }
+    return ('If the harness-transcripts tool is available, call read_session_tail with harness={1} id={3}. Otherwise read {0}. It updates itself after every turn of the {1} chat "{2}"; read it again when you need newer context.' -f $Pin.mirrorPath, $Pin.harness, $title, $mcpId)
 }
