@@ -90,8 +90,8 @@ function Invoke-HarnessImport {
             $res.Status = 'provider-mismatch'; $res.Mode = 'handoff'
         } elseif ($mode -eq 'codex-import') {
             $r = & $to.Adapter.ImportExternalClaude $BundlePath $Target
-            if ($r.Status -ne 'not-detected') { $res.Status = $r.Status; $res.ThreadId = $r.ThreadId; return $res }
-            $res.Status = 'not-detected'; $res.Mode = 'handoff'
+            if ($r.Status -notin 'not-detected', 'skipped') { $res.Status = $r.Status; $res.ThreadId = $r.ThreadId; return $res }
+            $res.Status = $(if ($r.Status -eq 'not-detected') { 'not-detected' } else { 'handoff' }); $res.Mode = 'handoff'
         }
         $h = & $to.Adapter.ImportHandoff $BundlePath $Target
         $res.Path = $h.Path; $res.Prompt = $h.Prompt

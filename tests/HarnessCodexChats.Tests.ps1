@@ -349,10 +349,11 @@ try {
 # ---------------------------------------------------------------- K4: Claude -> Codex import and handoff
 $claudeSrc = Join-Path $root 'src\Harness.Claude.ps1'
 $ui = Join-Path $root 'src\Ui.Harness.ps1'
+$extImport = Join-Path $root 'src\Harness.Codex.ExternalImport.ps1'
 . (Import-TestFunctions -Files @($claudeSrc) -Names @('ConvertTo-ClaudeProjectSlug', 'Find-ClaudeProjectDir', 'Get-ClaudeHomePath'))
 . (Import-TestFunctions -Files @($ui) -Names @('Get-HandoffDir', 'New-HandoffPrompt', 'Export-HarnessHandoffFiles'))
 . (Import-TestFunctions -Files @($core) -Names @('Resolve-CwdRef'))
-. (Import-TestFunctions -Files @($chats) -Names @('ConvertFrom-CodexPath', 'Get-CodexNormalPath','Get-CodexExternalImportRecord', 'Select-CodexDetectedSession', 'Import-CodexExternalClaude', 'New-CodexDeepLink', 'Start-CodexHandoff'))
+. (Import-TestFunctions -Files @($chats, $extImport) -Names @('ConvertFrom-CodexPath', 'Get-CodexNormalPath','Get-CodexExternalImportRecord', 'Select-CodexDetectedSession', 'Import-CodexExternalClaude', 'New-CodexDeepLink', 'Start-CodexHandoff'))
 
 $fixture = New-TestTempDir
 try {
@@ -398,6 +399,10 @@ while ($true) {
             [Console]::Out.WriteLine('{"id":' + $m.id + ',"result":{"importId":"imp1"}}')
             if ($env:FAKE_MODE -eq 'fail') {
                 [Console]::Out.WriteLine('{"method":"externalAgentConfig/import/completed","params":{"importId":"imp1","itemTypeResults":[{"itemType":"SESSIONS","successes":[],"failures":[{"subErrorType":"session_not_detected","message":"nope"}]}]}}')
+            } elseif ($env:FAKE_MODE -eq 'skip') {
+                [Console]::Out.WriteLine('{"method":"externalAgentConfig/import/completed","params":{"importId":"imp1","itemTypeResults":[{"itemType":"SESSIONS","successes":[],"failures":[]}]}}')
+            } elseif ($env:FAKE_MODE -eq 'skip-empty') {
+                [Console]::Out.WriteLine('{"method":"externalAgentConfig/import/completed","params":{"importId":"imp1","itemTypeResults":[]}}')
             } else {
                 [Console]::Out.WriteLine('{"method":"externalAgentConfig/import/progress","params":{}}')
                 [Console]::Out.WriteLine('{"method":"externalAgentConfig/import/completed","params":{"importId":"imp1","itemTypeResults":[{"itemType":"SESSIONS","successes":[{"itemType":"SESSIONS","target":"new-thread-1"}],"failures":[]}]}}')
@@ -446,6 +451,39 @@ while ($true) {
     # jsonl missing on this machine: not-detected without starting a server
     $missing = Import-CodexExternalClaude -BundlePath $cb -Profile $cProfile -ClaudeHome (Join-Path $fixture 'emptyclaude') -StartServer { throw 'server must not start' }
     Assert ($missing.Status -eq 'not-detected') 'no jsonl on this machine gives not-detected'
+
+    # source jsonl imports (no bundle) + only SESSIONS sent + maxSessionAgeDays
+    $srcJsonl = Join-Path $fixture 'direct-session.jsonl'
+    Set-Content -LiteralPath $srcJsonl -Value '{"type":"user"}' -Encoding ASCII
+    (Get-Item -LiteralPath $srcJsonl).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddDays(-45)
+    Remove-Item -LiteralPath (Join-Path $fixture 'detect-params.json') -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $fixture 'import-params.json') -Force -ErrorAction SilentlyContinue
+    $env:FAKE_JSONL = $srcJsonl; $env:FAKE_MODE = ''
+    $srcRes = Import-CodexExternalClaude -SourceJsonl $srcJsonl -Profile $cProfile -StartServer $factory
+    Assert ($srcRes.Status -eq 'imported' -and $srcRes.ThreadId -eq 'new-thread-1') "source jsonl imports: $($srcRes.Status) $($srcRes.ThreadId)"
+    $det2 = Get-Content -LiteralPath (Join-Path $fixture 'detect-params.json') -Raw | ConvertFrom-Json
+    Assert ($det2.params.includeHome -eq $true -and $det2.params.maxSessionAgeDays -ge 47) "detect carries includeHome and ageDays >= 47, got $($det2.params.maxSessionAgeDays)"
+    $imp2 = Get-Content -LiteralPath (Join-Path $fixture 'import-params.json') -Raw | ConvertFrom-Json
+    Assert (@($imp2.params.migrationItems).Count -ge 1 -and @($imp2.params.migrationItems | Where-Object { $_.itemType -ne 'SESSIONS' }).Count -eq 0) 'only SESSIONS sent'
+    Assert ($imp2.params.migrationItems[0].details.sessions[0].path -eq $srcJsonl) 'only the direct jsonl session is sent'
+    Assert ((Import-CodexExternalClaude -SourceJsonl (Join-Path $fixture 'missing.jsonl') -Profile $cProfile -StartServer { throw 'server must not start' }).Status -eq 'not-detected') 'missing SourceJsonl gives not-detected without starting a server'
+
+    # empty result is skipped (no throw)
+    $env:FAKE_MODE = 'skip'
+    $skipRes = Import-CodexExternalClaude -SourceJsonl $srcJsonl -Profile $cProfile -StartServer $factory
+    Assert ($skipRes.Status -eq 'skipped' -and $null -eq $skipRes.ThreadId) "empty successes/failures is skipped, got $($skipRes.Status)"
+    $env:FAKE_MODE = 'skip-empty'
+    $skipRes2 = Import-CodexExternalClaude -SourceJsonl $srcJsonl -Profile $cProfile -StartServer $factory
+    Assert ($skipRes2.Status -eq 'skipped' -and $null -eq $skipRes2.ThreadId) "empty itemTypeResults is skipped, got $($skipRes2.Status)"
+    $env:FAKE_MODE = ''; $env:FAKE_JSONL = $jsonl
+
+    # bundle or source: neither or both throws bundle-or-source
+    $errNone = $null
+    try { [void](Import-CodexExternalClaude -Profile $cProfile -StartServer { throw 'server must not start' }) } catch { $errNone = $_.Exception.Message }
+    Assert ($errNone -eq 'bundle-or-source') "neither bundle nor source throws bundle-or-source, got $errNone"
+    $errBoth = $null
+    try { [void](Import-CodexExternalClaude -BundlePath $cb -SourceJsonl $srcJsonl -Profile $cProfile -StartServer { throw 'server must not start' }) } catch { $errBoth = $_.Exception.Message }
+    Assert ($errBoth -eq 'bundle-or-source') "both bundle and source throws bundle-or-source, got $errBoth"
 
     # deep link and handoff
     $url = New-CodexDeepLink -Prompt 'Continue "x" & y' -Path 'C:\work\my project'
@@ -531,6 +569,10 @@ try {
     $script:calls.Clear(); $script:extResult = @{ Status = 'not-detected'; ThreadId = $null }
     $r = Invoke-HarnessTransfer -Chat $lChat -SourceHarness 'claude' -Target $codexT -BundleDir $bd
     Assert ($r.Status -eq 'not-detected' -and $r.Mode -eq 'handoff' -and $script:calls -join ',' -eq 'ext,handoff') 'not-detected falls back to handoff'
+
+    $script:calls.Clear(); $script:extResult = @{ Status = 'skipped'; ThreadId = $null }
+    $r = Invoke-HarnessTransfer -Chat $lChat -SourceHarness 'claude' -Target $codexT -BundleDir $bd
+    Assert ($r.Status -eq 'handoff' -and $r.Mode -eq 'handoff' -and $script:calls -join ',' -eq 'ext,handoff') 'skipped falls back to handoff'
 
     $script:calls.Clear()
     $r = Invoke-HarnessTransfer -Chat $cChat -SourceHarness 'codex' -Target $claudeT -BundleDir $bd
