@@ -24,6 +24,24 @@ foreach ($h in $hosts) {
     }
 }
 
+Write-Host '== node --test'
+$nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+$nodeOk = $false
+if ($nodeCmd) {
+    $verText = (& $nodeCmd.Source --version 2>$null | Out-String).Trim()
+    if ($verText -match '^v?(\d+)\.(\d+)\.') {
+        $maj = [int]$Matches[1]; $min = [int]$Matches[2]
+        $nodeOk = ($maj -gt 22 -or ($maj -eq 22 -and $min -ge 15))
+    }
+}
+if ($nodeOk) {
+    $mcpTests = @(Get-ChildItem -LiteralPath (Join-Path $Root 'mcp\harness-transcripts\test') -Filter '*.test.mjs' -File | Sort-Object Name | ForEach-Object { $_.FullName })
+    & $nodeCmd.Source --test @mcpTests
+    if ($LASTEXITCODE -ne 0) { $failures.Add("node --test exited $LASTEXITCODE") }
+} else {
+    Write-Host 'node not found: MCP tests skipped'
+}
+
 Write-Host '== PSScriptAnalyzer (errors only)'
 if (Get-Module -ListAvailable PSScriptAnalyzer) {
     foreach ($f in Get-Scripts) {

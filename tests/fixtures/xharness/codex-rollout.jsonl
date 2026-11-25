@@ -1,0 +1,11 @@
+{"timestamp":"2026-11-25T10:00:00.000Z","type":"session_meta","payload":{"id":"22222222-2222-2222-2222-222222222222","cwd":"\\\\?\\C:\\work\\demo"}}
+{"timestamp":"2026-11-25T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"System prompt"}]}}
+{"timestamp":"2026-11-25T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context><cwd>C:\\work\\demo</cwd></environment_context>"}]}}
+{"timestamp":"2026-11-25T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Run tests in repo. First sentence!"}]}}
+{"timestamp":"2026-11-25T10:00:04.000Z","type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"gAAAA"}}
+{"timestamp":"2026-11-25T10:00:05.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Running tests with sk-ant-TEST0123456789012345678901."}]}}
+{"timestamp":"2026-11-25T10:00:06.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"cmd\":\"npm test\"}","call_id":"c1"}}
+{"timestamp":"2026-11-25T10:00:07.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"All passed"}}
+{"timestamp":"2026-11-25T10:00:08.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Kiểm tra tiếng Việt có dấu: Đặng, ngưỡng, phở."}]}}
+{"timestamp":"2026-11-25T10:00:09.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hoàn tất."}]}}
+{"timestamp":"2026-11-25T10:00:10.000Z","type":"response_item

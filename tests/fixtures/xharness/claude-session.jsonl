@@ -1,0 +1,9 @@
+﻿{"type":"queue-operation","operation":"enqueue"}
+{"type":"custom-title","customTitle":"Claude demo session","sessionId":"11111111-1111-1111-1111-111111111111"}
+{"type":"user","timestamp":"2026-11-25T10:00:00.000Z","cwd":"C:\\work\\demo","sessionId":"11111111-1111-1111-1111-111111111111","message":{"role":"user","content":"Fix the login bug. Please check env."}}
+{"type":"assistant","timestamp":"2026-11-25T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"internal thoughts"},{"type":"text","text":"Checking config with key sk-ant-TEST0123456789012345678901 now."},{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"git status"}}]}}
+{"type":"user","timestamp":"2026-11-25T10:00:06.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"On branch main"}]}}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"meta noise"}}
+{"type":"user","timestamp":"2026-11-25T10:00:10.000Z","message":{"role":"user","content":"Kiểm tra tiếng Việt có dấu: Đặng, ngưỡng, phở."}}
+{"type":"assistant","timestamp":"2026-11-25T10:00:12.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Đã xong."}]}}
+{"type":"assistant","partial":
