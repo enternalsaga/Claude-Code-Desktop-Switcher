@@ -316,6 +316,7 @@ function Invoke-DrivePull {
     (Get-MainState).DriveStale = $true
     Update-SyncDriveTab -Ctx $Ctx
     Show-ChatPanelResult -Ctx $Ctx -Result $script:DrivePullResult
+    Request-ChatPullRestart -Profile $Target -Result $script:DrivePullResult
 }
 
 # A click on a column header of the Drive list: sort by it, or reverse the order when it already is the sort column.

@@ -38,6 +38,28 @@ Assert ((Get-DriveTabBadge -Statuses @('UpToDate', 'DriveNewer')) -eq $true) 'ba
 Assert ((Get-DriveTabBadge -Statuses @('Diverged')) -eq $true) 'badge: diverged'
 Assert ((Get-DriveTabBadge -Statuses @()) -eq $false) 'badge: empty'
 Assert ((Get-DriveTabText -Badge $false) -eq 'Drive') 'tab text plain'
+
+# a pull into an open Claude profile offers a restart: Claude lists new chats only at start-up
+$claudeP = [pscustomobject]@{ Harness = 'claude'; Id = 'Account 2'; Name = 'DL1'; Path = 'C:\p\Account 2\' }
+Assert (Test-ChatPullNeedsRestart -Profile $claudeP -Status 'copied') 'restart: copied into Claude'
+Assert (-not (Test-ChatPullNeedsRestart -Profile $claudeP -Status 'same')) 'restart: nothing changed'
+Assert (-not (Test-ChatPullNeedsRestart -Profile ([pscustomobject]@{ Harness = 'codex' }) -Status 'copied')) 'restart: Codex is not Claude'
+$script:Running = @{}; $script:Answer = 'Yes'; $script:Asked = @(); $script:Restarted = @()
+function Get-RunningProfileMap { return $script:Running }
+function Show-Message { param($Text, $Title, $Buttons, $Icon) $script:Asked += $Text; return $script:Answer }
+function Restart-ClaudeProfile { param($Target, $ProcessId) $script:Restarted += "$($Target.Id)|$ProcessId" }
+$pulled = @{ Kind = 'message'; Text = 'Copied into Claude / DL1.'; Restart = $true }
+Request-ChatPullRestart -Profile $claudeP -Result $pulled
+Assert ($script:Asked.Count -eq 0) 'a closed profile is not asked about'
+$script:Running = @{ 'C:\p\Account 2' = 42 }
+Request-ChatPullRestart -Profile $claudeP -Result $pulled
+Assert ($script:Asked.Count -eq 1 -and $script:Asked[0] -like '*Restart it now?*' -and ($script:Restarted -join ',') -eq 'Account 2|42') "an open profile is restarted on Yes: $($script:Restarted -join ',')"
+$script:Answer = 'No'
+Request-ChatPullRestart -Profile $claudeP -Result $pulled
+Assert ($script:Restarted.Count -eq 1) 'No leaves it running'
+Request-ChatPullRestart -Profile $claudeP -Result @{ Kind = 'message'; Text = 'same'; Restart = $false }
+Assert ($script:Asked.Count -eq 2) 'no question when nothing changed'
+Remove-Item Function:\Get-RunningProfileMap, Function:\Show-Message, Function:\Restart-ClaudeProfile
 Assert ((Get-DriveTabText -Badge $true) -eq "Drive $bullet") 'tab text with dot'
 
 Assert ((Get-MainLastTab) -eq 'claude') 'default tab'

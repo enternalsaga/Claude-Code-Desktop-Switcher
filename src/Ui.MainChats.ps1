@@ -177,8 +177,24 @@ function Invoke-ChatPull {
         $r = Invoke-SyncPullAskingRoot -Row $Status.Row -Target $Profile -AskRoot $AskRoot -OnDiverged $OnDiverged
         if ($r.Status -eq 'close-first') { return @{ Kind = 'warning'; Text = "Close $($Profile.Name) first, then try again. Its chat list is not refreshed while it is open."; Prompt = $null } }
         $kind = $(if ($r.Status -eq 'needs-root') { 'warning' } else { 'message' })
-        return @{ Kind = $kind; Text = (Get-HarnessTransferMessage -Result $r -Target $Profile); Prompt = $r.Prompt }
+        return @{ Kind = $kind; Text = (Get-HarnessTransferMessage -Result $r -Target $Profile); Prompt = $r.Prompt; Restart = (Test-ChatPullNeedsRestart -Profile $Profile -Status ([string]$r.Status)) }
     } catch { return @{ Kind = 'error'; Text = (Get-SyncErrorMessage -Message $_.Exception.Message); Prompt = $null } }
+}
+
+# Claude Desktop reads its chat list only at start-up, so a chat written into a Claude profile shows after a restart.
+function Test-ChatPullNeedsRestart {
+    param([Parameter(Mandatory)]$Profile, [string]$Status)
+    return ([string]$Profile.Harness -eq 'claude' -and $Status -in 'copied', 'updated', 'renamed')
+}
+
+# After a pull: when the Claude profile that got the chat is open, offer to restart it (as the old Copy did).
+function Request-ChatPullRestart {
+    param([Parameter(Mandatory)]$Profile, $Result)
+    if (-not ($Result -and $Result.Restart) -or -not $Profile.Path) { return }
+    $live = (Get-RunningProfileMap)[([string]$Profile.Path).TrimEnd('\')]
+    if (-not $live) { return }
+    $ask = "$($Result.Text)`n`n'$($Profile.Name)' is open and only lists new chats after a restart. Restart it now?`n`nAny Code session still running in '$($Profile.Name)' will be stopped."
+    if ((Show-Message $ask 'Chat pulled' 'YesNo' 'Question') -eq 'Yes') { Restart-ClaudeProfile -Target $Profile -ProcessId $live }
 }
 
 # ---- icons ---------------------------------------------------------------------------------------------------------------
@@ -456,6 +472,7 @@ function Invoke-ChatPanelAction {
         # Only this profile and the catalog are read again; the Drive tab is told it is out of date.
         if ($reload) { Use-ChatPanelBusy -Ctx $Ctx -Block { Update-ChatPanel -Ctx $Ctx -Load }; (Get-MainState).DriveStale = $true }
         if ($res) { Show-ChatPanelResult -Ctx $Ctx -Result $res }
+        if ($Name -eq 'Pull') { Request-ChatPullRestart -Profile $profile -Result $res }
     } catch { Show-ChatPanelResult -Ctx $Ctx -Result @{ Kind = 'error'; Text = (Get-SyncErrorMessage -Message $_.Exception.Message) } }
 }
 
