@@ -2311,7 +2311,9 @@ $SW_SHOWNORMAL = 1
 # it shows, so the form itself would come up invisible. Shortcuts use a headless
 # console, which has nothing to hide, but the .cmd launcher does not.
 $console = [Native.WinApi]::GetConsoleWindow()
-if ($console -ne [IntPtr]::Zero) { [Native.WinApi]::ShowWindow($console, $SW_HIDE) | Out-Null }
+# run_debug.bat sets SWITCHER_DEBUG=1: the console stays and errors in click handlers go to it (ThreadException below).
+$script:DebugConsole = ($env:SWITCHER_DEBUG -eq '1')
+if ($console -ne [IntPtr]::Zero -and -not $script:DebugConsole) { [Native.WinApi]::ShowWindow($console, $SW_HIDE) | Out-Null }
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
@@ -3200,6 +3202,22 @@ $script:ExitRequested = $false
 $notify.Visible = $true
 Update-List -Force
 if (-not $Tray) { Show-Switcher }
+if ($script:DebugConsole) {
+    # Debug only: an error in a click handler is printed with its PowerShell position and stack, which the WinForms
+    # "Unhandled exception" box leaves out, and logged; the window keeps running as after that box's Continue.
+    [System.Windows.Forms.Application]::add_ThreadException({
+        param($s, $e)
+        # The innermost error record is where it broke; the outer ones are the handler that called it.
+        $rec = $null
+        for ($x = $e.Exception; $x; $x = $x.InnerException) { if ($x.PSObject.Properties['ErrorRecord'] -and $x.ErrorRecord) { $rec = $x.ErrorRecord } }
+        $lines = @(('[{0}] UNHANDLED in the window: {1}' -f (Get-Date -Format 's'), $(if ($rec) { $rec.Exception.Message } else { $e.Exception.Message })))
+        if ($rec) { $lines += $rec.InvocationInfo.PositionMessage; $lines += $rec.ScriptStackTrace }
+        $text = $lines -join "`r`n"
+        Write-Host $text -ForegroundColor Red
+        try { Add-Content -LiteralPath $script:LogPath -Value $text } catch { }
+    })
+    Write-Host "Debug console: errors in the window are printed here and written to $($script:LogPath)" -ForegroundColor DarkGray
+}
 try {
     [System.Windows.Forms.Application]::Run()
 } finally {
