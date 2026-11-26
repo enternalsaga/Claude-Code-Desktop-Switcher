@@ -221,7 +221,8 @@ try {
         $storeS = Join-Path $profS.Path 'claude-code-sessions\acctA\orgA'
         New-Item -ItemType Directory -Path $storeS -Force | Out-Null
         $scratchThere = 'C:\Users\Other\AppData\Local\ClaudeProfile-Account 3\scratch-workspaces\acctA\orgA\scratch-2026-11-25-1bee9f'
-        [IO.File]::WriteAllText((Join-Path $storeS 'local_s.json'), ('{"title":"Scratch chat","cwd":' + ($scratchThere | ConvertTo-Json) + ',"account":"acctA","org":"orgA","sessionId":"local_s","cliSessionId":"' + $cliX + '","lastActivityAt":1700000000000}'))
+        $sq = $scratchThere | ConvertTo-Json
+        [IO.File]::WriteAllText((Join-Path $storeS 'local_s.json'), ('{"title":"Scratch chat","cwd":' + $sq + ',"originCwd":' + $sq + ',"gitAnchorsFolderRealpath":' + $sq + ',"folders":[{"cwd":' + $sq + ',"realPath":' + $sq + ',"note":' + (($scratchThere + '\sub') | ConvertTo-Json) + '}],"account":"acctA","org":"orgA","sessionId":"local_s","cliSessionId":"' + $cliX + '","lastActivityAt":1700000000000}'))
         $sb = Join-Path $fixture 'out\s.hbundle.zip'
         [void](Export-ClaudeChat -Session @(Get-CodeSessions -Source $profS)[0] -OutPath $sb -ClaudeHome (Join-Path $fixture 'claudehome-empty') -MachineId 'machine-A' -MachineName 'PCA' -PathRoots @{ Proj = 'C:\work' })
         $dstS = Join-Path $fixture 'profT\claude-code-sessions\acctB\orgB'
@@ -229,7 +230,10 @@ try {
         $r = Import-ClaudeNative -BundlePath $sb -Store (Get-Item -LiteralPath $dstS) -ClaudeHome (Join-Path $fixture 'claudehomeS') -PathRoots @{ Proj = $rootHere }
         $scratchHere = Join-Path $fixture 'profT\scratch-workspaces\acctB\orgB\scratch-2026-11-25-1bee9f'
         Assert ($r.Status -eq 'copied' -and $r.CwdMissing -eq $false -and $r.Cwd -eq $scratchHere -and (Test-Path -LiteralPath $scratchHere -PathType Container)) "scratch folder mapped and created: $($r | ConvertTo-Json -Compress)"
-        Assert ((Get-Content -LiteralPath (Join-Path $dstS 'local_s.json') -Raw | ConvertFrom-Json).cwd -eq $scratchHere) 'the chat json points at the new scratch folder'
+        $sj = Get-Content -LiteralPath (Join-Path $dstS 'local_s.json') -Raw | ConvertFrom-Json
+        Assert ($sj.cwd -eq $scratchHere -and $sj.originCwd -eq $scratchHere) 'the chat json points at the new scratch folder'
+        Assert ($sj.gitAnchorsFolderRealpath -eq $scratchHere -and $sj.folders[0].cwd -eq $scratchHere -and $sj.folders[0].realPath -eq $scratchHere) "every copy of the old folder is rewritten: $($sj | ConvertTo-Json -Compress -Depth 4)"
+        Assert ($sj.folders[0].note -eq ($scratchThere + '\sub')) 'a longer path that only starts with the old folder is left alone'
         Assert ($null -eq (Resolve-ClaudeScratchCwd -Ref @{ root = $null; absolute = 'C:\x\scratch-workspaces\a\b\scratch-..'; relative = $null } -Store (Get-Item -LiteralPath $dstS))) 'a scratch name with dots is not a scratch folder'
         Assert ($null -eq (Resolve-ClaudeScratchCwd -Ref @{ root = 'Proj'; absolute = $null; relative = 'demo' } -Store (Get-Item -LiteralPath $dstS))) 'a folder under a root is left to the roots'
 

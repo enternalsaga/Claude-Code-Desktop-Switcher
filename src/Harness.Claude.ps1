@@ -192,6 +192,10 @@ function Import-ClaudeNative {
             if ($newCwd -is [hashtable]) { return @{ Status = 'needs-root'; Root = $newCwd.Root } }
             if ($newCwd) {
                 $text = [IO.File]::ReadAllText($localPath)
+                # The old folder is also kept in gitAnchorsFolderRealpath, realPath and nested cwd fields: every JSON string
+                # that is exactly the old folder becomes the new one (whole values only, as Copy-CodeSession does for ids).
+                $oldCwd = [string](Get-FirstValue (Read-ChatJson $localPath) 'cwd', 'originCwd', 'workingDirectory')
+                if ($oldCwd) { $text = $text.Replace('"' + $oldCwd.Replace('\', '\\') + '"', '"' + $newCwd.Replace('\', '\\') + '"') }
                 foreach ($key in 'cwd', 'originCwd', 'workingDirectory') { $t = Set-JsonTopLevelString $text $key $newCwd; if ($t) { $text = $t } }
                 [IO.File]::WriteAllText($localPath, $text, (New-Object Text.UTF8Encoding($false)))
             }
