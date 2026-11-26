@@ -386,6 +386,7 @@ function Get-ChatPanelSelection {
 
 function Update-ChatButtons {
     param([Parameter(Mandatory)]$Ctx)
+    if (-not $Ctx.Buttons) { return }   # the Drive tab borrows Use-ChatPanelBusy but has no chat buttons
     $v = Get-ChatPanelSelection -Ctx $Ctx
     $sync = $(if ($v) { [string]$v.Status.Sync } else { '' })
     $gone = [bool]($v -and $v.Chat.PSObject.Properties['HasRollout'] -and -not $v.Chat.HasRollout)

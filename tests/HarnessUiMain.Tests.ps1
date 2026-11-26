@@ -361,6 +361,9 @@ Assert ($counter.Calls.Count -eq $before -and $st.Drive.List.Items.Count -eq 0 -
 Invoke-MainRefresh -Tab 'drive'
 Assert (($counter.Calls | Select-Object -Skip $before) -join ',' -eq 'claude|Default,claude|Work2,codex|Default') "Refresh on the Drive tab reads every installed profile: $(($counter.Calls | Select-Object -Skip $before) -join ',')"
 Assert ($null -ne $st.LocalChats -and $st.Drive.List.Items.Count -gt 0) 'the Drive tab now lists the catalog'
+$busyRan = $false
+try { Use-ChatPanelBusy -Ctx $st.Drive -Block { $script:busyRan = $true }; $busyOk = $true } catch { $busyOk = $false }
+Assert ($busyOk -and $script:busyRan -and -not $st.Drive.Busy) 'the Drive tab Refresh button can mark the tab busy: it has no chat buttons'
 $after = $counter.Calls.Count
 Update-MainTab -Key 'drive'; Update-MainTab -Key 'claude'
 Assert ($counter.Calls.Count -eq $after) 'redrawing tabs after the Drive refresh reads nothing'
