@@ -214,7 +214,8 @@ function Import-ClaudeNative {
 function Register-ClaudeHarness {
     Register-Harness -Name 'claude' -Adapter @{
         Detect        = { $i = Find-ClaudeInstall; [pscustomobject]@{ Installed = [bool]$i; Kind = $i.Kind; Exe = $i.Exe; Version = $i.Version; Aumid = $i.AppUserModelId } }
-        GetProfiles   = { Get-ProfileList }
+        # Every harness profile names its harness: Pull to..., Move and the Drive state read $Profile.Harness.
+        GetProfiles   = { Get-ProfileList | ForEach-Object { Add-Member -InputObject $_ -NotePropertyName Harness -NotePropertyValue 'claude' -Force -PassThru } }
         Launch        = { param($Profile) Start-ClaudeProfile -Id $Profile.Id }
         ListChats     = {
             param($Profile)

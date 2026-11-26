@@ -272,6 +272,9 @@ try {
     $h = Get-Harness -Name 'claude'
     Assert ($null -ne $h) 'claude registered'
     foreach ($k in 'Detect','GetProfiles','Launch','ListChats','Export','ImportHandoff','ImportNative') { Assert ($h.Adapter[$k] -is [scriptblock]) "adapter lacks $k" }
+    function Get-ProfileList { [pscustomobject]@{ Id = 'Default'; Name = 'Default'; IsDefault = $true }; [pscustomobject]@{ Id = 'Work'; Name = 'Work'; IsDefault = $false } }
+    $profs = @(& $h.Adapter.GetProfiles)
+    Assert ($profs.Count -eq 2 -and @($profs | Where-Object { $_.Harness -ne 'claude' }).Count -eq 0) 'every Claude profile names its harness (Pull to... reads it)'
 
     Write-Output 'PASS: Claude slug, jsonl normalization, export bundle, native import identical to Copy-CodeSession, registration.'
 } finally {
