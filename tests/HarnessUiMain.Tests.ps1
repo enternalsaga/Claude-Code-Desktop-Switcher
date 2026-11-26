@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-foreach ($f in 'Ui.ChatStatus', 'Ui.Main', 'Ui.MainChats', 'Ui.MainChatActions', 'Ui.MainDrive', 'Ui.Storage', 'Ui.StorageActions') { . (Join-Path $root "src\$f.ps1") }
+foreach ($f in 'Ui.ChatStatus', 'Ui.Main', 'Ui.MainChats', 'Ui.MainChatActions', 'Ui.MainDrive', 'Storage.Scan', 'Ui.Storage', 'Ui.StorageActions') { . (Join-Path $root "src\$f.ps1") }
 
 # ---- fakes for what ClaudeSwitcher.ps1 and the harness layer give the window --------------------------------------------
 $script:Store = @{}
@@ -286,6 +286,30 @@ $byTitle['Newer'].Selected = $true
 Update-ChatButtons -Ctx $ctx
 Assert ($ctx.List.SelectedItems.Count -eq 2 -and $ctx.Buttons.Pull.Enabled -and $ctx.Buttons.Push.Enabled -and -not $ctx.Buttons.Choose.Enabled) 'two chats: Pull fits Newer, Choose folder is off'
 $byTitle['Newer'].Selected = $false
+
+# Push runs on a runspace of its own, so the window keeps drawing; the job registers its own harnesses first
+$realPush = ${function:Invoke-ChatPush}
+function Register-Harnesses { $script:Harnesses = @([pscustomobject]@{ Name = 'claude'; Runspace = [runspace]::DefaultRunspace.InstanceId }) }
+function Invoke-ChatPush { param($Harness, $Profile, $Chat) if ($Chat.Title -eq 'Bad') { return @{ Kind = 'error'; Text = 'no key' } }; @{ Kind = 'message'; Text = ('{0}|{1}|{2}' -f $Chat.Title, $Harness.Runspace, [runspace]::DefaultRunspace.InstanceId) } }
+$uiRunspace = [runspace]::DefaultRunspace.InstanceId
+$pushChats = @([pscustomobject]@{ Title = 'One' }, [pscustomobject]@{ Title = 'Two' }, [pscustomobject]@{ Title = 'Bad' })
+$job = Start-StorageJob -Script (Get-ChatPushJobScript) -Arguments @{ HarnessName = 'claude'; Profile = $prof; Chats = $pushChats } -Total 3
+$sw = [Diagnostics.Stopwatch]::StartNew(); while (-not $job.Progress['Finished'] -and $sw.Elapsed.TotalSeconds -lt 30) { Start-Sleep -Milliseconds 50 }
+Assert ($job.Progress['Finished'] -and -not $job.Progress['Error']) "push job finished without error: $($job.Progress['Error'])"
+$pr = @($job.Progress['Result'])
+Assert ($pr.Count -eq 3 -and $job.Progress['Done'] -eq 3) "one result per chat, Done counted: $($pr.Count) / $($job.Progress['Done'])"
+$parts = ([string]$pr[0].Result.Text).Split('|')
+Assert ($parts[0] -eq 'One' -and $parts[2] -ne [string]$uiRunspace) 'the push ran on another runspace than the window'
+Assert ($parts[1] -eq $parts[2]) 'the harness the job used was registered inside the job, not copied from the window'
+Assert ((Get-ChatPushProgressText -Progress @{ Done = 1; Total = 3; Current = 'Two' }) -eq 'Pushing 2 of 3: Two...') 'progress line'
+Assert ((Get-ChatPushProgressText -Progress @{ Done = 3; Total = 3; Current = 'Bad' }) -eq 'Pushing 3 of 3: Bad...') 'progress line never counts past the total'
+$ctx.Busy = $true
+$done = Complete-ChatPushJob -Ctx $ctx -Job $job -Skipped 1
+Assert ($done.Kind -eq 'warning' -and $done.Text -like 'Pushed 2 of 4 chat(s). 1 skipped*"Bad": no key*') "the end of the job sums it up: $($done.Text)"
+Assert (-not $ctx.Busy -and $ctx.Status.Text -eq $done.Text -and $ctx.List.Items.Count -eq 3) 'the buttons are unlocked, the result is shown, the chats were read again'
+Assert ($job.Runspace.RunspaceStateInfo.State -in 'Closed', 'Closing', 'Broken' -or $job.Runspace.RunspaceAvailability -eq 'None') "the job runspace is freed: $($job.Runspace.RunspaceStateInfo.State)"
+Remove-Item Function:\Register-Harnesses
+Set-Item -Path Function:\Invoke-ChatPush -Value $realPush
 $ctx.Search.Text = 'alo'
 Update-ChatPanel -Ctx $ctx
 Assert ($ctx.List.Items.Count -eq 1 -and $ctx.List.Items[0].Text -eq 'Alone') 'the search box filters the loaded list'

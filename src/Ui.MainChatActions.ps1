@@ -132,11 +132,8 @@ function Invoke-ChatPanelAction {
             'Push' {
                 if (-not (Test-SyncReady)) { [void](Show-SyncSetupWizard); return }
                 if (-not $fits.Count) { return }
-                Use-ChatPanelBusy -Ctx $Ctx -Block {
-                    $tried = foreach ($v in $fits) { @{ Title = [string]$v.Chat.Title; Result = (Invoke-ChatPush -Harness $Ctx.Harness -Profile $profile -Chat $v.Chat) } }
-                    $script:ChatActionResult = Get-ChatBatchResult -Verb 'Pushed' -Results @($tried) -Skipped $skipped -SkipReason 'their chat file is missing'
-                }
-                $res = $script:ChatActionResult; $reload = $true
+                Start-ChatPushJob -Ctx $Ctx -Chats @($fits | ForEach-Object { $_.Chat }) -Profile $profile -Skipped $skipped
+                return   # the job shows its own result when it ends
             }
             'Pull' {
                 if (-not (Test-SyncReady)) { [void](Show-SyncSetupWizard); return }
@@ -152,6 +149,64 @@ function Invoke-ChatPanelAction {
         if ($res) { Show-ChatPanelResult -Ctx $Ctx -Result $res }
         if ($Name -eq 'Pull') { Request-ChatPullRestart -Profile $profile -Result $res }
     } catch { Show-ChatPanelResult -Ctx $Ctx -Result @{ Kind = 'error'; Text = (Get-SyncErrorMessage -Message $_.Exception.Message) } }
+}
+
+# ---- push in the background --------------------------------------------------------------------------------------------
+# A chat with a big transcript takes about half a minute to push (scan, redact, zip, encrypt, write to Drive). On the window's
+# thread the window froze for the whole batch, so Push runs on a runspace of its own (Start-StorageJob) and the window only
+# polls its progress.
+
+# The job: every chat in turn, one @{ Title; Result } each. The harness registry the job gets is a copy that holds scriptblocks
+# of the window's runspace, which must not run on another thread, so the job registers its own first.
+function Get-ChatPushJobScript {
+    return @'
+param($A, $Progress, $Cancel)
+Register-Harnesses
+$h = Get-Harness -Name $A.HarnessName
+foreach ($c in @($A.Chats)) {
+    $Progress['Current'] = [string]$c.Title
+    @{ Title = [string]$c.Title; Result = (Invoke-ChatPush -Harness $h -Profile $A.Profile -Chat $c) }
+    $Progress['Done'] = [int]$Progress['Done'] + 1
+}
+'@
+}
+
+function Get-ChatPushProgressText {
+    param([Parameter(Mandatory)]$Progress)
+    $n = [Math]::Min([int]$Progress['Done'] + 1, [int]$Progress['Total'])
+    return ('Pushing {0} of {1}: {2}...' -f $n, $Progress['Total'], $Progress['Current'])
+}
+
+# Starts the push and a timer that shows which chat is being pushed. The chat buttons stay locked until it ends.
+function Start-ChatPushJob {
+    param([Parameter(Mandatory)]$Ctx, [Parameter(Mandatory)][array]$Chats, $Profile, [int]$Skipped = 0)
+    $job = Start-StorageJob -Script (Get-ChatPushJobScript) -Arguments @{ HarnessName = $Ctx.Harness.Name; Profile = $Profile; Chats = $Chats } -Total $Chats.Count
+    $job.Progress['Current'] = [string]$Chats[0].Title
+    $Ctx.Busy = $true; Update-ChatButtons -Ctx $Ctx
+    $Ctx.Status.Text = Get-ChatPushProgressText -Progress $job.Progress
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 400
+    $state = @{ Ctx = $Ctx; Job = $job; Timer = $timer; Skipped = $Skipped }
+    $timer.Add_Tick({
+        if (-not $state.Job.Progress['Finished']) { $state.Ctx.Status.Text = Get-ChatPushProgressText -Progress $state.Job.Progress; return }
+        $state.Timer.Stop(); $state.Timer.Dispose()
+        Complete-ChatPushJob -Ctx $state.Ctx -Job $state.Job -Skipped $state.Skipped
+    }.GetNewClosure())
+    $timer.Start()
+}
+
+# The end of a push: frees the runspace, unlocks the buttons, reads this profile and the catalog again, shows the result.
+function Complete-ChatPushJob {
+    param([Parameter(Mandatory)]$Ctx, [Parameter(Mandatory)]$Job, [int]$Skipped = 0)
+    $p = $Job.Progress
+    Close-StorageScan -Scan $Job
+    $Ctx.Busy = $false
+    $res = $(if ($p['Error']) { @{ Kind = 'error'; Text = (Get-SyncErrorMessage -Message ([string]$p['Error'])) } }
+             else { Get-ChatBatchResult -Verb 'Pushed' -Results @($p['Result']) -Skipped $Skipped -SkipReason 'their chat file is missing' })
+    try { Update-ChatPanel -Ctx $Ctx -Load } catch { Write-HarnessLog "Push: reading the chats again failed: $($_.Exception.Message)" }
+    (Get-MainState).DriveStale = $true
+    Show-ChatPanelResult -Ctx $Ctx -Result $res
+    return $res
 }
 
 function Invoke-ChatChooseFolder {
