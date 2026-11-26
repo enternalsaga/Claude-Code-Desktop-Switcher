@@ -11,7 +11,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 $env:COMPUTERNAME = 'PREVIEW-PC'   # this process only: the pictures must not carry the real machine name
-foreach ($f in 'Ui.ChatStatus', 'Ui.Main', 'Ui.MainChats', 'Ui.MainDrive', 'Ui.Harness', 'Ui.Sync', 'Ui.SyncWizard', 'Ui.Tray', 'Harness.Sync.Config', 'Storage.Guard', 'Storage.Scan', 'Storage.Inventory', 'Ui.Storage', 'Ui.StorageActions') { . (Join-Path $Root "src\$f.ps1") }
+foreach ($f in 'Ui.ChatStatus', 'Ui.Main', 'Ui.MainChats', 'Ui.MainChatActions', 'Ui.MainDrive', 'Ui.Harness', 'Ui.Sync', 'Ui.SyncWizard', 'Ui.Tray', 'Harness.Sync.Config', 'Storage.Guard', 'Storage.Scan', 'Storage.Inventory', 'Ui.Storage', 'Ui.StorageActions') { . (Join-Path $Root "src\$f.ps1") }
 function Get-StorageRootsFromConfig { param($Config) return @{} }   # the Storage tab reads nothing until Scan is pressed
 function Get-SyncMachine { [pscustomobject]@{ Id = 'aaaaaaaa-0000-4000-8000-000000000001'; Name = 'PREVIEW-PC' } }
 function Get-StorageArchiveIndex { param($Target, [switch]$AllMachines) return @([pscustomobject]@{ key = 'claude:c1'; harness = 'claude'; title = 'Fix login redirect'; bytes = 10MB; zipBytes = 2MB; lastActivity = 1; archivedAt = '2026-11-14T10:00:00Z'; machineId = 'm1'; entry = 'claude/2026-11/c1.harchive.zip'; sha256 = ('a' * 64) }) }
@@ -214,6 +214,6 @@ $d.Form.Dispose()
 
 . (Get-PreviewFunction -File 'Ui.Harness.ps1' -Name 'Show-HarnessMoveDialog' -Replacement '$list.SelectedIndex = 1; Save-PreviewForm -Form $dlg -Name "dialog-move"')
 $moveChat = $chatsClaude[1].PSObject.Copy(); $moveChat | Add-Member -NotePropertyName Profile -NotePropertyValue ([pscustomobject]@{ Harness = 'claude'; Id = 'Default'; Name = 'Default' })
-[void](Preview-Show-HarnessMoveDialog -Chat $moveChat -SourceHarness 'claude')
+[void](Preview-Show-HarnessMoveDialog -Chats @($moveChat) -SourceHarness 'claude')
 . (Get-PreviewFunction -File 'Ui.SyncWizard.ps1' -Name 'Show-SyncSetupWizard' -Replacement 'Save-PreviewForm -Form $dlg -Name "dialog-wizard-1"; $pg1.List.SelectedIndex = 0; $nav.Page = 2; & $refresh; $pg2.Pass1.Text = "xxxxxxxxxxxx"; $pg2.Pass2.Text = "xxxxxxxxxxxx"; $pg2.Ack.Checked = $true; & $refresh; Save-PreviewForm -Form $dlg -Name "dialog-wizard-2"; $nav.Page = 3; & $refresh; Save-PreviewForm -Form $dlg -Name "dialog-wizard-3"')
 [void](Preview-Show-SyncSetupWizard)

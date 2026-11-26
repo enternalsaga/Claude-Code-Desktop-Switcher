@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-foreach ($f in 'Ui.ChatStatus', 'Ui.Main', 'Ui.MainChats', 'Ui.MainDrive', 'Ui.Storage', 'Ui.StorageActions') { . (Join-Path $root "src\$f.ps1") }
+foreach ($f in 'Ui.ChatStatus', 'Ui.Main', 'Ui.MainChats', 'Ui.MainChatActions', 'Ui.MainDrive', 'Ui.Storage', 'Ui.StorageActions') { . (Join-Path $root "src\$f.ps1") }
 
 # ---- fakes for what ClaudeSwitcher.ps1 and the harness layer give the window --------------------------------------------
 $script:Store = @{}
@@ -173,11 +173,54 @@ Assert ($t.Harness -eq 'codex') 'pull target: the harness of the row'
 $mt = @(
     [pscustomobject]@{ Harness = 'claude'; Id = 'Default'; Name = 'Default' }, [pscustomobject]@{ Harness = 'claude'; Id = 'Work2'; Name = 'Work2' },
     [pscustomobject]@{ Harness = 'codex'; Id = 'Default'; Name = 'Default' })
-. (Import-TestFunctions -Files @((Join-Path $root 'src\Ui.Harness.ps1')) -Names @('Get-HarnessMoveTargets'))
+. (Import-TestFunctions -Files @((Join-Path $root 'src\Ui.Harness.ps1')) -Names @('Get-HarnessMoveTargets', 'Get-HarnessMoveBlock'))
+Assert ($null -eq (Get-HarnessMoveBlock -Mode 'handoff' -Count 1)) 'move block: one chat may hand off'
+Assert ((Get-HarnessMoveBlock -Mode 'handoff' -Count 3) -like '*one chat at a time*') 'move block: several chats cannot hand off'
+Assert ($null -eq (Get-HarnessMoveBlock -Mode 'native' -Count 3) -and $null -eq (Get-HarnessMoveBlock -Mode 'codex-import' -Count 3)) 'move block: native copy and Codex import take several'
 $mc = [pscustomobject]@{ ChatId = 'a'; Profile = [pscustomobject]@{ Id = 'Default' } }
 $left = @(Get-HarnessMoveTargets -Chat $mc -SourceHarness 'claude' -Targets $mt)
 Assert ($left.Count -eq 2 -and -not ($left | Where-Object { $_.Harness -eq 'claude' -and $_.Id -eq 'Default' })) 'the source profile is not a target (same id in another harness stays)'
 Assert (@(Get-HarnessMoveTargets -Chat ([pscustomobject]@{ ChatId = 'a' }) -SourceHarness 'claude' -Targets $mt).Count -eq 3) 'a chat without profile keeps every target'
+
+# several selected chats: a button is on when it fits at least one of them; Choose folder only for one
+$sv = { param($sync, [bool]$missing = $false, $rollout = $null) $c = [pscustomobject]@{ ChatId = [guid]::NewGuid(); Title = 't' }; if ($null -ne $rollout) { $c | Add-Member HasRollout $rollout }; [pscustomobject]@{ Chat = $c; Status = [pscustomobject]@{ Sync = $sync }; CwdMissing = $missing } }
+$sa = Get-ChatSelectionActions -Views @((& $sv 'DriveNewer'), (& $sv 'NotOnDrive'))
+Assert ($sa.Pull -and $sa.Push -and $sa.Move -and -not $sa.Choose -and $null -eq $sa.Highlight) "mixed selection: Pull fits one, Push both, no highlight: $($sa | ConvertTo-Json -Compress)"
+$sa = Get-ChatSelectionActions -Views @((& $sv 'DriveNewer'), (& $sv 'Diverged'))
+Assert ($sa.Highlight -eq 'Pull') 'every chat asks for Pull: Pull is highlighted'
+$sa = Get-ChatSelectionActions -Views @((& $sv 'Synced' $true), (& $sv 'Synced' $true))
+Assert (-not $sa.Choose -and -not $sa.Pull) 'two chats with a missing folder: Choose folder is for one chat at a time'
+Assert ((Get-ChatSelectionActions -Views @((& $sv 'Synced' $true))).Choose) 'one chat with a missing folder: Choose folder on'
+$sa = Get-ChatSelectionActions -Views @((& $sv 'NotOnDrive' $false $false), (& $sv 'NotOnDrive' $false $false))
+Assert (-not $sa.Push -and -not $sa.Move -and $sa.Continue) 'chats whose file is gone: no Push, no Move'
+$sa = Get-ChatSelectionActions -Views @()
+Assert (-not $sa.Push -and -not $sa.Pull -and $sa.Continue) 'nothing selected: only Continue'
+
+# the answer of an action on several chats
+$ok = { param($t) @{ Title = $t; Result = @{ Kind = 'message'; Text = "done $t"; Prompt = $null } } }
+$one = Get-ChatBatchResult -Verb 'Pushed' -Results @((& $ok 'A'))
+Assert ($one.Text -eq 'done A') 'one chat keeps its own message'
+$b = Get-ChatBatchResult -Verb 'Pushed' -Results @((& $ok 'A'), (& $ok 'B')) -Skipped 1 -SkipReason 'their chat file is missing'
+Assert ($b.Kind -eq 'warning' -and $b.Text -eq 'Pushed 2 of 3 chat(s). 1 skipped (their chat file is missing).') "batch with a skip: $($b.Text)"
+$b = Get-ChatBatchResult -Verb 'Pulled' -Results @((& $ok 'A'), @{ Title = 'B'; Result = @{ Kind = 'error'; Text = 'boom' } })
+Assert ($b.Kind -eq 'warning' -and $b.Text -eq 'Pulled 1 of 2 chat(s). "B": boom') "batch with a failure names it: $($b.Text)"
+$b = Get-ChatBatchResult -Verb 'Pulled' -Results @(@{ Title = 'A'; Result = @{ Kind = 'error'; Text = 'x' } }, @{ Title = 'B'; Result = @{ Kind = 'error'; Text = 'y' } })
+Assert ($b.Kind -eq 'error') 'every chat failed: error'
+$b = Get-ChatBatchResult -Verb 'Moved' -Results @(@{ Title = 'A'; Result = @{ Kind = 'message'; Text = 'a'; Prompt = 'p1' } }, @{ Title = 'B'; Result = @{ Kind = 'message'; Text = 'b'; Prompt = 'p2'; Restart = $true } })
+Assert ($b.Kind -eq 'message' -and $b.Prompt -eq 'p2' -and $b.Restart -and $b.Text -like '*Only the last opening prompt*') "prompts and restart are carried: $($b | ConvertTo-Json -Compress)"
+
+# a batch pull asks each folder root once: a root left unanswered is not asked again for the next chat
+$script:PullCalls = @()
+$realPull = ${function:Invoke-ChatPull}
+function Invoke-ChatPull { param($Profile, $Status, $AskRoot, $OnDiverged) $p = & $AskRoot 'Proj'; $script:PullCalls += "$($Status.Row.chatKey)|$p"; @{ Kind = $(if ($p) { 'message' } else { 'warning' }); Text = $(if ($p) { 'copied' } else { 'needs root' }); Prompt = $null; Restart = [bool]$p } }
+$script:Asked = 0
+$pb = Invoke-ChatPullBatch -Profile ([pscustomobject]@{ Harness = 'claude' }) -Items @(@{ Title = 'A'; Status = @{ Row = @{ chatKey = 'a' } } }, @{ Title = 'B'; Status = @{ Row = @{ chatKey = 'b' } } }) -Ask { param($n) $script:Asked++; $null }
+Assert ($script:Asked -eq 1 -and ($script:PullCalls -join ',') -eq 'a|,b|') "a declined root is asked once per batch: asked $($script:Asked), calls $($script:PullCalls -join ',')"
+Assert ($pb.Kind -eq 'warning' -and -not $pb.Restart) "nothing pulled: $($pb.Text)"
+$script:Asked = 0; $script:PullCalls = @()
+$pb = Invoke-ChatPullBatch -Profile ([pscustomobject]@{ Harness = 'claude' }) -Items @(@{ Title = 'A'; Status = @{ Row = @{ chatKey = 'a' } } }, @{ Title = 'B'; Status = @{ Row = @{ chatKey = 'b' } } }) -Skipped 1 -SkipReason 'nothing newer on Drive' -Ask { param($n) $script:Asked++; 'D:\Proj' }
+Assert ($pb.Text -eq 'Pulled 2 of 3 chat(s). 1 skipped (nothing newer on Drive).' -and $pb.Restart) "pulled two, skipped one: $($pb.Text)"
+Set-Item -Path Function:\Invoke-ChatPull -Value $realPull
 
 # the setup wizard: step 2 has two password boxes that are on the page and wide enough (the wizard is built, never shown)
 . (Import-TestFunctions -Files @((Join-Path $root 'src\Ui.Sync.ps1')) -Names @('Test-SyncSetupInput'))
@@ -238,6 +281,11 @@ $ctx.List.SelectedItems[0].Selected = $false
 $ctx.List.Items | Where-Object { $_.Text -eq 'Alone' } | ForEach-Object { $_.Selected = $true }
 Update-ChatButtons -Ctx $ctx
 Assert ($ctx.Buttons.Choose.Enabled -and -not $ctx.Buttons.Pull.Enabled) 'missing folder: Choose folder on'
+Assert ($ctx.List.MultiSelect) 'the chat list takes several chats'
+$byTitle['Newer'].Selected = $true
+Update-ChatButtons -Ctx $ctx
+Assert ($ctx.List.SelectedItems.Count -eq 2 -and $ctx.Buttons.Pull.Enabled -and $ctx.Buttons.Push.Enabled -and -not $ctx.Buttons.Choose.Enabled) 'two chats: Pull fits Newer, Choose folder is off'
+$byTitle['Newer'].Selected = $false
 $ctx.Search.Text = 'alo'
 Update-ChatPanel -Ctx $ctx
 Assert ($ctx.List.Items.Count -eq 1 -and $ctx.List.Items[0].Text -eq 'Alone') 'the search box filters the loaded list'
@@ -331,7 +379,7 @@ Assert ($form2.Text -eq 'Claude Profile Switcher') 'old title restored'
 Assert ($script:Logged.Count -ge 1 -and ($script:Logged -join ' ') -like '*boom*') 'the failure is logged'
 
 # ---- V4: nothing is read until a button is pressed ---------------------------------------------------------------------------
-. (Join-Path $root 'src\Ui.MainChats.ps1')   # the earlier tests replaced some of its functions with fakes
+foreach ($f in 'Ui.MainChats', 'Ui.MainChatActions') { . (Join-Path $root "src\$f.ps1") }   # the earlier tests replaced some of their functions with fakes
 $flag = { param($c) [bool][System.Windows.Forms.Control].GetMethod('GetState', [Reflection.BindingFlags]'NonPublic,Instance', $null, [Type[]]@([int]), $null).Invoke($c, @(2)) }
 $counter = @{ Calls = (New-Object Collections.ArrayList) }
 function New-CountingHarness($name, $profiles, $chatsById) {

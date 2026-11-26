@@ -228,8 +228,6 @@ function Show-SyncDivergedDialog {
     } finally { $f.Form.Dispose() }
 }
 
-# Move one chat to any profile of any installed harness. Returns @{ Result; Target } of the transfer, or $null when the
-# user cancels. A failed transfer is shown here and the window stays open.
 # The profiles a chat can move to: every profile except the one it is in.
 function Get-HarnessMoveTargets {
     param([Parameter(Mandatory)]$Chat, [Parameter(Mandatory)][string]$SourceHarness, [array]$Targets = @())
@@ -237,12 +235,23 @@ function Get-HarnessMoveTargets {
     return @($Targets | Where-Object { -not ($own -and [string]$_.Harness -eq $SourceHarness -and [string]$_.Id -eq $own) })
 }
 
+# A handoff starts a new chat from the transcript, puts its opening prompt on the clipboard and opens the app, so it is done
+# for one chat at a time; a native copy or Codex's importer can take several. $null when the move is allowed.
+function Get-HarnessMoveBlock {
+    param([Parameter(Mandatory)][string]$Mode, [int]$Count)
+    if ($Count -gt 1 -and $Mode -notin 'native', 'codex-import') { return 'A handoff moves one chat at a time: select a single chat to move it to this profile.' }
+    return $null
+}
+
+# Move one or more chats (all from the same profile) to one profile of any installed harness. Returns
+# @{ Target; Items = @(@{ Chat; Result = @{ Kind; Text; Prompt } }) }, or $null when the user cancels. With one chat a
+# failed transfer is shown here and the window stays open; with several each failure is kept in its item.
 function Show-HarnessMoveDialog {
-    param([Parameter(Mandatory)]$Chat, [Parameter(Mandatory)][string]$SourceHarness)
+    param([Parameter(Mandatory)][array]$Chats, [Parameter(Mandatory)][string]$SourceHarness)
     Add-Type -AssemblyName System.Windows.Forms
-    $targets = @(Get-HarnessMoveTargets -Chat $Chat -SourceHarness $SourceHarness -Targets @(Get-HarnessTransferTargets))
+    $targets = @(Get-HarnessMoveTargets -Chat $Chats[0] -SourceHarness $SourceHarness -Targets @(Get-HarnessTransferTargets))
     $dlg = New-Object System.Windows.Forms.Form
-    $dlg.Text = 'Move to...'; $dlg.Size = New-Object System.Drawing.Size(520, 400); $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.Text = $(if ($Chats.Count -gt 1) { 'Move {0} chats to...' -f $Chats.Count } else { 'Move to...' }); $dlg.Size = New-Object System.Drawing.Size(520, 400); $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.StartPosition = 'CenterParent'; $dlg.ShowInTaskbar = $false; $dlg.MinimizeBox = $false; $dlg.MaximizeBox = $false
     $dlg.BackColor = $bg; $dlg.Font = $fontUI
     $list = New-Object System.Windows.Forms.ListBox
@@ -262,21 +271,31 @@ function Show-HarnessMoveDialog {
 
     $out = @{ Value = $null }
     $list.Add_SelectedIndexChanged({
-        $go.Enabled = ($list.SelectedIndex -ge 0)
+        $go.Enabled = $false
         if ($list.SelectedIndex -lt 0) { $hint.Text = ''; return }
-        $t = $targets[$list.SelectedIndex]
-        $hint.Text = Get-HarnessMoveHint -Mode (Resolve-TransferMode -Source $SourceHarness -Target $t.Harness) -TargetName $list.SelectedItem
+        $mode = Resolve-TransferMode -Source $SourceHarness -Target $targets[$list.SelectedIndex].Harness
+        $block = Get-HarnessMoveBlock -Mode $mode -Count $Chats.Count
+        $hint.Text = $(if ($block) { $block } else { Get-HarnessMoveHint -Mode $mode -TargetName $list.SelectedItem })
+        $go.Enabled = -not $block
     })
     $go.Add_Click({
         $t = $targets[$list.SelectedIndex]
         $dlg.UseWaitCursor = $true; $go.Enabled = $false
+        $items = New-Object System.Collections.Generic.List[object]
         try {
-            $r = Invoke-HarnessTransfer -Chat $Chat -SourceHarness $SourceHarness -Target $t
-            if ($r.Prompt) { [System.Windows.Forms.Clipboard]::SetText($r.Prompt) }
-            $out.Value = [pscustomobject]@{ Result = $r; Target = $t }
+            foreach ($c in $Chats) {
+                try {
+                    $r = Invoke-HarnessTransfer -Chat $c -SourceHarness $SourceHarness -Target $t
+                    $kind = $(if ($r.Status -eq 'close-first') { 'warning' } else { 'message' })
+                    $items.Add([pscustomobject]@{ Chat = $c; Result = @{ Kind = $kind; Text = (Get-HarnessTransferMessage -Result $r -Target $t); Prompt = $r.Prompt } })
+                } catch {
+                    $msg = Get-SyncErrorMessage -Message $_.Exception.Message
+                    if ($Chats.Count -eq 1) { Show-Message $msg 'Move to...' 'OK' 'Error' | Out-Null; return }
+                    $items.Add([pscustomobject]@{ Chat = $c; Result = @{ Kind = 'error'; Text = $msg; Prompt = $null } })
+                }
+            }
+            $out.Value = [pscustomobject]@{ Target = $t; Items = $items.ToArray() }
             $dlg.Close()
-        } catch {
-            Show-Message (Get-SyncErrorMessage -Message $_.Exception.Message) 'Move to...' 'OK' 'Error' | Out-Null
         } finally { $dlg.UseWaitCursor = $false; $go.Enabled = ($list.SelectedIndex -ge 0) }
     })
     [void]$dlg.ShowDialog()
