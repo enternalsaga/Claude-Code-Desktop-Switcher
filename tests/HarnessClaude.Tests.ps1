@@ -9,7 +9,7 @@ $claude = Join-Path $root 'src\Harness.Claude.ps1'
     'Get-HarnessRequiredCapabilities','Register-Harness','Get-Harness','Reset-HarnessRegistry','Register-Harnesses',
     'Get-BytesSha256Hex','Get-FileSha256Hex','Test-BundleEntryName','New-HarnessBundle','Read-ZipEntryBytes','Read-HarnessBundle','Get-HarnessBundleLimits','Copy-ZipEntryChecked','ConvertTo-CwdRef','Resolve-CwdRef','Get-HarnessMachineInfo','Get-HarnessPathRoots',
     'Get-SecretPatterns','Invoke-SecretScan','Protect-TranscriptText','Measure-SecretFindings','Protect-TranscriptEntries','Get-FirstSentence','Format-TranscriptTurn','ConvertTo-HandoffMarkdown'))
-. (Import-TestFunctions -Files @($claude) -Names @('ConvertTo-ClaudeProjectSlug','Find-ClaudeProjectDir','Get-ClaudeHomePath','Get-ClaudeToolArg','ConvertTo-ClaudeResultText','ConvertFrom-ClaudeJsonl','Get-ClaudeNativeFiles','Get-ClaudeFolderFiles','Export-ClaudeChat','Import-ClaudeNative','Resolve-ClaudeImportCwd','Register-ClaudeHarness'))
+. (Import-TestFunctions -Files @($claude) -Names @('ConvertTo-ClaudeProjectSlug','Find-ClaudeProjectDir','Get-ClaudeHomePath','Get-ClaudeToolArg','ConvertTo-ClaudeResultText','ConvertFrom-ClaudeJsonl','Get-ClaudeNativeFiles','Get-ClaudeFolderFiles','Export-ClaudeChat','Import-ClaudeNative','Resolve-ClaudeImportCwd','Resolve-ClaudeScratchCwd','Register-ClaudeHarness'))
 
 function Assert-FilesIdentical($a, $b, $what) {
     Assert ((Get-FileSha256Hex $a) -eq (Get-FileSha256Hex $b)) "$what differs"
@@ -216,6 +216,23 @@ try {
         New-Item -ItemType Directory -Path $dstZ -Force | Out-Null
         $r = Import-ClaudeNative -BundlePath $xb -Store (Get-Item -LiteralPath $dstZ) -ClaudeHome (Join-Path $fixture 'claudehomeZ') -PathRoots @{ Proj = $rootHere }
         Assert ($r.Status -eq 'copied' -and $r.CwdMissing -eq $false) 'CwdMissing is false when the folder exists'
+        # a chat with no folder lives in the other machine's scratch folder: it gets the same scratch folder in the target profile
+        $profS = [pscustomobject]@{ Path = (Join-Path $fixture 'profS') }
+        $storeS = Join-Path $profS.Path 'claude-code-sessions\acctA\orgA'
+        New-Item -ItemType Directory -Path $storeS -Force | Out-Null
+        $scratchThere = 'C:\Users\Other\AppData\Local\ClaudeProfile-Account 3\scratch-workspaces\acctA\orgA\scratch-2026-11-25-1bee9f'
+        [IO.File]::WriteAllText((Join-Path $storeS 'local_s.json'), ('{"title":"Scratch chat","cwd":' + ($scratchThere | ConvertTo-Json) + ',"account":"acctA","org":"orgA","sessionId":"local_s","cliSessionId":"' + $cliX + '","lastActivityAt":1700000000000}'))
+        $sb = Join-Path $fixture 'out\s.hbundle.zip'
+        [void](Export-ClaudeChat -Session @(Get-CodeSessions -Source $profS)[0] -OutPath $sb -ClaudeHome (Join-Path $fixture 'claudehome-empty') -MachineId 'machine-A' -MachineName 'PCA' -PathRoots @{ Proj = 'C:\work' })
+        $dstS = Join-Path $fixture 'profT\claude-code-sessions\acctB\orgB'
+        New-Item -ItemType Directory -Path $dstS -Force | Out-Null
+        $r = Import-ClaudeNative -BundlePath $sb -Store (Get-Item -LiteralPath $dstS) -ClaudeHome (Join-Path $fixture 'claudehomeS') -PathRoots @{ Proj = $rootHere }
+        $scratchHere = Join-Path $fixture 'profT\scratch-workspaces\acctB\orgB\scratch-2026-11-25-1bee9f'
+        Assert ($r.Status -eq 'copied' -and $r.CwdMissing -eq $false -and $r.Cwd -eq $scratchHere -and (Test-Path -LiteralPath $scratchHere -PathType Container)) "scratch folder mapped and created: $($r | ConvertTo-Json -Compress)"
+        Assert ((Get-Content -LiteralPath (Join-Path $dstS 'local_s.json') -Raw | ConvertFrom-Json).cwd -eq $scratchHere) 'the chat json points at the new scratch folder'
+        Assert ($null -eq (Resolve-ClaudeScratchCwd -Ref @{ root = $null; absolute = 'C:\x\scratch-workspaces\a\b\scratch-..'; relative = $null } -Store (Get-Item -LiteralPath $dstS))) 'a scratch name with dots is not a scratch folder'
+        Assert ($null -eq (Resolve-ClaudeScratchCwd -Ref @{ root = 'Proj'; absolute = $null; relative = 'demo' } -Store (Get-Item -LiteralPath $dstS))) 'a folder under a root is left to the roots'
+
         $badRoots = $null; try { [void](Import-ClaudeNative -BundlePath $xb -Store (Get-Item -LiteralPath $dstZ) -ClaudeHome (Join-Path $fixture 'claudehomeZ2') -PathRoots @{ Proj = 'rel\path' }) } catch { $badRoots = $_.Exception.Message }
 
         # C2: a newer bundle replaces the transcript (old one kept as .bak), an older one changes nothing

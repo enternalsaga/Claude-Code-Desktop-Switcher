@@ -149,6 +149,19 @@ function Resolve-ClaudeImportCwd {
     return $cwd
 }
 
+# A chat with no folder works in Claude's own scratch folder: <profile data>\scratch-workspaces\<account>\<org>\scratch-*,
+# next to claude-code-sessions. From another machine that path means nothing here, so it becomes the same scratch folder
+# under the store the chat goes into, and is created. Returns $null when the ref is not a scratch folder.
+function Resolve-ClaudeScratchCwd {
+    param($Ref, [Parameter(Mandatory)]$Store)
+    if (-not $Ref -or $Ref.root -or -not $Ref.absolute) { return $null }
+    if ([string]$Ref.absolute -notmatch '\\scratch-workspaces\\[^\\]+\\[^\\]+\\(scratch-[A-Za-z0-9-]+)\\?\z') { return $null }
+    $dataRoot = $Store.Parent.Parent.Parent.FullName
+    $dir = Join-Path (Join-Path (Join-Path (Join-Path $dataRoot 'scratch-workspaces') $Store.Parent.Name) $Store.Name) $Matches[1]
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    return $dir
+}
+
 # Native import into a Claude profile. The chat's local json goes through the existing Copy-CodeSession
 # (same account/org rewrite, same duplicate rules). On the same machine the transcript jsonl and its folder
 # are only added when missing (accounts there share ~\.claude\projects) and the result is Copy-CodeSession's
@@ -174,7 +187,8 @@ function Import-ClaudeNative {
             $cliIn = [string]$m.source.claude.cliSessionId
             if ($cliIn -and $cliIn -notmatch '\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z') { throw 'Claude session id in bundle is not a UUID' }
             if ($localRow.path -notmatch '\Anative/local_[A-Za-z0-9_-]+\.json\z') { throw 'Chat file name in bundle is not valid' }
-            $newCwd = Resolve-ClaudeImportCwd -Ref $m.source.cwd -PathRoots $PathRoots
+            $newCwd = Resolve-ClaudeScratchCwd -Ref $m.source.cwd -Store $Store
+            if (-not $newCwd) { $newCwd = Resolve-ClaudeImportCwd -Ref $m.source.cwd -PathRoots $PathRoots }
             if ($newCwd -is [hashtable]) { return @{ Status = 'needs-root'; Root = $newCwd.Root } }
             if ($newCwd) {
                 $text = [IO.File]::ReadAllText($localPath)
