@@ -30,7 +30,9 @@ try {
     $script:SyncHooks = @{
         ReadRegistry = { $script:fakeJson }
         VolumeLabel  = { param($Mount) 'label-of-' + (Split-Path -Leaf $Mount) }
+        DriveVolumes = { $script:fakeVolumes }
     }
+    $script:fakeVolumes = @()
     $acc = @(Get-DriveFsAccounts)
     Assert ($acc.Count -eq 5) "five accounts, got $($acc.Count)"
     Assert ($acc[0].Token -eq '100000000000000000001' -and $acc[0].MyDrive -eq (Join-Path $mountA 'My Drive')) 'English My Drive found'
@@ -46,6 +48,19 @@ try {
     Assert (@(Get-DriveFsAccounts).Count -eq 0) 'damaged JSON gives an empty array'
     $script:fakeJson = '{"per_account_preferences":[{"key":"x"},{"value":{"mount_point_path":"Q"}},"junk"]}'
     Assert (@(Get-DriveFsAccounts).Count -eq 0) 'entries without a key or a mount are skipped'
+
+    # an account on Drive's default letter has no mount_point_path (seen on a real machine: {"key":"...","value":{}})
+    $script:fakeJson = '{"per_account_preferences":[{"key":"100000000000000000001","value":{}},{"key":"100000000000000000002","value":{"mount_point_path":"' + ($mountB -replace '\\', '\\') + '"}}]}'
+    $script:fakeVolumes = @($mountB, $mountA)
+    $acc = @(Get-DriveFsAccounts)
+    Assert ($acc.Count -eq 2 -and $acc[0].Token -eq '100000000000000000001' -and $acc[0].MountPoint -eq $mountA -and $acc[0].MyDrive -eq (Join-Path $mountA 'My Drive')) "the account without a letter gets the one Drive volume no other account holds: $($acc | ConvertTo-Json -Compress)"
+    Assert ($acc[1].MountPoint -eq $mountB) 'the account with a letter keeps it'
+    $script:fakeVolumes = @($mountB, $mountA, $mountC)
+    Assert (@(Get-DriveFsAccounts).Count -eq 1) 'two free Drive volumes: which one is unknown, so the account is left out'
+    $script:fakeVolumes = @($mountA)
+    $script:fakeJson = '{"per_account_preferences":[{"key":"100000000000000000001","value":{}},{"key":"100000000000000000002","value":{}}]}'
+    Assert (@(Get-DriveFsAccounts).Count -eq 0) 'two accounts without a letter: which one is unknown, so both are left out'
+    $script:fakeVolumes = @()
     $script:fakeJson = New-FakePrefs @(@{ Token = '100000000000000000001'; Mount = $mountA })
 
     # ---------------------------------------------------------------- settings helpers

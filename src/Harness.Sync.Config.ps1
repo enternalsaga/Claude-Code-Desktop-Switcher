@@ -51,16 +51,40 @@ function Get-DriveFsAccounts {
     $doc = $null
     try { $doc = $raw | ConvertFrom-Json } catch { return @() }
     $list = New-Object Collections.Generic.List[object]
-    foreach ($e in @($doc.per_account_preferences)) {
-        if ($e -isnot [pscustomobject] -or -not $e.key -or -not $e.value -or -not $e.value.mount_point_path) { continue }
-        $mount = [string]$e.value.mount_point_path
-        $mountPoint = $(if ($mount -match '\A[A-Za-z]\z') { $mount.ToUpperInvariant() + ':\' } else { $mount })
+    $entries = @($doc.per_account_preferences | Where-Object { $_ -is [pscustomobject] -and $_.key })
+    $unmounted = @($entries | Where-Object { -not ($_.value -and $_.value.mount_point_path) })
+    $claimed = @{}
+    foreach ($e in $entries) {
+        $mount = $(if ($e.value) { [string]$e.value.mount_point_path } else { '' })
+        if ($mount -match '\A[A-Za-z]\z') { $mount = $mount.ToUpperInvariant() + ':\' }
+        if ($mount) { $claimed[$mount.ToUpperInvariant()] = $true }
+        Add-Member -InputObject $e -NotePropertyName MountPoint -NotePropertyValue $mount -Force
+    }
+    # Drive writes no mount_point_path for an account on its default letter. Only when exactly one account lacks it and
+    # exactly one Drive volume is not taken by another account do the two surely belong together.
+    if ($unmounted.Count -eq 1) {
+        $free = @(Get-DriveFsVolumes | Where-Object { -not $claimed.ContainsKey(([string]$_).ToUpperInvariant()) })
+        if ($free.Count -eq 1) { $unmounted[0].MountPoint = [string]$free[0] }
+    }
+    foreach ($e in $entries) {
+        if (-not $e.MountPoint) { continue }
         $list.Add([pscustomobject]@{
-            Token = [string]$e.key; MountPoint = $mountPoint
-            Label = (Get-DriveVolumeLabel -Mount $mountPoint); MyDrive = (Find-DriveFsMyDrive -MountPoint $mountPoint)
+            Token = [string]$e.key; MountPoint = $e.MountPoint
+            Label = (Get-DriveVolumeLabel -Mount $e.MountPoint); MyDrive = (Find-DriveFsMyDrive -MountPoint $e.MountPoint)
         })
     }
     return $list.ToArray()
+}
+
+# Root paths (X:\) of the local volumes that Drive mounted: fixed drives holding .shortcut-targets-by-id. Network drives
+# are skipped so a dead share cannot stall the read.
+function Get-DriveFsVolumes {
+    $hook = Get-SyncHook 'DriveVolumes'
+    if ($hook) { return @(& $hook) }
+    $roots = foreach ($d in [IO.DriveInfo]::GetDrives()) {
+        try { if ($d.DriveType -eq 'Fixed' -and $d.IsReady -and (Test-Path -LiteralPath (Join-Path $d.Name '.shortcut-targets-by-id') -PathType Container)) { $d.Name } } catch { }
+    }
+    return @($roots)
 }
 
 # ---- settings (keys Sync.*) --------------------------------------------------------------------------------------------
