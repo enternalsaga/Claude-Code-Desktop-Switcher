@@ -160,27 +160,6 @@ function Get-ChatFolderFix {
     return @{ Kind = 'none' }
 }
 
-# ---- what the buttons do (no window; the handlers show the answer) -------------------------------------------------------
-
-# Each returns @{ Kind = message|warning|error; Text; Prompt }.
-function Invoke-ChatPush {
-    param([Parameter(Mandatory)]$Harness, [Parameter(Mandatory)]$Profile, [Parameter(Mandatory)]$Chat)
-    try {
-        [void](Invoke-SyncPush -Chat $Chat -SourceHarness $Harness.Name -Profile $Profile)
-        return @{ Kind = 'message'; Text = ('Pushed "{0}" to Drive.' -f $Chat.Title); Prompt = $null }
-    } catch { return @{ Kind = 'error'; Text = (Get-SyncErrorMessage -Message $_.Exception.Message); Prompt = $null } }
-}
-
-function Invoke-ChatPull {
-    param([Parameter(Mandatory)]$Profile, [Parameter(Mandatory)]$Status, [scriptblock]$AskRoot, [scriptblock]$OnDiverged)
-    try {
-        $r = Invoke-SyncPullAskingRoot -Row $Status.Row -Target $Profile -AskRoot $AskRoot -OnDiverged $OnDiverged
-        if ($r.Status -eq 'close-first') { return @{ Kind = 'warning'; Text = "Close $($Profile.Name) first, then try again. Its chat list is not refreshed while it is open."; Prompt = $null } }
-        $kind = $(if ($r.Status -eq 'needs-root') { 'warning' } else { 'message' })
-        return @{ Kind = $kind; Text = (Get-HarnessTransferMessage -Result $r -Target $Profile); Prompt = $r.Prompt }
-    } catch { return @{ Kind = 'error'; Text = (Get-SyncErrorMessage -Message $_.Exception.Message); Prompt = $null } }
-}
-
 # ---- icons ---------------------------------------------------------------------------------------------------------------
 
 function New-ChatStatusBitmap {
@@ -262,7 +241,7 @@ function New-HarnessChatPanel {
     $panel = New-Object System.Windows.Forms.Panel
     $panel.Dock = 'Fill'; $panel.BackColor = $s.Bg
     $list = New-Object System.Windows.Forms.ListView
-    $list.View = 'Details'; $list.FullRowSelect = $true; $list.MultiSelect = $false; $list.HideSelection = $false; $list.ShowItemToolTips = $true
+    $list.View = 'Details'; $list.FullRowSelect = $true; $list.MultiSelect = $true; $list.HideSelection = $false; $list.ShowItemToolTips = $true
     $list.Dock = 'Fill'; $list.BackColor = [System.Drawing.Color]::White; $list.ForeColor = $s.Ink; $list.SmallImageList = (New-ChatStatusImages)
     foreach ($c in @(@('Title', 300), @('Folder', 150), @('Last active', 90), @('Drive', 280), @('Mirror', 180))) { [void]$list.Columns.Add((Get-ChatColumnHeader -Name $c[0] -SortColumn $view.sortColumn -Descending $view.descending), $c[1]) }
     $load = New-MainButton -Text 'Load chats' -X 0 -Width 140; $load.Size = New-Object System.Drawing.Size(140, 36); $load.BackColor = $s.Accent; $load.ForeColor = [System.Drawing.Color]::White
@@ -361,7 +340,7 @@ function Update-ChatPanel {
     } else { $Ctx.Status.Text = $(if ($p) { 'Chats not loaded yet.' } else { '' }) }
     $Ctx.LoadButton.Visible = [bool]($p -and -not $entry)
     $Ctx.LoadButton.Text = 'Load chats'
-    $keep = $(if ($Ctx.List.SelectedItems.Count) { [string]$Ctx.List.SelectedItems[0].Tag.Chat.ChatId } else { '' })
+    $keep = @{}; foreach ($v in @(Get-ChatPanelSelections -Ctx $Ctx)) { $keep[[string]$v.Chat.ChatId] = $true }
     $rows = Sort-ChatListRows -Rows (Select-ChatListRows -Rows $Ctx.Views -Text $Ctx.Search.Text -Show $Ctx.View.show) -Column $Ctx.View.sortColumn -Descending $Ctx.View.descending
     $Ctx.List.BeginUpdate()
     $Ctx.List.Items.Clear()
@@ -372,7 +351,7 @@ function Update-ChatPanel {
         foreach ($t in $v.Folder, $v.When, $v.DriveText, $mirrorText) { [void]$it.SubItems.Add($t) }
         if ($v.CwdMissing) { $it.SubItems[1].ForeColor = [System.Drawing.Color]::FromArgb(200, 100, 10); $it.ToolTipText = $v.Tooltip }
         [void]$Ctx.List.Items.Add($it)
-        if ($keep -and [string]$v.Chat.ChatId -eq $keep) { $it.Selected = $true }
+        if ($keep.ContainsKey([string]$v.Chat.ChatId)) { $it.Selected = $true }
     }
     $i = 0
     foreach ($n in 'Title', 'Folder', 'Last active', 'Drive', 'Mirror') { $Ctx.List.Columns[$i].Text = Get-ChatColumnHeader -Name $n -SortColumn $Ctx.View.sortColumn -Descending $Ctx.View.descending; $i++ }
@@ -380,18 +359,16 @@ function Update-ChatPanel {
     Update-ChatButtons -Ctx $Ctx
 }
 
-function Get-ChatPanelSelection {
+# The rows selected in the list, in list order (several with Ctrl or Shift).
+function Get-ChatPanelSelections {
     param([Parameter(Mandatory)]$Ctx)
-    if ($Ctx.List.SelectedItems.Count -eq 0) { return $null }
-    return $Ctx.List.SelectedItems[0].Tag
+    return @($Ctx.List.SelectedItems | ForEach-Object { $_.Tag })
 }
 
 function Update-ChatButtons {
     param([Parameter(Mandatory)]$Ctx)
-    $v = Get-ChatPanelSelection -Ctx $Ctx
-    $sync = $(if ($v) { [string]$v.Status.Sync } else { '' })
-    $gone = [bool]($v -and $v.Chat.PSObject.Properties['HasRollout'] -and -not $v.Chat.HasRollout)
-    $a = Get-ChatPanelActions -Sync $sync -HasSelection ([bool]$v) -CwdMissing ([bool]($v -and $v.CwdMissing)) -Gone $gone
+    if (-not $Ctx.Buttons) { return }   # the Drive tab borrows Use-ChatPanelBusy but has no chat buttons
+    $a = Get-ChatSelectionActions -Views @(Get-ChatPanelSelections -Ctx $Ctx)
     $s = Get-MainUiStyle
     foreach ($n in 'Continue', 'Move', 'Push', 'Pull', 'Choose') {
         $b = $Ctx.Buttons[$n]
@@ -418,57 +395,4 @@ function Use-ChatPanelBusy {
     $Ctx.Busy = $true; Update-ChatButtons -Ctx $Ctx
     $Ctx.Panel.UseWaitCursor = $true
     try { & $Block } finally { $Ctx.Busy = $false; $Ctx.Panel.UseWaitCursor = $false; Update-ChatButtons -Ctx $Ctx }
-}
-
-function Invoke-ChatPanelAction {
-    param([Parameter(Mandatory)]$Ctx, [Parameter(Mandatory)][string]$Name)
-    $v = Get-ChatPanelSelection -Ctx $Ctx
-    $profile = $Ctx.Profile
-    if ($Name -eq 'Continue') {
-        if ($profile) { Invoke-HarnessTrayLaunch -Harness $Ctx.Harness -Profile $profile }
-        return
-    }
-    if ($Name -eq 'Load') {
-        Use-ChatPanelBusy -Ctx $Ctx -Block { Update-ChatPanel -Ctx $Ctx -Load }
-        return
-    }
-    if (-not $v) { return }
-    try {
-        $res = $null; $reload = $false
-        switch ($Name) {
-            'Move' {
-                $r = Show-HarnessMoveDialog -Chat $v.Chat -SourceHarness $Ctx.Harness.Name
-                if ($r) { Clear-MainChatCache -Harness $r.Target.Harness -Profile $r.Target; $reload = $true; $res = @{ Kind = 'message'; Text = (Get-HarnessTransferMessage -Result $r.Result -Target $r.Target); Prompt = $r.Result.Prompt } }
-            }
-            'Push' {
-                if (-not (Test-SyncReady)) { [void](Show-SyncSetupWizard); return }
-                Use-ChatPanelBusy -Ctx $Ctx -Block { $script:ChatActionResult = Invoke-ChatPush -Harness $Ctx.Harness -Profile $profile -Chat $v.Chat }
-                $res = $script:ChatActionResult; $reload = $true
-            }
-            'Pull' {
-                if (-not (Test-SyncReady) -or -not $v.Status.Row) { [void](Show-SyncSetupWizard); return }
-                $askRoot = { param($rootName) Read-SyncFolder -Description "Where is the folder '$rootName' on this machine? The chat's working folder is inside it." }
-                $onDiverged = { param($row, $chat) Show-SyncDivergedDialog -Row $row -Chat $chat }
-                Use-ChatPanelBusy -Ctx $Ctx -Block { $script:ChatActionResult = Invoke-ChatPull -Profile $profile -Status $v.Status -AskRoot $askRoot -OnDiverged $onDiverged }
-                $res = $script:ChatActionResult; $reload = $true
-            }
-            'Choose' { Invoke-ChatChooseFolder -Ctx $Ctx -View $v }
-        }
-        # Only this profile and the catalog are read again; the Drive tab is told it is out of date.
-        if ($reload) { Use-ChatPanelBusy -Ctx $Ctx -Block { Update-ChatPanel -Ctx $Ctx -Load }; (Get-MainState).DriveStale = $true }
-        if ($res) { Show-ChatPanelResult -Ctx $Ctx -Result $res }
-    } catch { Show-ChatPanelResult -Ctx $Ctx -Result @{ Kind = 'error'; Text = (Get-SyncErrorMessage -Message $_.Exception.Message) } }
-}
-
-function Invoke-ChatChooseFolder {
-    param([Parameter(Mandatory)]$Ctx, [Parameter(Mandatory)]$View)
-    $fix = Get-ChatFolderFix -Cwd ([string]$View.Chat.Cwd) -Roots (Get-SyncPathRoots)
-    switch ($fix.Kind) {
-        'root' {
-            $path = Read-SyncFolder -Description "Where is the folder '$($fix.Name)' on this machine now? It used to be $($fix.OldPath)."
-            if ($path) { Set-SyncPathRoot -Name $fix.Name -Path $path; Show-ChatPanelResult -Ctx $Ctx -Result @{ Kind = 'message'; Text = "The folder '$($fix.Name)' is now $path." }; Update-ChatPanel -Ctx $Ctx }
-        }
-        'open' { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $fix.Path); Show-ChatPanelResult -Ctx $Ctx -Result @{ Kind = 'message'; Text = "Opened $($fix.Path). Create the missing folder there, or move the project back." } }
-        default { Show-ChatPanelResult -Ctx $Ctx -Result @{ Kind = 'warning'; Text = 'This chat has no working folder to fix.' } }
-    }
 }

@@ -149,6 +149,19 @@ function Resolve-ClaudeImportCwd {
     return $cwd
 }
 
+# A chat with no folder works in Claude's own scratch folder: <profile data>\scratch-workspaces\<account>\<org>\scratch-*,
+# next to claude-code-sessions. From another machine that path means nothing here, so it becomes the same scratch folder
+# under the store the chat goes into, and is created. Returns $null when the ref is not a scratch folder.
+function Resolve-ClaudeScratchCwd {
+    param($Ref, [Parameter(Mandatory)]$Store)
+    if (-not $Ref -or $Ref.root -or -not $Ref.absolute) { return $null }
+    if ([string]$Ref.absolute -notmatch '\\scratch-workspaces\\[^\\]+\\[^\\]+\\(scratch-[A-Za-z0-9-]+)\\?\z') { return $null }
+    $dataRoot = $Store.Parent.Parent.Parent.FullName
+    $dir = Join-Path (Join-Path (Join-Path (Join-Path $dataRoot 'scratch-workspaces') $Store.Parent.Name) $Store.Name) $Matches[1]
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    return $dir
+}
+
 # Native import into a Claude profile. The chat's local json goes through the existing Copy-CodeSession
 # (same account/org rewrite, same duplicate rules). On the same machine the transcript jsonl and its folder
 # are only added when missing (accounts there share ~\.claude\projects) and the result is Copy-CodeSession's
@@ -174,10 +187,15 @@ function Import-ClaudeNative {
             $cliIn = [string]$m.source.claude.cliSessionId
             if ($cliIn -and $cliIn -notmatch '\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z') { throw 'Claude session id in bundle is not a UUID' }
             if ($localRow.path -notmatch '\Anative/local_[A-Za-z0-9_-]+\.json\z') { throw 'Chat file name in bundle is not valid' }
-            $newCwd = Resolve-ClaudeImportCwd -Ref $m.source.cwd -PathRoots $PathRoots
+            $newCwd = Resolve-ClaudeScratchCwd -Ref $m.source.cwd -Store $Store
+            if (-not $newCwd) { $newCwd = Resolve-ClaudeImportCwd -Ref $m.source.cwd -PathRoots $PathRoots }
             if ($newCwd -is [hashtable]) { return @{ Status = 'needs-root'; Root = $newCwd.Root } }
             if ($newCwd) {
                 $text = [IO.File]::ReadAllText($localPath)
+                # The old folder is also kept in gitAnchorsFolderRealpath, realPath and nested cwd fields: every JSON string
+                # that is exactly the old folder becomes the new one (whole values only, as Copy-CodeSession does for ids).
+                $oldCwd = [string](Get-FirstValue (Read-ChatJson $localPath) 'cwd', 'originCwd', 'workingDirectory')
+                if ($oldCwd) { $text = $text.Replace('"' + $oldCwd.Replace('\', '\\') + '"', '"' + $newCwd.Replace('\', '\\') + '"') }
                 foreach ($key in 'cwd', 'originCwd', 'workingDirectory') { $t = Set-JsonTopLevelString $text $key $newCwd; if ($t) { $text = $t } }
                 [IO.File]::WriteAllText($localPath, $text, (New-Object Text.UTF8Encoding($false)))
             }
@@ -214,7 +232,8 @@ function Import-ClaudeNative {
 function Register-ClaudeHarness {
     Register-Harness -Name 'claude' -Adapter @{
         Detect        = { $i = Find-ClaudeInstall; [pscustomobject]@{ Installed = [bool]$i; Kind = $i.Kind; Exe = $i.Exe; Version = $i.Version; Aumid = $i.AppUserModelId } }
-        GetProfiles   = { Get-ProfileList }
+        # Every harness profile names its harness: Pull to..., Move and the Drive state read $Profile.Harness.
+        GetProfiles   = { Get-ProfileList | ForEach-Object { Add-Member -InputObject $_ -NotePropertyName Harness -NotePropertyValue 'claude' -Force -PassThru } }
         Launch        = { param($Profile) Start-ClaudeProfile -Id $Profile.Id }
         ListChats     = {
             param($Profile)

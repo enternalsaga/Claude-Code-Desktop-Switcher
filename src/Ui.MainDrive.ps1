@@ -226,6 +226,7 @@ function New-SyncDriveTab {
     $btnRefresh.Add_Click({ Use-ChatPanelBusy -Ctx $ctx -Block { Invoke-MainRefresh -Tab 'drive' } }.GetNewClosure())
     # After the wizard only the catalog is read; the chats of this machine are read by Refresh.
     foreach ($b in $btnSettings, $btnSetup) { $b.Add_Click({ try { [void](Show-SyncSetupWizard) } catch { Show-ChatPanelResult -Ctx $ctx -Result @{ Kind = 'error'; Text = (Get-SyncErrorMessage -Message $_.Exception.Message) } }; Update-MainCatalog; Update-SyncDriveTab -Ctx $ctx }.GetNewClosure()) }
+    $list.MultiSelect = $true   # Pull to... takes every selected chat into the profile picked
     $list.Add_SelectedIndexChanged({ $ctx.Pull.Enabled = [bool]$ctx.List.SelectedItems.Count }.GetNewClosure())
     $list.Add_ColumnClick({ Set-DriveTabSort -Ctx $ctx -Index $_.Column }.GetNewClosure())
     $rbNeed.Add_CheckedChanged({ $ctx.View.show = $(if ($ctx.Need.Checked) { 'NeedsAction' } else { 'All' }); Set-MainViewSetting -Name 'Ui.DriveView' -View $ctx.View; Update-SyncDriveTab -Ctx $ctx }.GetNewClosure())
@@ -287,35 +288,36 @@ function Update-SyncDriveTab {
     $Ctx.Change.Enabled = $false; $Ctx.Remove.Enabled = $false
 }
 
-# "Pull to...": a menu of the profiles that can receive the chat, the likely one first and in bold.
+# "Pull to...": a menu of the profiles that can receive the selected chats, the likely one (for the first chat) first and
+# in bold.
 function Show-DrivePullMenu {
     param([Parameter(Mandatory)]$Ctx)
-    if (-not $Ctx.List.SelectedItems.Count) { return }
-    $view = $Ctx.List.SelectedItems[0].Tag
+    $views = @($Ctx.List.SelectedItems | ForEach-Object { $_.Tag })
+    if (-not $views.Count) { return }
     $targets = @(Get-HarnessTransferTargets)
-    $first = Get-DefaultPullTarget -Row $view.Row -State (Get-MainSync).State -Targets $targets
+    $first = Get-DefaultPullTarget -Row $views[0].Row -State (Get-MainSync).State -Targets $targets
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
     foreach ($t in @($first) + @($targets | Where-Object { $_ -ne $first })) {
         if (-not $t) { continue }
         $mi = New-Object System.Windows.Forms.ToolStripMenuItem(('{0} / {1}' -f (Get-HarnessDisplayName (Get-Harness -Name $t.Harness)), $t.Name))
         if ($t -eq $first) { $mi.Font = New-Object System.Drawing.Font($mi.Font, [System.Drawing.FontStyle]::Bold) }
-        $mi.Tag = @{ Target = $t; View = $view }
-        $mi.Add_Click({ Invoke-DrivePull -Ctx $ctx -Target $this.Tag.Target -View $this.Tag.View }.GetNewClosure())
+        $mi.Tag = @{ Target = $t; Views = $views }
+        $mi.Add_Click({ Invoke-DrivePull -Ctx $ctx -Target $this.Tag.Target -Views $this.Tag.Views }.GetNewClosure())
         [void]$menu.Items.Add($mi)
     }
     $menu.Show($Ctx.Pull, (New-Object System.Drawing.Point(0, $Ctx.Pull.Height)))
 }
 
 function Invoke-DrivePull {
-    param([Parameter(Mandatory)]$Ctx, [Parameter(Mandatory)]$Target, [Parameter(Mandatory)]$View)
-    $askRoot = { param($rootName) Read-SyncFolder -Description "Where is the folder '$rootName' on this machine? The chat's working folder is inside it." }
-    $onDiverged = { param($row, $chat) Show-SyncDivergedDialog -Row $row -Chat $chat }
-    Use-ChatPanelBusy -Ctx $Ctx -Block { $script:DrivePullResult = Invoke-ChatPull -Profile $Target -Status @{ Row = $View.Row } -AskRoot $askRoot -OnDiverged $onDiverged }
+    param([Parameter(Mandatory)]$Ctx, [Parameter(Mandatory)]$Target, [Parameter(Mandatory)][array]$Views)
+    $items = @($Views | ForEach-Object { @{ Title = [string]$_.Title; Status = @{ Row = $_.Row } } })
+    Use-ChatPanelBusy -Ctx $Ctx -Block { $script:DrivePullResult = Invoke-ChatPullBatch -Profile $Target -Items $items }
     # The target profile's cached chats are out of date now; nothing is read again until a button asks for it.
     Clear-MainChatCache -Harness $Target.Harness -Profile $Target
     (Get-MainState).DriveStale = $true
     Update-SyncDriveTab -Ctx $Ctx
     Show-ChatPanelResult -Ctx $Ctx -Result $script:DrivePullResult
+    Request-ChatPullRestart -Profile $Target -Result $script:DrivePullResult
 }
 
 # A click on a column header of the Drive list: sort by it, or reverse the order when it already is the sort column.

@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-foreach ($f in 'Ui.ChatStatus', 'Ui.Main', 'Ui.MainChats', 'Ui.MainDrive', 'Ui.Storage', 'Ui.StorageActions') { . (Join-Path $root "src\$f.ps1") }
+foreach ($f in 'Ui.ChatStatus', 'Ui.Main', 'Ui.MainChats', 'Ui.MainChatActions', 'Ui.MainDrive', 'Storage.Scan', 'Ui.Storage', 'Ui.StorageActions') { . (Join-Path $root "src\$f.ps1") }
 
 # ---- fakes for what ClaudeSwitcher.ps1 and the harness layer give the window --------------------------------------------
 $script:Store = @{}
@@ -38,6 +38,28 @@ Assert ((Get-DriveTabBadge -Statuses @('UpToDate', 'DriveNewer')) -eq $true) 'ba
 Assert ((Get-DriveTabBadge -Statuses @('Diverged')) -eq $true) 'badge: diverged'
 Assert ((Get-DriveTabBadge -Statuses @()) -eq $false) 'badge: empty'
 Assert ((Get-DriveTabText -Badge $false) -eq 'Drive') 'tab text plain'
+
+# a pull into an open Claude profile offers a restart: Claude lists new chats only at start-up
+$claudeP = [pscustomobject]@{ Harness = 'claude'; Id = 'Account 2'; Name = 'DL1'; Path = 'C:\p\Account 2\' }
+Assert (Test-ChatPullNeedsRestart -Profile $claudeP -Status 'copied') 'restart: copied into Claude'
+Assert (-not (Test-ChatPullNeedsRestart -Profile $claudeP -Status 'same')) 'restart: nothing changed'
+Assert (-not (Test-ChatPullNeedsRestart -Profile ([pscustomobject]@{ Harness = 'codex' }) -Status 'copied')) 'restart: Codex is not Claude'
+$script:Running = @{}; $script:Answer = 'Yes'; $script:Asked = @(); $script:Restarted = @()
+function Get-RunningProfileMap { return $script:Running }
+function Show-Message { param($Text, $Title, $Buttons, $Icon) $script:Asked += $Text; return $script:Answer }
+function Restart-ClaudeProfile { param($Target, $ProcessId) $script:Restarted += "$($Target.Id)|$ProcessId" }
+$pulled = @{ Kind = 'message'; Text = 'Copied into Claude / DL1.'; Restart = $true }
+Request-ChatPullRestart -Profile $claudeP -Result $pulled
+Assert ($script:Asked.Count -eq 0) 'a closed profile is not asked about'
+$script:Running = @{ 'C:\p\Account 2' = 42 }
+Request-ChatPullRestart -Profile $claudeP -Result $pulled
+Assert ($script:Asked.Count -eq 1 -and $script:Asked[0] -like '*Restart it now?*' -and ($script:Restarted -join ',') -eq 'Account 2|42') "an open profile is restarted on Yes: $($script:Restarted -join ',')"
+$script:Answer = 'No'
+Request-ChatPullRestart -Profile $claudeP -Result $pulled
+Assert ($script:Restarted.Count -eq 1) 'No leaves it running'
+Request-ChatPullRestart -Profile $claudeP -Result @{ Kind = 'message'; Text = 'same'; Restart = $false }
+Assert ($script:Asked.Count -eq 2) 'no question when nothing changed'
+Remove-Item Function:\Get-RunningProfileMap, Function:\Show-Message, Function:\Restart-ClaudeProfile
 Assert ((Get-DriveTabText -Badge $true) -eq "Drive $bullet") 'tab text with dot'
 
 Assert ((Get-MainLastTab) -eq 'claude') 'default tab'
@@ -151,11 +173,54 @@ Assert ($t.Harness -eq 'codex') 'pull target: the harness of the row'
 $mt = @(
     [pscustomobject]@{ Harness = 'claude'; Id = 'Default'; Name = 'Default' }, [pscustomobject]@{ Harness = 'claude'; Id = 'Work2'; Name = 'Work2' },
     [pscustomobject]@{ Harness = 'codex'; Id = 'Default'; Name = 'Default' })
-. (Import-TestFunctions -Files @((Join-Path $root 'src\Ui.Harness.ps1')) -Names @('Get-HarnessMoveTargets'))
+. (Import-TestFunctions -Files @((Join-Path $root 'src\Ui.Harness.ps1')) -Names @('Get-HarnessMoveTargets', 'Get-HarnessMoveBlock'))
+Assert ($null -eq (Get-HarnessMoveBlock -Mode 'handoff' -Count 1)) 'move block: one chat may hand off'
+Assert ((Get-HarnessMoveBlock -Mode 'handoff' -Count 3) -like '*one chat at a time*') 'move block: several chats cannot hand off'
+Assert ($null -eq (Get-HarnessMoveBlock -Mode 'native' -Count 3) -and $null -eq (Get-HarnessMoveBlock -Mode 'codex-import' -Count 3)) 'move block: native copy and Codex import take several'
 $mc = [pscustomobject]@{ ChatId = 'a'; Profile = [pscustomobject]@{ Id = 'Default' } }
 $left = @(Get-HarnessMoveTargets -Chat $mc -SourceHarness 'claude' -Targets $mt)
 Assert ($left.Count -eq 2 -and -not ($left | Where-Object { $_.Harness -eq 'claude' -and $_.Id -eq 'Default' })) 'the source profile is not a target (same id in another harness stays)'
 Assert (@(Get-HarnessMoveTargets -Chat ([pscustomobject]@{ ChatId = 'a' }) -SourceHarness 'claude' -Targets $mt).Count -eq 3) 'a chat without profile keeps every target'
+
+# several selected chats: a button is on when it fits at least one of them; Choose folder only for one
+$sv = { param($sync, [bool]$missing = $false, $rollout = $null) $c = [pscustomobject]@{ ChatId = [guid]::NewGuid(); Title = 't' }; if ($null -ne $rollout) { $c | Add-Member HasRollout $rollout }; [pscustomobject]@{ Chat = $c; Status = [pscustomobject]@{ Sync = $sync }; CwdMissing = $missing } }
+$sa = Get-ChatSelectionActions -Views @((& $sv 'DriveNewer'), (& $sv 'NotOnDrive'))
+Assert ($sa.Pull -and $sa.Push -and $sa.Move -and -not $sa.Choose -and $null -eq $sa.Highlight) "mixed selection: Pull fits one, Push both, no highlight: $($sa | ConvertTo-Json -Compress)"
+$sa = Get-ChatSelectionActions -Views @((& $sv 'DriveNewer'), (& $sv 'Diverged'))
+Assert ($sa.Highlight -eq 'Pull') 'every chat asks for Pull: Pull is highlighted'
+$sa = Get-ChatSelectionActions -Views @((& $sv 'Synced' $true), (& $sv 'Synced' $true))
+Assert (-not $sa.Choose -and -not $sa.Pull) 'two chats with a missing folder: Choose folder is for one chat at a time'
+Assert ((Get-ChatSelectionActions -Views @((& $sv 'Synced' $true))).Choose) 'one chat with a missing folder: Choose folder on'
+$sa = Get-ChatSelectionActions -Views @((& $sv 'NotOnDrive' $false $false), (& $sv 'NotOnDrive' $false $false))
+Assert (-not $sa.Push -and -not $sa.Move -and $sa.Continue) 'chats whose file is gone: no Push, no Move'
+$sa = Get-ChatSelectionActions -Views @()
+Assert (-not $sa.Push -and -not $sa.Pull -and $sa.Continue) 'nothing selected: only Continue'
+
+# the answer of an action on several chats
+$ok = { param($t) @{ Title = $t; Result = @{ Kind = 'message'; Text = "done $t"; Prompt = $null } } }
+$one = Get-ChatBatchResult -Verb 'Pushed' -Results @((& $ok 'A'))
+Assert ($one.Text -eq 'done A') 'one chat keeps its own message'
+$b = Get-ChatBatchResult -Verb 'Pushed' -Results @((& $ok 'A'), (& $ok 'B')) -Skipped 1 -SkipReason 'their chat file is missing'
+Assert ($b.Kind -eq 'warning' -and $b.Text -eq 'Pushed 2 of 3 chat(s). 1 skipped (their chat file is missing).') "batch with a skip: $($b.Text)"
+$b = Get-ChatBatchResult -Verb 'Pulled' -Results @((& $ok 'A'), @{ Title = 'B'; Result = @{ Kind = 'error'; Text = 'boom' } })
+Assert ($b.Kind -eq 'warning' -and $b.Text -eq 'Pulled 1 of 2 chat(s). "B": boom') "batch with a failure names it: $($b.Text)"
+$b = Get-ChatBatchResult -Verb 'Pulled' -Results @(@{ Title = 'A'; Result = @{ Kind = 'error'; Text = 'x' } }, @{ Title = 'B'; Result = @{ Kind = 'error'; Text = 'y' } })
+Assert ($b.Kind -eq 'error') 'every chat failed: error'
+$b = Get-ChatBatchResult -Verb 'Moved' -Results @(@{ Title = 'A'; Result = @{ Kind = 'message'; Text = 'a'; Prompt = 'p1' } }, @{ Title = 'B'; Result = @{ Kind = 'message'; Text = 'b'; Prompt = 'p2'; Restart = $true } })
+Assert ($b.Kind -eq 'message' -and $b.Prompt -eq 'p2' -and $b.Restart -and $b.Text -like '*Only the last opening prompt*') "prompts and restart are carried: $($b | ConvertTo-Json -Compress)"
+
+# a batch pull asks each folder root once: a root left unanswered is not asked again for the next chat
+$script:PullCalls = @()
+$realPull = ${function:Invoke-ChatPull}
+function Invoke-ChatPull { param($Profile, $Status, $AskRoot, $OnDiverged) $p = & $AskRoot 'Proj'; $script:PullCalls += "$($Status.Row.chatKey)|$p"; @{ Kind = $(if ($p) { 'message' } else { 'warning' }); Text = $(if ($p) { 'copied' } else { 'needs root' }); Prompt = $null; Restart = [bool]$p } }
+$script:Asked = 0
+$pb = Invoke-ChatPullBatch -Profile ([pscustomobject]@{ Harness = 'claude' }) -Items @(@{ Title = 'A'; Status = @{ Row = @{ chatKey = 'a' } } }, @{ Title = 'B'; Status = @{ Row = @{ chatKey = 'b' } } }) -Ask { param($n) $script:Asked++; $null }
+Assert ($script:Asked -eq 1 -and ($script:PullCalls -join ',') -eq 'a|,b|') "a declined root is asked once per batch: asked $($script:Asked), calls $($script:PullCalls -join ',')"
+Assert ($pb.Kind -eq 'warning' -and -not $pb.Restart) "nothing pulled: $($pb.Text)"
+$script:Asked = 0; $script:PullCalls = @()
+$pb = Invoke-ChatPullBatch -Profile ([pscustomobject]@{ Harness = 'claude' }) -Items @(@{ Title = 'A'; Status = @{ Row = @{ chatKey = 'a' } } }, @{ Title = 'B'; Status = @{ Row = @{ chatKey = 'b' } } }) -Skipped 1 -SkipReason 'nothing newer on Drive' -Ask { param($n) $script:Asked++; 'D:\Proj' }
+Assert ($pb.Text -eq 'Pulled 2 of 3 chat(s). 1 skipped (nothing newer on Drive).' -and $pb.Restart) "pulled two, skipped one: $($pb.Text)"
+Set-Item -Path Function:\Invoke-ChatPull -Value $realPull
 
 # the setup wizard: step 2 has two password boxes that are on the page and wide enough (the wizard is built, never shown)
 . (Import-TestFunctions -Files @((Join-Path $root 'src\Ui.Sync.ps1')) -Names @('Test-SyncSetupInput'))
@@ -216,6 +281,35 @@ $ctx.List.SelectedItems[0].Selected = $false
 $ctx.List.Items | Where-Object { $_.Text -eq 'Alone' } | ForEach-Object { $_.Selected = $true }
 Update-ChatButtons -Ctx $ctx
 Assert ($ctx.Buttons.Choose.Enabled -and -not $ctx.Buttons.Pull.Enabled) 'missing folder: Choose folder on'
+Assert ($ctx.List.MultiSelect) 'the chat list takes several chats'
+$byTitle['Newer'].Selected = $true
+Update-ChatButtons -Ctx $ctx
+Assert ($ctx.List.SelectedItems.Count -eq 2 -and $ctx.Buttons.Pull.Enabled -and $ctx.Buttons.Push.Enabled -and -not $ctx.Buttons.Choose.Enabled) 'two chats: Pull fits Newer, Choose folder is off'
+$byTitle['Newer'].Selected = $false
+
+# Push runs on a runspace of its own, so the window keeps drawing; the job registers its own harnesses first
+$realPush = ${function:Invoke-ChatPush}
+function Register-Harnesses { $script:Harnesses = @([pscustomobject]@{ Name = 'claude'; Runspace = [runspace]::DefaultRunspace.InstanceId }) }
+function Invoke-ChatPush { param($Harness, $Profile, $Chat) if ($Chat.Title -eq 'Bad') { return @{ Kind = 'error'; Text = 'no key' } }; @{ Kind = 'message'; Text = ('{0}|{1}|{2}' -f $Chat.Title, $Harness.Runspace, [runspace]::DefaultRunspace.InstanceId) } }
+$uiRunspace = [runspace]::DefaultRunspace.InstanceId
+$pushChats = @([pscustomobject]@{ Title = 'One' }, [pscustomobject]@{ Title = 'Two' }, [pscustomobject]@{ Title = 'Bad' })
+$job = Start-StorageJob -Script (Get-ChatPushJobScript) -Arguments @{ HarnessName = 'claude'; Profile = $prof; Chats = $pushChats } -Total 3
+$sw = [Diagnostics.Stopwatch]::StartNew(); while (-not $job.Progress['Finished'] -and $sw.Elapsed.TotalSeconds -lt 30) { Start-Sleep -Milliseconds 50 }
+Assert ($job.Progress['Finished'] -and -not $job.Progress['Error']) "push job finished without error: $($job.Progress['Error'])"
+$pr = @($job.Progress['Result'])
+Assert ($pr.Count -eq 3 -and $job.Progress['Done'] -eq 3) "one result per chat, Done counted: $($pr.Count) / $($job.Progress['Done'])"
+$parts = ([string]$pr[0].Result.Text).Split('|')
+Assert ($parts[0] -eq 'One' -and $parts[2] -ne [string]$uiRunspace) 'the push ran on another runspace than the window'
+Assert ($parts[1] -eq $parts[2]) 'the harness the job used was registered inside the job, not copied from the window'
+Assert ((Get-ChatPushProgressText -Progress @{ Done = 1; Total = 3; Current = 'Two' }) -eq 'Pushing 2 of 3: Two...') 'progress line'
+Assert ((Get-ChatPushProgressText -Progress @{ Done = 3; Total = 3; Current = 'Bad' }) -eq 'Pushing 3 of 3: Bad...') 'progress line never counts past the total'
+$ctx.Busy = $true
+$done = Complete-ChatPushJob -Ctx $ctx -Job $job -Skipped 1
+Assert ($done.Kind -eq 'warning' -and $done.Text -like 'Pushed 2 of 4 chat(s). 1 skipped*"Bad": no key*') "the end of the job sums it up: $($done.Text)"
+Assert (-not $ctx.Busy -and $ctx.Status.Text -eq $done.Text -and $ctx.List.Items.Count -eq 3) 'the buttons are unlocked, the result is shown, the chats were read again'
+Assert ($job.Runspace.RunspaceStateInfo.State -in 'Closed', 'Closing', 'Broken' -or $job.Runspace.RunspaceAvailability -eq 'None') "the job runspace is freed: $($job.Runspace.RunspaceStateInfo.State)"
+Remove-Item Function:\Register-Harnesses
+Set-Item -Path Function:\Invoke-ChatPush -Value $realPush
 $ctx.Search.Text = 'alo'
 Update-ChatPanel -Ctx $ctx
 Assert ($ctx.List.Items.Count -eq 1 -and $ctx.List.Items[0].Text -eq 'Alone') 'the search box filters the loaded list'
@@ -309,7 +403,7 @@ Assert ($form2.Text -eq 'Claude Profile Switcher') 'old title restored'
 Assert ($script:Logged.Count -ge 1 -and ($script:Logged -join ' ') -like '*boom*') 'the failure is logged'
 
 # ---- V4: nothing is read until a button is pressed ---------------------------------------------------------------------------
-. (Join-Path $root 'src\Ui.MainChats.ps1')   # the earlier tests replaced some of its functions with fakes
+foreach ($f in 'Ui.MainChats', 'Ui.MainChatActions') { . (Join-Path $root "src\$f.ps1") }   # the earlier tests replaced some of their functions with fakes
 $flag = { param($c) [bool][System.Windows.Forms.Control].GetMethod('GetState', [Reflection.BindingFlags]'NonPublic,Instance', $null, [Type[]]@([int]), $null).Invoke($c, @(2)) }
 $counter = @{ Calls = (New-Object Collections.ArrayList) }
 function New-CountingHarness($name, $profiles, $chatsById) {
@@ -361,6 +455,9 @@ Assert ($counter.Calls.Count -eq $before -and $st.Drive.List.Items.Count -eq 0 -
 Invoke-MainRefresh -Tab 'drive'
 Assert (($counter.Calls | Select-Object -Skip $before) -join ',' -eq 'claude|Default,claude|Work2,codex|Default') "Refresh on the Drive tab reads every installed profile: $(($counter.Calls | Select-Object -Skip $before) -join ',')"
 Assert ($null -ne $st.LocalChats -and $st.Drive.List.Items.Count -gt 0) 'the Drive tab now lists the catalog'
+$busyRan = $false
+try { Use-ChatPanelBusy -Ctx $st.Drive -Block { $script:busyRan = $true }; $busyOk = $true } catch { $busyOk = $false }
+Assert ($busyOk -and $script:busyRan -and -not $st.Drive.Busy) 'the Drive tab Refresh button can mark the tab busy: it has no chat buttons'
 $after = $counter.Calls.Count
 Update-MainTab -Key 'drive'; Update-MainTab -Key 'claude'
 Assert ($counter.Calls.Count -eq $after) 'redrawing tabs after the Drive refresh reads nothing'
